@@ -1,0 +1,85 @@
+# distutils: language=c++
+# cython: language_level=3
+# cython: language=c++
+
+import mpi4py.MPI as MPI
+cimport mpi4py.MPI as MPI
+cimport mpi4py.libmpi as libmpi
+
+import numpy as np
+cimport numpy as np
+
+from libcpp.string cimport string
+from libcpp.typeinfo cimport type_info
+
+from cpython.version cimport PY_MAJOR_VERSION
+
+cdef extern from "string.h" nogil:
+    char   *strdup  (const char *s)
+    size_t strlen   (const char *s)
+
+cpdef str b2s(bytes x):
+    if PY_MAJOR_VERSION < 3:
+        return str(x)
+    else:
+        return x.decode()
+
+cpdef bytes s2b(str x):
+    if PY_MAJOR_VERSION < 3:
+        return <bytes>x
+    else:
+        return strdup(x.encode())
+
+cdef extern from "ddstore.hpp":
+    ctypedef struct VarInfo:
+        string name
+        string typeinfo
+        int disp
+
+
+    cdef cppclass DDStore:
+        DDStore()
+        DDStore(libmpi.MPI_Comm comm)
+        void add[T](string name, T* buffer, int nrows, int disp)
+        void get[T](string name, int start, int count, T* buffer) except +
+
+cdef class PyDDstoreVarinfo:
+    cdef VarInfo c_varinfo
+
+    def __cinit__(self):
+        pass
+
+cdef class PyDDStore:
+    cdef DDStore c_ddstore
+
+    def __cinit__(self, MPI.Comm comm):
+        self.c_ddstore = DDStore(comm.ob_mpi)
+    
+    def add(self, str name, np.ndarray arr):
+        assert arr.flags.c_contiguous
+        cdef int nrows = arr.shape[0]
+        cdef int disp = arr.size / arr.shape[0]
+        if arr.dtype == np.int32:
+            self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp)
+        elif arr.dtype == np.int64:
+            self.c_ddstore.add(s2b(name), <long *> arr.data, nrows, disp)
+        elif arr.dtype == np.float32:
+            self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
+        elif arr.dtype == np.float64:
+            self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp)
+        else:
+            raise NotImplementedError
+
+    def get(self, str name, np.ndarray arr, int start=0, int count=1):
+        assert arr.flags.c_contiguous
+        assert arr.shape[0] >= count
+        if arr.dtype == np.int32:
+            self.c_ddstore.get(s2b(name), start, count, <int *> arr.data)
+        elif arr.dtype == np.int64:
+            self.c_ddstore.get(s2b(name), start, count, <long *> arr.data)
+        elif arr.dtype == np.float32:
+            self.c_ddstore.get(s2b(name), start, count, <float *> arr.data)
+        elif arr.dtype == np.float64:
+            self.c_ddstore.get(s2b(name), start, count, <double *> arr.data)
+        else:
+            raise NotImplementedError

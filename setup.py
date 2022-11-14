@@ -22,5 +22,8 @@ extending = Extension("pyddstore",
 extensions = [extending,]
 
 setup(
+    name="PyDDStore",
+    version="0.1",
+    description="Distributed Data Store",
     ext_modules=cythonize(extensions)
 )

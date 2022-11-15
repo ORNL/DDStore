@@ -89,10 +89,7 @@ class DDStore
             throw std::invalid_argument("Invalid count on target");
 
         MPI_Win win = varinfo.win;
-        std::cout << "    " << rank << ": Wait lock: " << target << "," << offset << "," << start << "," << count
-                  << std::endl;
-        int ret0 = MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
-        std::cout << "    " << rank << ": Lock accuired: " << target << "," << ret0 << std::endl;
+        MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
         MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
                 varinfo.disp * sizeof(T) * count, /* count on RMA origin process */
                 MPI_BYTE,                         /* type on RMA origin process */
@@ -101,9 +98,7 @@ class DDStore
                 varinfo.disp * sizeof(T) * count, /* count on RMA target process */
                 MPI_BYTE,                         /* type on RMA target process */
                 win /* window object */);
-        std::cout << "    " << rank << ": Get done: " << target << std::endl;
-        int ret1 = MPI_Win_unlock(target, win);
-        std::cout << "    " << rank << ": Unlock: " << target << "," << ret1 << std::endl;
+        MPI_Win_unlock(target, win);
     }
 
   private:

@@ -7,6 +7,7 @@ import numpy as np
 from mpi4py import MPI
 import argparse
 import pyddstore as dds
+import sys
 
 
 if __name__ == "__main__":
@@ -39,7 +40,7 @@ if __name__ == "__main__":
     buff_list = list()
     for i in range(nbatch):
         idx = np.random.randint(num * comm_size)
-        buff = np.zeros(dim, dtype=dtype)
+        buff = np.zeros((1,dim), dtype=dtype)
         ddstore.get("var", buff, idx)
         idx_list.append(idx)
         buff_list.append(buff)
@@ -47,4 +48,7 @@ if __name__ == "__main__":
     for i, idx in enumerate(idx_list):
         expected = idx // num + 1
         assert np.mean(buff_list[i]) == expected, (np.mean(buff_list[i]), expected)
+    comm.Barrier()
     print(rank, "done.")
+    ddstore.free()
+    sys.exit(0)

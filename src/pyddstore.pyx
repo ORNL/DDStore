@@ -40,8 +40,9 @@ cdef extern from "ddstore.hpp":
     cdef cppclass DDStore:
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
-        void add[T](string name, T* buffer, int nrows, int disp)
+        void add[T](string name, T* buffer, int nrows, int disp) except +
         void get[T](string name, int start, int count, T* buffer) except +
+        void free()
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -70,8 +71,9 @@ cdef class PyDDStore:
         else:
             raise NotImplementedError
 
-    def get(self, str name, np.ndarray arr, int start=0, int count=1):
+    def get(self, str name, np.ndarray arr, int start=0):
         assert arr.flags.c_contiguous
+        cdef int count = arr.shape[0]
         assert arr.shape[0] >= count
         if arr.dtype == np.int32:
             self.c_ddstore.get(s2b(name), start, count, <int *> arr.data)
@@ -83,3 +85,6 @@ cdef class PyDDStore:
             self.c_ddstore.get(s2b(name), start, count, <double *> arr.data)
         else:
             raise NotImplementedError
+    
+    def free(self):
+        self.c_ddstore.free()

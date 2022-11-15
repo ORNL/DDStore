@@ -54,18 +54,25 @@ DDStore::DDStore(MPI_Comm comm)
 
 DDStore::~DDStore()
 {
+    this->free();
+}
+
+void DDStore::query(std::string name, VarInfo_t &varinfo)
+{
+    varinfo = this->varlist[name];
+}
+
+void DDStore::free()
+{
     int flag;
     MPI_Finalized(&flag);
     if (!flag)
     {
         for (auto &x : this->varlist)
         {
-            MPI_Win_free(&x.second.win);
+            if (x.second.active)
+                MPI_Win_free(&x.second.win);
+            x.second.active = false;
         }
     }
-}
-
-void DDStore::query(std::string name, VarInfo_t &varinfo)
-{
-    varinfo = this->varlist[name];
 }

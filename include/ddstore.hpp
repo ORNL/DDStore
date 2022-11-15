@@ -12,6 +12,7 @@ struct VarInfo
     int disp;
     std::vector<int> lenlist;
     MPI_Win win;
+    bool active;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -25,6 +26,7 @@ class DDStore
     ~DDStore();
 
     void query(std::string name, VarInfo_t &varinfo);
+    void free();
 
     template <typename T> void add(std::string name, T *buffer, int nrows, int disp)
     {
@@ -63,6 +65,7 @@ class DDStore
         var.disp = disp;
         var.win = win;
         var.lenlist = lenlist;
+        var.active = true;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }
@@ -86,7 +89,10 @@ class DDStore
             throw std::invalid_argument("Invalid count on target");
 
         MPI_Win win = varinfo.win;
-        MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+        std::cout << "    " << rank << ": Wait lock: " << target << "," << offset << "," << start << "," << count
+                  << std::endl;
+        int ret0 = MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+        std::cout << "    " << rank << ": Lock accuired: " << target << "," << ret0 << std::endl;
         MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
                 varinfo.disp * sizeof(T) * count, /* count on RMA origin process */
                 MPI_BYTE,                         /* type on RMA origin process */
@@ -95,7 +101,9 @@ class DDStore
                 varinfo.disp * sizeof(T) * count, /* count on RMA target process */
                 MPI_BYTE,                         /* type on RMA target process */
                 win /* window object */);
-        MPI_Win_unlock(target, win);
+        std::cout << "    " << rank << ": Get done: " << target << std::endl;
+        int ret1 = MPI_Win_unlock(target, win);
+        std::cout << "    " << rank << ": Unlock: " << target << "," << ret1 << std::endl;
     }
 
   private:

@@ -1,4 +1,5 @@
 import mpi4py
+
 # mpi4py.rc.thread_level = "serialized"
 # mpi4py.rc.threads = False
 
@@ -14,7 +15,12 @@ import torch.distributed as dist
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num", type=int, help="num. of data (default: %(default)s)", default=1024 * 1024)
+    parser.add_argument(
+        "--num",
+        type=int,
+        help="num. of data (default: %(default)s)",
+        default=1024 * 1024,
+    )
     parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
     parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
     args = parser.parse_args()
@@ -50,10 +56,10 @@ if __name__ == "__main__":
     for i in range(nbatch):
         ddstore.epoch_begin()
         idx = np.random.randint(num * comm_size)
-        buff = np.zeros((1,dim), dtype=dtype)
+        buff = np.zeros((1, dim), dtype=dtype)
         ddstore.get("var", buff, idx)
         idx2 = np.random.randint(num * comm_size)
-        buff2 = np.zeros((1,dim), dtype=dtype)
+        buff2 = np.zeros((1, dim), dtype=dtype)
         ddstore.get("var", buff2, idx)
         ddstore.epoch_end()
         idx_list.append(idx)

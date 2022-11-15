@@ -81,8 +81,8 @@ class DDStore
 
         int target = sortedsearch(varinfo.lenlist, start);
         int offset = target > 0 ? varinfo.lenlist[target - 1] : 0;
-        // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count
-        //           << std::endl;
+        // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
+        // std::endl;
 
         if (start < offset)
             throw std::invalid_argument("Invalid start on target");

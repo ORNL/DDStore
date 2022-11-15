@@ -12,7 +12,12 @@ import sys
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num", type=int, help="num. of data (default: %(default)s)", default=1024 * 1024)
+    parser.add_argument(
+        "--num",
+        type=int,
+        help="num. of data (default: %(default)s)",
+        default=1024 * 1024,
+    )
     parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
     parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
     args = parser.parse_args()
@@ -40,7 +45,7 @@ if __name__ == "__main__":
     buff_list = list()
     for i in range(nbatch):
         idx = np.random.randint(num * comm_size)
-        buff = np.zeros((1,dim), dtype=dtype)
+        buff = np.zeros((1, dim), dtype=dtype)
         ddstore.get("var", buff, idx)
         idx_list.append(idx)
         buff_list.append(buff)

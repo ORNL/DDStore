@@ -42,6 +42,8 @@ cdef extern from "ddstore.hpp":
         DDStore(libmpi.MPI_Comm comm)
         void add[T](string name, T* buffer, int nrows, int disp) except +
         void get[T](string name, int start, int count, T* buffer) except +
+        void epoch_begin()
+        void epoch_end()
         void free()
 
 cdef class PyDDstoreVarinfo:
@@ -86,5 +88,11 @@ cdef class PyDDStore:
         else:
             raise NotImplementedError
     
+    def epoch_begin(self):
+        self.c_ddstore.epoch_begin()
+
+    def epoch_end(self):
+        self.c_ddstore.epoch_end()
+
     def free(self):
         self.c_ddstore.free()

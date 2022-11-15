@@ -62,6 +62,22 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
     varinfo = this->varlist[name];
 }
 
+void DDStore::epoch_begin()
+{
+    for (auto &x : this->varlist)
+    {
+        MPI_Win_fence(0, x.second.win);
+    }
+}
+
+void DDStore::epoch_end()
+{
+    for (auto &x : this->varlist)
+    {
+        MPI_Win_fence(0, x.second.win);
+    }
+}
+
 void DDStore::free()
 {
     int flag;

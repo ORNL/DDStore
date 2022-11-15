@@ -26,6 +26,8 @@ class DDStore
     ~DDStore();
 
     void query(std::string name, VarInfo_t &varinfo);
+    void epoch_begin();
+    void epoch_end();
     void free();
 
     template <typename T> void add(std::string name, T *buffer, int nrows, int disp)

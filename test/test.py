@@ -79,6 +79,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
     parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--gloo", help="gloo", action="store_const", dest="backend", const="gloo")
+    group.add_argument("--nccl", help="nccl", action="store_const", dest="backend", const="nccl")
+    parser.set_defaults(backend="gloo")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -88,6 +92,7 @@ if __name__ == "__main__":
     ## Default setting
     master_addr = "127.0.0.1"
     master_port = "8889"
+    backend = args.backend
 
     if os.getenv("LSB_HOSTS") is not None:
         ## source: https://www.olcf.ornl.gov/wp-content/uploads/2019/12/Scaling-DL-on-Summit.pdf
@@ -104,11 +109,12 @@ if __name__ == "__main__":
     os.environ["WORLD_SIZE"] = str(comm_size)
     os.environ["RANK"] = str(rank)
 
-    ifname = find_ifname(master_addr)
-    if ifname is not None:
-        os.environ["GLOO_SOCKET_IFNAME"] = ifname
+    if (backend == "gloo") and ("GLOO_SOCKET_IFNAME" not in os.environ):
+        ifname = find_ifname(master_addr)
+        if ifname is not None:
+            os.environ["GLOO_SOCKET_IFNAME"] = ifname
 
-    dist.init_process_group(backend="gloo", init_method="env://")
+    dist.init_process_group(backend=backend, init_method="env://")
 
     ddstore = dds.PyDDStore(comm)
 

@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 import psutil
 import socket
+import re
 
 
 def find_ifname(myaddr):
@@ -115,6 +116,7 @@ if __name__ == "__main__":
             os.environ["GLOO_SOCKET_IFNAME"] = ifname
 
     dist.init_process_group(backend=backend, init_method="env://")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ddstore = dds.PyDDStore(comm)
 
@@ -145,7 +147,7 @@ if __name__ == "__main__":
         ddstore.epoch_end()
         idx_list.append(idx)
         buff_list.append(buff)
-        x = torch.zeros(1)
+        x = torch.zeros(1).to(device)
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
 
     for i, idx in enumerate(idx_list):

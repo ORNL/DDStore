@@ -20,6 +20,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
     parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
+    parser.add_argument("--ngroup", type=int, help="ngroup (default: %(default)s)", default=1)
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -35,16 +36,16 @@ if __name__ == "__main__":
     shape = (num, dim)
     dtype = np.float64
     arr = np.ones(shape, dtype=dtype)
-    arr = arr * (rank + 1)
+    arr = arr * (rank%(comm_size//args.ngroup) + 1)
     arr = arr.reshape(shape)
     print(rank, "arr", np.mean(arr), arr.nbytes / 1024 / 1024 / 1024, "(GB)")
-    ddstore.add("var", arr)
+    ddstore.add("var", arr, rank//(comm_size//args.ngroup))
 
     comm.Barrier()
     idx_list = list()
     buff_list = list()
     for i in range(nbatch):
-        idx = np.random.randint(num * comm_size)
+        idx = np.random.randint(num * (comm_size//args.ngroup))
         buff = np.zeros((1, dim), dtype=dtype)
         ddstore.get("var", buff, idx)
         idx_list.append(idx)

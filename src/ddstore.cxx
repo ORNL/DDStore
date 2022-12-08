@@ -66,7 +66,10 @@ void DDStore::epoch_begin()
 {
     for (auto &x : this->varlist)
     {
+        if (x.second.fence_active)
+            throw std::logic_error("Fence already activated");
         MPI_Win_fence(0, x.second.win);
+        x.second.fence_active = true;
     }
 }
 
@@ -74,7 +77,10 @@ void DDStore::epoch_end()
 {
     for (auto &x : this->varlist)
     {
+        if (not x.second.fence_active)
+            throw std::logic_error("Fence is not activated");
         MPI_Win_fence(0, x.second.win);
+        x.second.fence_active = false;
     }
 }
 

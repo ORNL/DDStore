@@ -13,6 +13,7 @@ struct VarInfo
     std::vector<int> lenlist;
     MPI_Win win;
     bool active;
+    bool fence_active;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -68,6 +69,7 @@ class DDStore
         var.win = win;
         var.lenlist = lenlist;
         var.active = true;
+        var.fence_active = false;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }

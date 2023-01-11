@@ -41,7 +41,6 @@ cdef extern from "ddstore.hpp":
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
         void add[T](string name, T* buffer, int nrows, int disp) except +
-        void add[T](string name, T* buffer, int nrows, int disp, int gid) except +
         void get[T](string name, int start, int count, T* buffer) except +
         void epoch_begin()
         void epoch_end()
@@ -59,18 +58,18 @@ cdef class PyDDStore:
     def __cinit__(self, MPI.Comm comm):
         self.c_ddstore = DDStore(comm.ob_mpi)
     
-    def add(self, str name, np.ndarray arr, int gid=0):
+    def add(self, str name, np.ndarray arr):
         assert arr.flags.c_contiguous
         cdef int nrows = arr.shape[0]
         cdef int disp = arr.size / arr.shape[0]
         if arr.dtype == np.int32:
-            self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp, gid)
+            self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp)
         elif arr.dtype == np.int64:
-            self.c_ddstore.add(s2b(name), <long *> arr.data, nrows, disp, gid)
+            self.c_ddstore.add(s2b(name), <long *> arr.data, nrows, disp)
         elif arr.dtype == np.float32:
-            self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp, gid)
+            self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
         elif arr.dtype == np.float64:
-            self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp, gid)
+            self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp)
         else:
             raise NotImplementedError
 

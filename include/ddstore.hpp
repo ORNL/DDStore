@@ -10,15 +10,14 @@ struct VarInfo
     std::string name;
     std::string typeinfo;
     int disp;
-    int ngroup;
-    std::vector<int> lenlist;
+    std::vector<long> lenlist;
     MPI_Win win;
     bool active;
     bool fence_active;
 };
 typedef struct VarInfo VarInfo_t;
 
-int sortedsearch(std::vector<int> &vec, int num);
+int sortedsearch(std::vector<long> &vec, long num);
 
 class DDStore
 {
@@ -32,7 +31,7 @@ class DDStore
     void epoch_end();
     void free();
 
-    template <typename T> void add(std::string name, T *buffer, int nrows, int disp)
+    template <typename T> void add(std::string name, T *buffer, long nrows, int disp)
     {
         MPI_Win win;
         MPI_Win_create(buffer,                             /* pre-allocated buffer */
@@ -42,8 +41,8 @@ class DDStore
                        this->comm,                         /* communicator */
                        &win /* window object */);
 
-        std::vector<int> lenlist(this->comm_size);
-        MPI_Allgather(&nrows, 1, MPI_INT, lenlist.data(), 1, MPI_INT, this->comm);
+        std::vector<long> lenlist(this->comm_size);
+        MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
 
         int max_disp = 0;
         // We assume disp is same for all
@@ -51,7 +50,7 @@ class DDStore
         if (max_disp != disp)
             throw std::invalid_argument("Invalid disp");
 
-        int sum = 0;
+        long sum = 0;
         for (long unsigned int i = 0; i < lenlist.size(); i++)
         {
             sum += lenlist[i];
@@ -75,7 +74,7 @@ class DDStore
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }
 
-    template <typename T> void get(std::string name, int start, int count, T *buffer)
+    template <typename T> void get(std::string name, long start, long count, T *buffer)
     {
         VarInfo_t varinfo = this->varlist[name];
 
@@ -83,7 +82,7 @@ class DDStore
             throw std::invalid_argument("Invalid data type");
 
         int target = sortedsearch(varinfo.lenlist, start);
-        int offset = target > 0 ? varinfo.lenlist[target - 1] : 0;
+        long offset = target > 0 ? varinfo.lenlist[target - 1] : 0;
         // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
         // std::endl;
 
@@ -98,6 +97,12 @@ class DDStore
 
         MPI_Win win = varinfo.win;
         MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+        /*
+        int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
+                    origin_datatype, int target_rank, MPI_Aint target_disp,
+                    int target_count, MPI_Datatype target_datatype, MPI_Win
+                    win)
+        */
         MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
                 varinfo.disp * sizeof(T) * count, /* count on RMA origin process */
                 MPI_BYTE,                         /* type on RMA origin process */

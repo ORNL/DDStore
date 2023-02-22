@@ -10,7 +10,7 @@
 #define LOG BOOST_LOG_TRIVIAL(debug)
 #endif
 
-int sortedsearch(std::vector<int> &vec, int num)
+int sortedsearch(std::vector<long> &vec, long num)
 {
     int rtn = 0;
     for (long unsigned int i = 1; i < vec.size(); i++)

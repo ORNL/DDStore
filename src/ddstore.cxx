@@ -1,4 +1,5 @@
 #include "ddstore.hpp"
+
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -10,17 +11,24 @@
 #define LOG BOOST_LOG_TRIVIAL(debug)
 #endif
 
-int sortedsearch(std::vector<long> &vec, long num)
+int sortedsearch(std::vector<int> &vec, long unsigned int idx)
 {
     int rtn = 0;
-    for (long unsigned int i = 1; i < vec.size(); i++)
+    for (long unsigned int i = 0; i < vec.size() - 1; i++)
     {
-        if ((vec[i - 1] <= num) && (num < vec[i]))
+        if ((idx >= vec[i]) && (idx < vec[i + 1]))
         {
             rtn = i;
             break;
         }
     }
+
+    if (idx >= vec[vec.size() - 1])
+        rtn = vec.size() - 1;
+
+    if (idx < vec[0])
+        rtn = -1;
+
     return rtn;
 }
 

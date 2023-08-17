@@ -19,7 +19,7 @@ target_include_directories(ddstore PUBLIC include)
 
 add_executable (demo test/demo.cxx)
 target_link_libraries (demo PUBLIC ddstore)
-target_include_directories(demo PUBLIC ddstore)
+target_include_directories(demo PUBLIC include)
 
 # option(BUILD_PYTHON_BINDINGS "Build Python bindings using cython" ON)
 # find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)

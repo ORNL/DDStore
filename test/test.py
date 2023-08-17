@@ -130,8 +130,9 @@ if __name__ == "__main__":
     arr = arr * (rank + 1)
     arr = arr.reshape(shape)
     print(rank, "arr", np.mean(arr), arr.nbytes / 1024 / 1024 / 1024, "(GB)")
-    ddstore.add("var", arr)
-    ddstore.add("var2", arr)
+    lenlist = np.ones(num, dtype=np.int32)
+    ddstore.create("var", arr, lenlist)
+    ddstore.create("var2", arr, lenlist)
 
     comm.Barrier()
     idx_list = list()

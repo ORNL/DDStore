@@ -8,7 +8,8 @@ from mpi4py import MPI
 import argparse
 import pyddstore as dds
 import sys
-
+import io
+import pickle
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -18,8 +19,12 @@ if __name__ == "__main__":
         help="num. of data (default: %(default)s)",
         default=1024 * 1024,
     )
-    parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
-    parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
+    parser.add_argument(
+        "--dim", type=int, help="dim (default: %(default)s)", default=64
+    )
+    parser.add_argument(
+        "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
+    )
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -39,6 +44,7 @@ if __name__ == "__main__":
     print(rank, "arr", np.mean(arr), arr.nbytes / 1024 / 1024 / 1024, "(GB)")
     lenlist = np.ones(num, dtype=np.int32)
     ddstore.create("var", arr, lenlist)
+    print("Create done.")
 
     comm.Barrier()
     idx_list = list()
@@ -46,7 +52,7 @@ if __name__ == "__main__":
     for i in range(nbatch):
         idx = np.random.randint(num)
         buff = np.zeros((1, dim), dtype=dtype)
-        ddstore.get("var", buff, idx)
+        ddstore.get_ndarray("var", buff, idx)
         idx_list.append(idx)
         buff_list.append(buff)
 

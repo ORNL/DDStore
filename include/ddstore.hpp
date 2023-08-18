@@ -11,8 +11,11 @@ struct VarInfo
     std::string typeinfo;
     int disp;
     std::vector<int> lenlist; // list of sizes of all element
-    std::vector<int> counts;  // list of total number of elements each process has
+    std::vector<long unsigned int> dataoffsets; // list of offsets of all elements
     std::vector<int> offsets; // list of offsets at each process
+    // std::vector<int> offsetlist; // list of offsets at each process
+    // std::vector<int> counts;  // list of total number of elements each process has
+    // std::vector<int> process_offsets; // list of offsets at each process
     MPI_Win win;
     bool active;
     bool fence_active;
@@ -47,15 +50,15 @@ class DDStore
     */
 
     template <typename T>
-    void create(std::string name, T *buffer, int disp, int *local_lenlist, int ncount)
+    void create(std::string name, T *buffer, int disp, int *l_lenlist, int ncount)
     {
-        long sumlen = 0;
+        long l_ntotal = 0;
         for (int i = 0; i < ncount; i++)
-            sumlen += local_lenlist[i];
+            l_ntotal += l_lenlist[i];
 
         MPI_Win win;
         MPI_Win_create(buffer,                              /* pre-allocated buffer */
-                       (MPI_Aint)sumlen * disp * sizeof(T), /* size in bytes */
+                       (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
                        disp * sizeof(T),                    /* displacement units */
                        MPI_INFO_NULL,                       /* info object */
                        this->comm,                          /* communicator */
@@ -67,27 +70,44 @@ class DDStore
         std::vector<int> displs(this->comm_size);
 
         MPI_Allgather(&ncount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, this->comm);
-
-        int sum = 0;
-        long unsigned int i = 0;
-        for (auto &x : recvcounts)
+        int ntotal = 0;
         {
-            displs[i++] = sum;
-            sum += x;
+            long unsigned int i = 0;
+            for (auto &x : recvcounts)
+            {
+                displs[i++] = ntotal;
+                ntotal += x;
+            }
         }
-        // for (auto &x : recvcounts)
-        //     std::cout << this->rank << ": " << "recvcounts = " << x << std::endl;
-        // for (auto &x : displs)
-        //     std::cout << this->rank << ": " << "displs = " << x << std::endl;
-        // std::cout << this->rank << ": " << "sum = " << sum << std::endl;
 
-        std::vector<int> lenlist(sum);
+        // for (long unsigned int i = 0; i < recvcounts.size(); i++)
+        //     std::cout << this->rank << ": " << "recvcounts[" << i << "] = " << recvcounts[i] << std::endl;
+        // for (long unsigned int i = 0; i < displs.size(); i++)
+        //     std::cout << this->rank << ": " << "displs[" << i << "] = " << displs[i] << std::endl;
+        // std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
+
+        std::vector<int> lenlist(ntotal);
+        std::vector<long unsigned int> dataoffsets(ntotal);
         /*
         int MPI_Allgatherv(const void *sendbuf, int sendcount, MPI_Datatype
                             sendtype, void *recvbuf, const int *recvcounts, const int *displs,
                             MPI_Datatype recvtype, MPI_Comm comm)
         */
-        MPI_Allgatherv(local_lenlist, ncount, MPI_INT, lenlist.data(), recvcounts.data(), displs.data(), MPI_INT, this->comm);
+        MPI_Allgatherv(l_lenlist, ncount, MPI_INT, lenlist.data(), recvcounts.data(), displs.data(), MPI_INT, this->comm);
+        {
+            long unsigned int sum = 0;
+            long unsigned int i = 0;
+            for (auto &x : lenlist)
+            {
+                dataoffsets[i++] = sum;
+                sum += x;
+            }
+        }
+
+        // for (long unsigned int i = 0; i < lenlist.size(); i++)
+        //     std::cout << this->rank << ": " << "lenlist[" << i << "] = " << lenlist[i] << std::endl;
+        // for (long unsigned int i = 0; i < dataoffsets.size(); i++)
+        //     std::cout << this->rank << ": " << "dataoffsets[" << i << "] = " << dataoffsets[i] << std::endl;
 
         int max_disp = 0;
         // We assume disp is same for all
@@ -101,7 +121,7 @@ class DDStore
         var.disp = disp;
         var.win = win;
         var.lenlist = lenlist;
-        var.counts = recvcounts;
+        var.dataoffsets = dataoffsets;
         var.offsets = displs;
         var.active = true;
         var.fence_active = false;
@@ -118,9 +138,10 @@ class DDStore
             throw std::invalid_argument("Invalid data type");
 
         int target = sortedsearch(varinfo.offsets, id);
-        int offset = varinfo.offsets[target];
+        int offset = varinfo.dataoffsets[varinfo.offsets[target]];
         int len = varinfo.lenlist[id];
-        // std::cout << "[" << this->rank << "] id,target,offset: " << id << "," << target << "," << offset << std::endl;
+        long unsigned int dataoffset = varinfo.dataoffsets[id];
+        // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
 
         MPI_Win win = varinfo.win;
         MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
@@ -134,7 +155,7 @@ class DDStore
                 varinfo.disp * sizeof(T) * len, /* count on RMA origin process */
                 MPI_BYTE,                       /* type on RMA origin process */
                 target,                         /* rank of RMA target process */
-                id - offset,                    /* displacement on RMA target process */
+                dataoffset - offset,            /* displacement on RMA target process */
                 varinfo.disp * sizeof(T) * len, /* count on RMA target process */
                 MPI_BYTE,                       /* type on RMA target process */
                 win);                           /* window object */

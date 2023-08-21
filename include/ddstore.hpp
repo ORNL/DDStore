@@ -1,18 +1,32 @@
 #include <iostream>
 #include <map>
 #include <mpi.h>
+#include <mqueue.h>
 #include <string>
 #include <typeinfo>
 #include <vector>
+
+#define Q_NAME "/ddstore"
+#define Q_OFLAGS_CONSUMER (O_RDONLY)
+#define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
+#define Q_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+#define Q_ATTR_FLAGS 0
+// #define Q_ATTR_MSG_SIZE 1024
+#define Q_ATTR_MAX_MSG 10
+#define Q_ATTR_CURMSGS 0
+#define Q_CREATE_WAIT_US 1000000
+#define MSG_COUNT_DEFAULT 20
+#define MSG_PERIOD_US 100000
 
 struct VarInfo
 {
     std::string name;
     std::string typeinfo;
+    int itemsize;
     int disp;
-    std::vector<int> lenlist; // list of sizes of all element
+    std::vector<int> lenlist;                   // list of sizes of all element
     std::vector<long unsigned int> dataoffsets; // list of offsets of all elements
-    std::vector<int> offsets; // list of offsets at each process
+    std::vector<int> offsets;                   // list of offsets at each process
     // std::vector<int> offsetlist; // list of offsets at each process
     // std::vector<int> counts;  // list of total number of elements each process has
     // std::vector<int> process_offsets; // list of offsets at each process
@@ -21,6 +35,15 @@ struct VarInfo
     bool fence_active;
 };
 typedef struct VarInfo VarInfo_t;
+
+struct QueInfo
+{
+    mqd_t mq;
+    std::string mq_name;
+    long mq_msgsize;
+    int role;
+};
+typedef struct QueInfo QueInfo_t;
 
 int sortedsearch(std::vector<int> &vec, long unsigned int idx);
 
@@ -50,19 +73,19 @@ class DDStore
     */
 
     template <typename T>
-    void create(std::string name, T *buffer, int disp, int *l_lenlist, int ncount)
+    void create(std::string name, T *buffer, int disp, int *l_lenlist, int ncount, int use_mq = 0, int role = 0)
     {
         long l_ntotal = 0;
         for (int i = 0; i < ncount; i++)
             l_ntotal += l_lenlist[i];
 
         MPI_Win win;
-        MPI_Win_create(buffer,                              /* pre-allocated buffer */
+        MPI_Win_create(buffer,                                /* pre-allocated buffer */
                        (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
-                       disp * sizeof(T),                    /* displacement units */
-                       MPI_INFO_NULL,                       /* info object */
-                       this->comm,                          /* communicator */
-                       &win);                               /* window object */
+                       disp * sizeof(T),                      /* displacement units */
+                       MPI_INFO_NULL,                         /* info object */
+                       this->comm,                            /* communicator */
+                       &win);                                 /* window object */
 
         // Use MPI_Allgatherv
         // Note: expect possible limit for using int32 (due to MPI)
@@ -118,6 +141,7 @@ class DDStore
         VarInfo_t var;
         var.name = name;
         var.typeinfo = typeid(T).name();
+        var.itemsize = sizeof(T);
         var.disp = disp;
         var.win = win;
         var.lenlist = lenlist;
@@ -127,39 +151,66 @@ class DDStore
         var.fence_active = false;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+
+        if (use_mq)
+        {
+            queue_init(name, role);
+        }
     }
 
     template <typename T>
-    void get(std::string name, long unsigned int id, T *buffer)
+    void get(std::string name, long unsigned int id, T *buffer, int size)
     {
-        VarInfo_t varinfo = this->varlist[name];
+        int use_mq = quelist.count(name) == 0 ? 0 : 1;
+        int role = 0;
+        if (use_mq)
+        {
+            QueInfo_t queinfo = this->quelist[name];
+            role = queinfo.role;
+        }
 
+        VarInfo_t varinfo = this->varlist[name];
         if (varinfo.typeinfo != typeid(T).name())
             throw std::invalid_argument("Invalid data type");
-
-        int target = sortedsearch(varinfo.offsets, id);
-        int offset = varinfo.dataoffsets[varinfo.offsets[target]];
         int len = varinfo.lenlist[id];
-        long unsigned int dataoffset = varinfo.dataoffsets[id];
-        // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
+        int nbyte = varinfo.disp * sizeof(T) * len;
+        if ( (long unsigned int) nbyte > size * sizeof(T))
+            throw std::invalid_argument("Invalid buffer size");
 
-        MPI_Win win = varinfo.win;
-        MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
-        /*
-        int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
-                    origin_datatype, int target_rank, MPI_Aint target_disp,
-                    int target_count, MPI_Datatype target_datatype, MPI_Win
-                    win)
-        */
-        MPI_Get(buffer,                         /* pre-allocated buffer on RMA origin process */
-                varinfo.disp * sizeof(T) * len, /* count on RMA origin process */
-                MPI_BYTE,                       /* type on RMA origin process */
-                target,                         /* rank of RMA target process */
-                dataoffset - offset,            /* displacement on RMA target process */
-                varinfo.disp * sizeof(T) * len, /* count on RMA target process */
-                MPI_BYTE,                       /* type on RMA target process */
-                win);                           /* window object */
-        MPI_Win_unlock(target, win);
+        if (use_mq && (role == 1))
+        {
+            this->pull(name, (char *) buffer, nbyte);
+        }
+        else
+        {
+            int target = sortedsearch(varinfo.offsets, id);
+            int offset = varinfo.dataoffsets[varinfo.offsets[target]];
+            long unsigned int dataoffset = varinfo.dataoffsets[id];
+            // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
+
+            MPI_Win win = varinfo.win;
+            MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+            /*
+            int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
+                        origin_datatype, int target_rank, MPI_Aint target_disp,
+                        int target_count, MPI_Datatype target_datatype, MPI_Win
+                        win)
+            */
+            MPI_Get(buffer,              /* pre-allocated buffer on RMA origin process */
+                    nbyte,               /* count on RMA origin process */
+                    MPI_BYTE,            /* type on RMA origin process */
+                    target,              /* rank of RMA target process */
+                    dataoffset - offset, /* displacement on RMA target process */
+                    nbyte,               /* count on RMA target process */
+                    MPI_BYTE,            /* type on RMA target process */
+                    win);                /* window object */
+            MPI_Win_unlock(target, win);
+
+            if (use_mq && (role == 0))
+            {
+                this->push(name, (char *)buffer, nbyte);
+            }
+        }
     }
 
   private:
@@ -168,4 +219,9 @@ class DDStore
     int rank;
 
     std::map<std::string, VarInfo_t> varlist;
+    std::map<std::string, QueInfo_t> quelist;
+
+    void queue_init(std::string name, int role);
+    void push(std::string name, char *buffer, int size);
+    void pull(std::string name, char *buffer, int size);
 };

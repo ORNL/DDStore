@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.16)
 project(DDStore)
 set (CMAKE_CXX_STANDARD 11)
 
@@ -6,10 +6,11 @@ find_package(MPI REQUIRED)
 set(Boost_USE_STATIC_LIBS OFF)
 set(Boost_USE_MULTITHREADED OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)
-find_package(Boost COMPONENTS log log_setup)
-message(STATUS "Boost_INCLUDE_DIRS: " "${Boost_INCLUDE_DIRS}")
-message(STATUS "Boost_LIBRARIES: " "${Boost_LIBRARIES}")
-include_directories(${Boost_INCLUDE_DIRS})
+
+# find_package(Boost COMPONENTS log log_setup)
+# message(STATUS "Boost_INCLUDE_DIRS: " "${Boost_INCLUDE_DIRS}")
+# message(STATUS "Boost_LIBRARIES: " "${Boost_LIBRARIES}")
+# include_directories(${Boost_INCLUDE_DIRS})
 
 add_library(ddstore src/ddstore.cxx)
 set_property(TARGET ddstore PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -20,6 +21,9 @@ target_include_directories(ddstore PUBLIC include)
 add_executable (demo test/demo.cxx)
 target_link_libraries (demo PUBLIC ddstore)
 target_include_directories(demo PUBLIC include)
+
+find_library(LIBRT rt)
+target_link_libraries(ddstore PUBLIC ${LIBRT})
 
 # option(BUILD_PYTHON_BINDINGS "Build Python bindings using cython" ON)
 # find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)

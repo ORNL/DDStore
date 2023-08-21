@@ -50,8 +50,9 @@ cdef extern from "ddstore.hpp":
     cdef cppclass DDStore:
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
+        void create[T](string name, T* buffer, int disp, int* local_lenlist, int ncount, int use_mq, int role) except +
         void create[T](string name, T* buffer, int disp, int* local_lenlist, int ncount) except +
-        void get[T](string name, long id, T* buffer) except +
+        void get[T](string name, long id, T* buffer, int size) except +
         void epoch_begin()
         void epoch_end()
         void free()
@@ -76,17 +77,17 @@ cdef class PyDDStore:
         array.resize(a, 10)
         print (a, len(a))
 
-    cpdef create(self, str name, input, lenlist=None):
+    cpdef create(self, str name, input, lenlist=None, int use_mq = 0, int role = 0):
         cdef int[:] lenarr
         if isinstance(input, io.BytesIO):
             buffer = input.getbuffer()
             lenarr = array.array('i', lenlist)
-            self.__create_from_buffer(name, buffer, lenarr)
+            self.__create_from_buffer(name, buffer, lenarr, use_mq, role)
         elif isinstance(input, memoryview):
             lenarr = array.array('i', lenlist)
-            self.__create_from_buffer(name, input, lenarr)
+            self.__create_from_buffer(name, input, lenarr, use_mq, role)
         elif isinstance(input, np.ndarray):
-            self.__create__from_ndarray(name, input, lenlist)
+            self.__create__from_ndarray(name, input, lenarr, use_mq, role)
         elif isinstance(input, list):
             buffer = io.BytesIO()
             self.buffer_list[name] = buffer
@@ -98,11 +99,11 @@ cdef class PyDDStore:
                 lenlist.append(buffer.getbuffer().nbytes - prev)
                 prev = buffer.getbuffer().nbytes
             lenarr = array.array('i', lenlist)
-            self.__create_from_buffer(name, buffer.getbuffer(), lenarr)
+            self.__create_from_buffer(name, buffer.getbuffer(), lenarr, use_mq, role)
         else:
             raise NotImplementedError
 
-    cpdef __create_from_buffer(self, str name, char [:] buffer, int [:] lenlist):
+    cpdef __create_from_buffer(self, str name, char [:] buffer, int [:] lenlist, int use_mq = 0, int role = 0):
         cdef char *ptr = &buffer[0]
         cdef int *plen = &lenlist[0]
         cdef int ncount = len(lenlist)
@@ -134,7 +135,7 @@ cdef class PyDDStore:
     def get(self, str name, long id, decoder=None):
         n = self.query(name, id)
         cdef np.ndarray arr = np.chararray(n)
-        self.c_ddstore.get(s2b(name), id, <char *> arr.data)
+        self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
         rtn = arr.data[:n]
         if decoder is not None:
             rtn = decoder(rtn)
@@ -145,15 +146,15 @@ cdef class PyDDStore:
         cdef long count = arr.shape[0]
         assert arr.shape[0] >= count
         if arr.dtype == np.int32:
-            self.c_ddstore.get(s2b(name), id, <int *> arr.data)
+            self.c_ddstore.get(s2b(name), id, <int *> arr.data, arr.size)
         elif arr.dtype == np.int64:
-            self.c_ddstore.get(s2b(name), id, <long *> arr.data)
+            self.c_ddstore.get(s2b(name), id, <long *> arr.data, arr.size)
         elif arr.dtype == np.float32:
-            self.c_ddstore.get(s2b(name), id, <float *> arr.data)
+            self.c_ddstore.get(s2b(name), id, <float *> arr.data, arr.size)
         elif arr.dtype == np.float64:
-            self.c_ddstore.get(s2b(name), id, <double *> arr.data)
+            self.c_ddstore.get(s2b(name), id, <double *> arr.data, arr.size)
         elif arr.dtype == np.dtype('S1'):
-            self.c_ddstore.get(s2b(name), id, <char *> arr.data)
+            self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
         else:
             raise NotImplementedError
     

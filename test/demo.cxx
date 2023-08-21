@@ -10,8 +10,8 @@ int main(int argc, char *argv[])
     {
         fprintf(stderr, "Usage: %s <nsample> <use_mq> <role>\n", argv[0]);
         fprintf(stderr, "  nsample: number of samples per process\n");
-        fprintf(stderr, "  use_mq: (0 = false, 1 = true)\n");
-        fprintf(stderr, "  role:   (0 = producer, 1 = consumer)\n");
+        fprintf(stderr, "  use_mq: 0 = false, 1 = true\n");
+        fprintf(stderr, "  role: 0 = producer, 1 = consumer\n");
         return EINVAL;
     }
 
@@ -45,7 +45,7 @@ int main(int argc, char *argv[])
     len = (int *)malloc(N * sizeof(int));
     for (int i = 0; i < N; i++)
     {
-        buffer[i] = i + 1 + 10 * rank;
+        buffer[i] = i + N * rank;
         if (role == 1) 
             buffer[i] *= -1;
         len[i] = 1;

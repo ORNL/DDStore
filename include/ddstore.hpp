@@ -38,9 +38,12 @@ typedef struct VarInfo VarInfo_t;
 
 struct QueInfo
 {
-    mqd_t mq;
-    std::string mq_name;
-    long mq_msgsize;
+    mqd_t mqd;
+    mqd_t mqr;
+    std::string mqd_name;
+    std::string mqr_name;
+    long mqd_msgsize;
+    long mqr_msgsize;
     int role;
 };
 typedef struct QueInfo QueInfo_t;
@@ -161,12 +164,17 @@ class DDStore
     template <typename T>
     void get(std::string name, long unsigned int id, T *buffer, int size)
     {
-        int use_mq = quelist.count(name) == 0 ? 0 : 1;
-        int role = 0;
+        int use_mq = qlist.count(name) == 0 ? 0 : 1;
+        QueInfo_t queinfo;
+        int role = -1;
+        mqd_t mqd;
+        mqd_t mqr;
         if (use_mq)
         {
-            QueInfo_t queinfo = this->quelist[name];
+            queinfo = this->qlist[name];
             role = queinfo.role;
+            mqr = queinfo.mqr;
+            mqd = queinfo.mqd;
         }
 
         VarInfo_t varinfo = this->varlist[name];
@@ -179,10 +187,20 @@ class DDStore
 
         if (use_mq && (role == 1))
         {
-            this->pull(name, (char *) buffer, nbyte);
+            // printf("[%d:%d] push request: %ld\n", role, this->rank, id);
+            this->push(mqr, (char *) &id, sizeof(long unsigned int));
+            // printf("[%d:%d] wait receive data: %d bytes\n", role, this->rank, nbyte);
+            this->pull(mqd, (char *) buffer, nbyte);
         }
         else
         {
+            if (use_mq && (role == 0))
+            {
+                // get id from mqr
+                this->pull(mqr, (char *) &id, sizeof(long unsigned int));
+                // printf("[%d:%d] received request: %ld\n", role, this->rank, id);
+            }
+
             int target = sortedsearch(varinfo.offsets, id);
             int offset = varinfo.dataoffsets[varinfo.offsets[target]];
             long unsigned int dataoffset = varinfo.dataoffsets[id];
@@ -208,7 +226,7 @@ class DDStore
 
             if (use_mq && (role == 0))
             {
-                this->push(name, (char *)buffer, nbyte);
+                this->push(mqd, (char *)buffer, nbyte);
             }
         }
     }
@@ -219,9 +237,9 @@ class DDStore
     int rank;
 
     std::map<std::string, VarInfo_t> varlist;
-    std::map<std::string, QueInfo_t> quelist;
+    std::map<std::string, QueInfo_t> qlist;
 
     void queue_init(std::string name, int role);
-    void push(std::string name, char *buffer, int size);
-    void pull(std::string name, char *buffer, int size);
+    void push(mqd_t mq, char *buffer, int size);
+    void pull(mqd_t mq, char *buffer, int size);
 };

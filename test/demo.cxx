@@ -60,7 +60,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < ntotal; i++)
     {
         // printf("[%d:%d] reading: %d\n", role, rank, i);
-        dds.get<double>("var", i, &(getbuf[i]), 1);
+        dds.get<double>("var", ntotal-i-1, &(getbuf[i]), 1);
     }
     if (role == 1)
     {

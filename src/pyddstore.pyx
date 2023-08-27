@@ -108,9 +108,9 @@ cdef class PyDDStore:
         cdef int *plen = &lenlist[0]
         cdef int ncount = len(lenlist)
         cdef int dist = 1
-        self.c_ddstore.create(s2b(name), <char *> ptr, dist, <int *> plen, ncount)
+        self.c_ddstore.create(s2b(name), <char *> ptr, dist, <int *> plen, ncount, use_mq, role)
 
-    def __create__from_ndarray(self, str name, np.ndarray arr, np.ndarray lenlist):
+    def __create__from_ndarray(self, str name, np.ndarray arr, np.ndarray lenlist, int use_mq = 0, int role = 0):
         assert arr.flags.c_contiguous
         assert lenlist.flags.c_contiguous
         assert lenlist.dtype == np.int32
@@ -120,15 +120,15 @@ cdef class PyDDStore:
         cdef int disp = arr.size // arr.shape[0]
         cdef int ncount = lenlist.size
         if arr.dtype == np.int32:
-            self.c_ddstore.create(s2b(name), <int *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <int *> arr.data, disp, <int *> lenlist.data, ncount, use_mq, role)
         elif arr.dtype == np.int64:
-            self.c_ddstore.create(s2b(name), <long *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <long *> arr.data, disp, <int *> lenlist.data, ncount, use_mq, role)
         elif arr.dtype == np.float32:
-            self.c_ddstore.create(s2b(name), <float *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <float *> arr.data, disp, <int *> lenlist.data, ncount, use_mq, role)
         elif arr.dtype == np.float64:
-            self.c_ddstore.create(s2b(name), <double *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <double *> arr.data, disp, <int *> lenlist.data, ncount, use_mq, role)
         elif arr.dtype == np.dtype('S1'):
-            self.c_ddstore.create(s2b(name), <char *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <char *> arr.data, disp, <int *> lenlist.data, ncount, use_mq, role)
         else:
             raise NotImplementedError
 

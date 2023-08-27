@@ -155,6 +155,7 @@ class DDStore
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
 
+        std::cout << this->rank << ": " << "use_mq,role = " << use_mq << ", " << role << std::endl;
         if (use_mq)
         {
             queue_init(name, role);

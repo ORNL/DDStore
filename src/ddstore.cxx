@@ -76,18 +76,18 @@ DDStore::~DDStore()
         }
         if (x.second.role == 0)
         {
-            // consumer destroys the queue
-            if (mq_unlink(x.second.mqr_name.c_str()))
+            // producer destroys the queue
+            if (mq_unlink(x.second.mqd_name.c_str()))
             {
-                perror("mqr: mq_unlink");
+                perror("mqd: mq_unlink");
             }
         }
         if (x.second.role == 1)
         {
             // consumer destroys the queue
-            if (mq_unlink(x.second.mqd_name.c_str()))
+            if (mq_unlink(x.second.mqr_name.c_str()))
             {
-                perror("mqd: mq_unlink");
+                perror("mqr: mq_unlink");
             }
         }
     }
@@ -146,18 +146,19 @@ void DDStore::queue_init(std::string name, int role)
     long mqd_msgsize = 0;
     long mqr_msgsize = sizeof(long unsigned int);
 
-    VarInfo_t &varinfo = this->varlist[name];
-    std::vector<int> &lenlist = varinfo.lenlist;
-    for (long unsigned int i = 0; i < lenlist.size(); i++)
-        if (lenlist[i] > mqd_msgsize)
-            mqd_msgsize = lenlist[i];
-    mqd_msgsize *=  varinfo.itemsize * varinfo.disp;
+    // VarInfo_t &varinfo = this->varlist[name];
+    // std::vector<int> &lenlist = varinfo.lenlist;
+    // for (long unsigned int i = 0; i < lenlist.size(); i++)
+    //     if (lenlist[i] > mqd_msgsize)
+    //         mqd_msgsize = lenlist[i];
+    // mqd_msgsize *=  varinfo.itemsize * varinfo.disp;
+    mqd_msgsize = (long) Q_ATTR_MSG_SIZE;
 
 
     snprintf(mqd_name, 128, "%sd-%s-%d", Q_NAME, name.c_str(), this->rank);
     snprintf(mqr_name, 128, "%sr-%s-%d", Q_NAME, name.c_str(), this->rank);
 
-    if (role == 0)
+    if (role == 0) // producer
     {
         // producer
         struct mq_attr q_attr = {
@@ -171,7 +172,7 @@ void DDStore::queue_init(std::string name, int role)
         // setup data mq
         if ((mqd = mq_open(mqd_name, Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
         {
-            perror("produce: mq_open");
+            perror("produce: mqd open");
             return;
         }
 
@@ -184,7 +185,7 @@ void DDStore::queue_init(std::string name, int role)
                 usleep(Q_CREATE_WAIT_US);
                 continue;
             }
-            perror("produce: mq_open");
+            perror("produce: mqr open");
             return;
         }
 
@@ -203,7 +204,7 @@ void DDStore::queue_init(std::string name, int role)
         // setup req mq
         if ((mqr = mq_open(mqr_name, Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
         {
-            perror("consume: mq_open");
+            perror("consume: mqr open");
             return;
         }
 
@@ -216,7 +217,7 @@ void DDStore::queue_init(std::string name, int role)
                 usleep(Q_CREATE_WAIT_US);
                 continue;
             }
-            perror("consume: mq_open");
+            perror("consume: mqd open");
             return;
         }
     }
@@ -233,22 +234,31 @@ void DDStore::queue_init(std::string name, int role)
     this->qlist.insert(std::pair<std::string, QueInfo_t>(name, queinfo));
 }
 
-void DDStore::push(mqd_t mq, char *buffer, int size)
+void DDStore::pushr(mqd_t mq, char *buffer, long size)
 {
-    printf ("mq_send: %d\n", size);
+    printf ("pushr: %ld\n", size);
+
+    struct mq_attr attr;
+    mq_getattr(mq, &attr);
+    if (size > attr.mq_msgsize)
+    {
+        perror("pushr: too big");
+        return;
+    }
+
     int rc;
     rc = mq_send(mq, buffer, size, 0);
     if (rc < 0)
     {
-        perror("produce: mq_send");
+        perror("pushr: send error");
     }
     else
     {
-        printf("produce: send (%d)\n", rc);
+        printf("pushr: send (%d)\n", rc);
     }
 }
 
-void DDStore::pull(mqd_t mq, char *buffer, int size)
+void DDStore::pullr(mqd_t mq, char *buffer, long size)
 {
     int rc;
     struct mq_attr attr;
@@ -258,20 +268,105 @@ void DDStore::pull(mqd_t mq, char *buffer, int size)
     // printf("mq_maxmsg %ld\n", attr.mq_maxmsg);
     // printf("mqd_msgsize %ld\n", attr.mq_msgsize);
     // printf("mq_curmsgs %ld\n", attr.mq_curmsgs);
-    if (attr.mq_msgsize > size)
+    if (size > attr.mq_msgsize)
     {
-        perror("pull: too big");
+        perror("pullr: too big");
         return;
     }
 
     memset(buffer, 0, size);
-    rc = mq_receive(mq, buffer, attr.mq_msgsize, NULL);
+    rc = mq_receive(mq, buffer, size, NULL);
     if (rc < 0)
     {
-        perror("consume: mq_receive");
+        perror("pullr: recv error");
     }
     else
     {
-        printf("consume: recv (%d)\n", rc);
+        printf("pullr: recv (%d)\n", rc);
+    }
+}
+
+void DDStore::pushd(mqd_t mq, char *buffer, long size)
+{
+    // 1. calculate nchunk
+    // 2. send nchunk info first
+    // 3. send data in chunk
+    struct mq_attr attr;
+    mq_getattr(mq, &attr);
+    // printf("mq_flags %ld\n", attr.mq_flags);
+    // printf("mq_maxmsg %ld\n", attr.mq_maxmsg);
+    // printf("mqd_msgsize %ld\n", attr.mq_msgsize);
+    // printf("mq_curmsgs %ld\n", attr.mq_curmsgs);
+
+    int nchunk = size / attr.mq_msgsize;
+    if (size > nchunk * attr.mq_msgsize)
+        nchunk += 1;
+    printf ("pushd: %ld %d\n", size, nchunk);
+
+    int rc;
+    rc = mq_send(mq, (const char *)&nchunk, sizeof(int), 0);
+    if (rc < 0)
+    {
+        perror("pushd: send head error");
+    }
+    else
+    {
+        printf("pushd: send head (%d)\n", rc);
+    }
+
+    for (int i = 0; i < nchunk; i++)
+    {
+        int len = attr.mq_msgsize;
+        if (i == nchunk - 1)
+            len = size - i * attr.mq_msgsize;
+
+        rc = mq_send(mq, buffer + i * attr.mq_msgsize, len, 0);
+        if (rc < 0)
+        {
+            perror("pushd: send data error");
+        }
+        else
+        {
+            printf("pushd: send data (%d)\n", rc);
+        }
+    }
+}
+
+void DDStore::pulld(mqd_t mq, char *buffer, long size)
+{
+    int rc;
+    int nchunk = 0;
+    struct mq_attr attr;
+    mq_getattr(mq, &attr);
+    char msg[Q_ATTR_MSG_SIZE];
+
+    rc = mq_receive(mq, (char *)&nchunk, attr.mq_msgsize, NULL);
+    if (rc < 0)
+    {
+        perror("pulld: recv head error");
+    }
+    else
+    {
+        printf("pulld: recv head (%d)\n", rc);
+    }
+    printf ("pulld: %ld %d\n", size, nchunk);
+
+    memset(buffer, 0, size);
+
+    for (int i = 0; i < nchunk; i++) 
+    {
+        int len = attr.mq_msgsize;
+        if (i == nchunk - 1)
+            len = size - i * attr.mq_msgsize;
+
+        rc = mq_receive(mq, buffer + i * attr.mq_msgsize, attr.mq_msgsize, NULL);
+        if (rc < 0)
+        {
+            perror("pulld: recv data error");
+        }
+        else
+        {
+            printf("pulld: recv data (%d)\n", rc);
+        }
     }
 }

@@ -15,7 +15,7 @@ int main(int argc, char *argv[])
         return EINVAL;
     }
 
-    int N = 20;
+    int N = 10;
     int use_mq = 0;
     int role = 0;
 
@@ -45,7 +45,7 @@ int main(int argc, char *argv[])
     len = (int *)malloc(N * sizeof(int));
     for (int i = 0; i < N; i++)
     {
-        buffer[i] = i + N * rank;
+        buffer[i] = i + N * rank + 1;
         if (role == 1) 
             buffer[i] *= -1;
         len[i] = 1;

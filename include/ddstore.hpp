@@ -11,7 +11,7 @@
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
 #define Q_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #define Q_ATTR_FLAGS 0
-// #define Q_ATTR_MSG_SIZE 1024
+#define Q_ATTR_MSG_SIZE 4096 //8192
 #define Q_ATTR_MAX_MSG 10
 #define Q_ATTR_CURMSGS 0
 #define Q_CREATE_WAIT_US 1000000
@@ -38,13 +38,13 @@ typedef struct VarInfo VarInfo_t;
 
 struct QueInfo
 {
-    mqd_t mqd;
-    mqd_t mqr;
+    mqd_t mqd; // data mq
+    mqd_t mqr; // request mq
     std::string mqd_name;
     std::string mqr_name;
     long mqd_msgsize;
     long mqr_msgsize;
-    int role;
+    int role; // 0 = producer, 1 = consumer
 };
 typedef struct QueInfo QueInfo_t;
 
@@ -168,8 +168,8 @@ class DDStore
         int use_mq = qlist.count(name) == 0 ? 0 : 1;
         QueInfo_t queinfo;
         int role = -1;
-        mqd_t mqd;
-        mqd_t mqr;
+        mqd_t mqd = 0;
+        mqd_t mqr = 0;
         if (use_mq)
         {
             queinfo = this->qlist[name];
@@ -188,18 +188,18 @@ class DDStore
 
         if (use_mq && (role == 1))
         {
-            // printf("[%d:%d] push request: %ld\n", role, this->rank, id);
-            this->push(mqr, (char *) &id, sizeof(long unsigned int));
-            // printf("[%d:%d] wait receive data: %d bytes\n", role, this->rank, nbyte);
-            this->pull(mqd, (char *) buffer, nbyte);
+            printf("[%d:%d] push request: %ld\n", role, this->rank, id);
+            this->pushr(mqr, (char *) &id, sizeof(long unsigned int));
+            printf("[%d:%d] pull data: %d bytes\n", role, this->rank, nbyte);
+            this->pulld(mqd, (char *) buffer, nbyte);
         }
         else
         {
             if (use_mq && (role == 0))
             {
                 // get id from mqr
-                this->pull(mqr, (char *) &id, sizeof(long unsigned int));
-                // printf("[%d:%d] received request: %ld\n", role, this->rank, id);
+                this->pullr(mqr, (char *) &id, sizeof(long unsigned int));
+                printf("[%d:%d] pull request: %ld\n", role, this->rank, id);
             }
 
             int target = sortedsearch(varinfo.offsets, id);
@@ -227,7 +227,8 @@ class DDStore
 
             if (use_mq && (role == 0))
             {
-                this->push(mqd, (char *)buffer, nbyte);
+                printf("[%d:%d] push data: %ld\n", role, this->rank, id);
+                this->pushd(mqd, (char *)buffer, nbyte);
             }
         }
     }
@@ -241,6 +242,8 @@ class DDStore
     std::map<std::string, QueInfo_t> qlist;
 
     void queue_init(std::string name, int role);
-    void push(mqd_t mq, char *buffer, int size);
-    void pull(mqd_t mq, char *buffer, int size);
+    void pushr(mqd_t mq, char *buffer, long size);
+    void pullr(mqd_t mq, char *buffer, long size);
+    void pushd(mqd_t mq, char *buffer, long size);
+    void pulld(mqd_t mq, char *buffer, long size);
 };

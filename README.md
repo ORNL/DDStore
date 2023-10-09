@@ -11,3 +11,9 @@ CC=mpicc CXX=mpicxx python setup.py build_ext --inplace
 ```
 mpirun -n 4 python test/demo.py
 ```
+
+* MQ producer/consumer test
+```
+mpirun -n 2 python test/demo2.py --mq --consumer & 
+mpirun -n 2 python test/demo2.py --mq --producer
+```

@@ -5,6 +5,8 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <stdio.h>
+#include <stdlib.h>
 
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
@@ -44,7 +46,6 @@ struct QueInfo
     std::string mqr_name;
     long mqd_msgsize;
     long mqr_msgsize;
-    int role; // 0 = producer, 1 = consumer
 };
 typedef struct QueInfo QueInfo_t;
 
@@ -55,7 +56,11 @@ class DDStore
   public:
     DDStore();
     DDStore(MPI_Comm comm);
+    DDStore(MPI_Comm comm, int use_mq, int role);
     ~DDStore();
+
+    int use_mq; 
+    int role; // 0 = producer, 1 = consumer
 
     void query(std::string name, VarInfo_t &varinfo);
     void epoch_begin();
@@ -76,104 +81,169 @@ class DDStore
     */
 
     template <typename T>
-    void create(std::string name, T *buffer, int disp, int *l_lenlist, int ncount, int use_mq = 0, int role = 0)
+    void create(std::string name, T *buffer, int disp, int *l_lenlist, int ncount)
     {
         long l_ntotal = 0;
         for (int i = 0; i < ncount; i++)
             l_ntotal += l_lenlist[i];
 
-        MPI_Win win;
-        MPI_Win_create(buffer,                                /* pre-allocated buffer */
-                       (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
-                       disp * sizeof(T),                      /* displacement units */
-                       MPI_INFO_NULL,                         /* info object */
-                       this->comm,                            /* communicator */
-                       &win);                                 /* window object */
-
-        // Use MPI_Allgatherv
-        // Note: expect possible limit for using int32 (due to MPI)
-        std::vector<int> recvcounts(this->comm_size);
-        std::vector<int> displs(this->comm_size);
-
-        MPI_Allgather(&ncount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, this->comm);
-        int ntotal = 0;
-        {
-            long unsigned int i = 0;
-            for (auto &x : recvcounts)
-            {
-                displs[i++] = ntotal;
-                ntotal += x;
-            }
-        }
-
-        // for (long unsigned int i = 0; i < recvcounts.size(); i++)
-        //     std::cout << this->rank << ": " << "recvcounts[" << i << "] = " << recvcounts[i] << std::endl;
-        // for (long unsigned int i = 0; i < displs.size(); i++)
-        //     std::cout << this->rank << ": " << "displs[" << i << "] = " << displs[i] << std::endl;
-        // std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
-
-        std::vector<int> lenlist(ntotal);
-        std::vector<long unsigned int> dataoffsets(ntotal);
-        /*
-        int MPI_Allgatherv(const void *sendbuf, int sendcount, MPI_Datatype
-                            sendtype, void *recvbuf, const int *recvcounts, const int *displs,
-                            MPI_Datatype recvtype, MPI_Comm comm)
-        */
-        MPI_Allgatherv(l_lenlist, ncount, MPI_INT, lenlist.data(), recvcounts.data(), displs.data(), MPI_INT, this->comm);
-        {
-            long unsigned int sum = 0;
-            long unsigned int i = 0;
-            for (auto &x : lenlist)
-            {
-                dataoffsets[i++] = sum;
-                sum += x;
-            }
-        }
-
-        // for (long unsigned int i = 0; i < lenlist.size(); i++)
-        //     std::cout << this->rank << ": " << "lenlist[" << i << "] = " << lenlist[i] << std::endl;
-        // for (long unsigned int i = 0; i < dataoffsets.size(); i++)
-        //     std::cout << this->rank << ": " << "dataoffsets[" << i << "] = " << dataoffsets[i] << std::endl;
-
-        int max_disp = 0;
-        // We assume disp is same for all
-        MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
-        if (max_disp != disp)
-            throw std::invalid_argument("Invalid disp");
-
         VarInfo_t var;
+        MPI_Win win;
+        
+        if ((use_mq == 0) || (use_mq && (role == 0)))
+        {
+            MPI_Win_create(buffer,                                /* pre-allocated buffer */
+                        (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
+                        disp * sizeof(T),                      /* displacement units */
+                        MPI_INFO_NULL,                         /* info object */
+                        this->comm,                            /* communicator */
+                        &win);                                 /* window object */
+
+            // Use MPI_Allgatherv
+            // Note: expect possible limit for using int32 (due to MPI)
+            std::vector<int> recvcounts(this->comm_size);
+            std::vector<int> displs(this->comm_size);
+
+            MPI_Allgather(&ncount, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, this->comm);
+            int ntotal = 0;
+            {
+                long unsigned int i = 0;
+                for (auto &x : recvcounts)
+                {
+                    displs[i++] = ntotal;
+                    ntotal += x;
+                }
+            }
+
+            // for (long unsigned int i = 0; i < recvcounts.size(); i++)
+            //     std::cout << this->rank << ": " << "recvcounts[" << i << "] = " << recvcounts[i] << std::endl;
+            // for (long unsigned int i = 0; i < displs.size(); i++)
+            //     std::cout << this->rank << ": " << "displs[" << i << "] = " << displs[i] << std::endl;
+            // std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
+
+            std::vector<int> lenlist(ntotal);
+            std::vector<long unsigned int> dataoffsets(ntotal);
+            /*
+            int MPI_Allgatherv(const void *sendbuf, int sendcount, MPI_Datatype
+                                sendtype, void *recvbuf, const int *recvcounts, const int *displs,
+                                MPI_Datatype recvtype, MPI_Comm comm)
+            */
+            MPI_Allgatherv(l_lenlist, ncount, MPI_INT, lenlist.data(), recvcounts.data(), displs.data(), MPI_INT, this->comm);
+            {
+                long unsigned int sum = 0;
+                long unsigned int i = 0;
+                for (auto &x : lenlist)
+                {
+                    dataoffsets[i++] = sum;
+                    sum += x;
+                }
+            }
+
+            // for (long unsigned int i = 0; i < lenlist.size(); i++)
+            //     std::cout << this->rank << ": " << "lenlist[" << i << "] = " << lenlist[i] << std::endl;
+            // for (long unsigned int i = 0; i < dataoffsets.size(); i++)
+            //     std::cout << this->rank << ": " << "dataoffsets[" << i << "] = " << dataoffsets[i] << std::endl;
+
+            int max_disp = 0;
+            // We assume disp is same for all
+            MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
+            if (max_disp != disp)
+                throw std::invalid_argument("Invalid disp");
+
+            var.lenlist = lenlist;
+            var.dataoffsets = dataoffsets;
+            var.offsets = displs;
+        }
+
+        // std::cout << this->rank << ": " << "use_mq,role = " << use_mq << ", " << role << std::endl;
+        if (use_mq)
+        {
+            queue_init(name);
+        }
+
+        // exchange lenlist
+        if (use_mq)
+        {
+            QueInfo_t queinfo;
+            mqd_t mq = 0;
+
+            queinfo = this->qlist[name];
+            mq = queinfo.mqd;
+
+            int rc = 0;
+            int ntotal = 0;
+            int nbytes = 0;
+            struct mq_attr attr;
+            mq_getattr(mq, &attr);
+
+            int nchunk;
+
+            if (role == 0)
+            {
+                ntotal = var.lenlist.size();
+                nbytes = ntotal * sizeof(int);
+                rc = mq_send(mq, (char *) &ntotal, sizeof(int), 0);
+
+                nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
+                for (int i = 0; i < nchunk; i++)
+                {
+                    int len = attr.mq_msgsize;
+                    if (i == nchunk - 1)
+                        len = nbytes - i * attr.mq_msgsize;
+
+                    rc = mq_send(mq, (char *)(var.lenlist.data() + i * attr.mq_msgsize), len, 0);
+                }
+
+                for (int i = 0; i < ntotal; i++)
+                {
+                    printf("lenlist[%d]: %d\n", i, var.lenlist[i]);
+                }
+            }
+            else
+            {
+                rc = mq_receive(mq, (char *) &ntotal, attr.mq_msgsize, NULL);
+
+                std::vector<int> lenlist(ntotal);
+                nchunk = ntotal * sizeof(int) / attr.mq_msgsize  + 1;
+                printf("pulld: recv ntotal (%d): %d %d\n", rc, ntotal, nchunk);
+
+                for (int i = 0; i < nchunk; i++) 
+                {
+                    rc = mq_receive(mq, (char *)(lenlist.data() + i * attr.mq_msgsize), attr.mq_msgsize, NULL);
+                    nbytes += rc;
+                    printf("[%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->rank, rc, i, nbytes);
+                }
+
+                var.lenlist = lenlist;
+
+                for (int i = 0; i < ntotal; i++)
+                {
+                    printf("lenlist[%d]: %d\n", i, var.lenlist[i]);
+                }
+            }
+        }
+
         var.name = name;
         var.typeinfo = typeid(T).name();
         var.itemsize = sizeof(T);
         var.disp = disp;
         var.win = win;
-        var.lenlist = lenlist;
-        var.dataoffsets = dataoffsets;
-        var.offsets = displs;
         var.active = true;
         var.fence_active = false;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
-
-        // std::cout << this->rank << ": " << "use_mq,role = " << use_mq << ", " << role << std::endl;
-        if (use_mq)
-        {
-            queue_init(name, role);
-        }
     }
 
     template <typename T>
-    void get(std::string name, long unsigned int id, T *buffer, int size)
+    int get(std::string name, long unsigned int id, T *buffer, int size)
     {
-        int use_mq = qlist.count(name) == 0 ? 0 : 1;
         QueInfo_t queinfo;
-        int role = -1;
         mqd_t mqd = 0;
         mqd_t mqr = 0;
+
         if (use_mq)
         {
             queinfo = this->qlist[name];
-            role = queinfo.role;
             mqr = queinfo.mqr;
             mqd = queinfo.mqd;
         }
@@ -181,15 +251,26 @@ class DDStore
         VarInfo_t varinfo = this->varlist[name];
         if (varinfo.typeinfo != typeid(T).name())
             throw std::invalid_argument("Invalid data type");
-        int len = varinfo.lenlist[id];
-        int nbyte = varinfo.disp * sizeof(T) * len;
+        int len = 0;
+        int nbyte = 0;
+        
+        len = varinfo.lenlist[id];
+        nbyte = varinfo.disp * sizeof(T) * len;
         if ( (long unsigned int) nbyte > size * sizeof(T))
             throw std::invalid_argument("Invalid buffer size");
 
         if (use_mq && (role == 1))
         {
+
             printf("[%d:%d] push request: %ld\n", role, this->rank, id);
             this->pushr(mqr, (char *) &id, sizeof(long unsigned int));
+
+            if (id == -1) 
+            {
+                printf("[%d:%d] -1\n", role, this->rank);
+                return -1;
+            }
+
             printf("[%d:%d] pull data: %d bytes\n", role, this->rank, nbyte);
             this->pulld(mqd, (char *) buffer, nbyte);
         }
@@ -200,6 +281,17 @@ class DDStore
                 // get id from mqr
                 this->pullr(mqr, (char *) &id, sizeof(long unsigned int));
                 printf("[%d:%d] pull request: %ld\n", role, this->rank, id);
+
+                if (id == -1) 
+                {
+                    printf("[%d:%d] -1\n", role, this->rank);
+                    return -1;
+                }
+
+                // reset based on the requested id
+                len = varinfo.lenlist[id];
+                nbyte = varinfo.disp * sizeof(T) * len;
+                buffer = (T *)std::malloc(nbyte);
             }
 
             int target = sortedsearch(varinfo.offsets, id);
@@ -229,8 +321,11 @@ class DDStore
             {
                 printf("[%d:%d] push data: %ld\n", role, this->rank, id);
                 this->pushd(mqd, (char *)buffer, nbyte);
+                std::free((void *)buffer);
             }
         }
+
+        return 0;
     }
 
   private:
@@ -241,7 +336,7 @@ class DDStore
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;
 
-    void queue_init(std::string name, int role);
+    void queue_init(std::string name);
     void pushr(mqd_t mq, char *buffer, long size);
     void pullr(mqd_t mq, char *buffer, long size);
     void pushd(mqd_t mq, char *buffer, long size);

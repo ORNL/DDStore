@@ -65,7 +65,7 @@ if __name__ == "__main__":
     for i in range(num):
         x = np.ones(shape, dtype=dtype) * (rank * num + i + 1000)
         dataset.append(x)
-    ddstore.create("var", dataset, use_mq=use_mq, role=role)
+    ddstore.add("var", dataset, use_mq=use_mq, role=role)
     print(
         "Create done: ",
         ddstore.buffer("var").getbuffer().nbytes / 1024 / 1024 / 1024,

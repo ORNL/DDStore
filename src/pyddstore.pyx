@@ -89,7 +89,8 @@ cdef class PyDDStore:
             lenarr = array.array('i', lenlist)
             self.__create_from_buffer(name, input, lenarr)
         elif isinstance(input, np.ndarray):
-            self.__create__from_ndarray(name, input, lenarr)
+            _lenarr = np.ones(len(input), dtype=np.int32)
+            self.__create__from_ndarray(name, input, _lenarr)
         elif isinstance(input, list):
             buffer = io.BytesIO()
             self.buffer_list[name] = buffer

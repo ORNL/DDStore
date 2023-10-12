@@ -265,12 +265,6 @@ class DDStore
             printf("[%d:%d] push request: %ld\n", role, this->rank, id);
             this->pushr(mqr, (char *) &id, sizeof(long unsigned int));
 
-            if (id == -1) 
-            {
-                printf("[%d:%d] -1\n", role, this->rank);
-                return -1;
-            }
-
             printf("[%d:%d] pull data: %d bytes\n", role, this->rank, nbyte);
             this->pulld(mqd, (char *) buffer, nbyte);
         }
@@ -282,12 +276,6 @@ class DDStore
                 this->pullr(mqr, (char *) &id, sizeof(long unsigned int));
                 printf("[%d:%d] pull request: %ld\n", role, this->rank, id);
 
-                if (id == -1) 
-                {
-                    printf("[%d:%d] -1\n", role, this->rank);
-                    return -1;
-                }
-
                 // reset based on the requested id
                 len = varinfo.lenlist[id];
                 nbyte = varinfo.disp * sizeof(T) * len;
@@ -295,7 +283,7 @@ class DDStore
             }
 
             int target = sortedsearch(varinfo.offsets, id);
-            int offset = varinfo.dataoffsets[varinfo.offsets[target]];
+            long unsigned int offset = varinfo.dataoffsets[varinfo.offsets[target]];
             long unsigned int dataoffset = varinfo.dataoffsets[id];
             // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
 

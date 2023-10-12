@@ -144,7 +144,10 @@ void DDStore::free()
         for (auto &x : this->varlist)
         {
             if (x.second.active)
-                MPI_Win_free(&x.second.win);
+            {
+                if (!use_mq || (use_mq && (role == 0)))
+                    MPI_Win_free(&x.second.win);
+            }
             x.second.active = false;
         }
     }

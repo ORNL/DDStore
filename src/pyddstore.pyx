@@ -89,8 +89,11 @@ cdef class PyDDStore:
             lenarr = array.array('i', lenlist)
             self.__create_from_buffer(name, input, lenarr)
         elif isinstance(input, np.ndarray):
-            _lenarr = np.ones(len(input), dtype=np.int32)
-            self.__create__from_ndarray(name, input, _lenarr)
+            if lenlist is None:
+                lenarr = np.ones(len(input), dtype=np.int32)
+            else:
+                lenarr = array.array('i', lenlist)
+            self.__create__from_ndarray(name, input, lenarr)
         elif isinstance(input, list):
             buffer = io.BytesIO()
             self.buffer_list[name] = buffer
@@ -113,41 +116,38 @@ cdef class PyDDStore:
         cdef int dist = 1
         self.c_ddstore.create(s2b(name), <char *> ptr, dist, <int *> plen, ncount)
 
-    def __create__from_ndarray(self, str name, np.ndarray arr, np.ndarray lenlist):
+    def __create__from_ndarray(self, str name, np.ndarray arr, int [:] lenlist):
         assert arr.flags.c_contiguous
-        assert lenlist.flags.c_contiguous
-        assert lenlist.dtype == np.int32
-        assert lenlist.ndim == 1
-        assert lenlist.sum() == arr.shape[0]
+        #assert lenlist.flags.c_contiguous
+        #assert lenlist.dtype == np.int32
+        #assert lenlist.ndim == 1
+        #assert lenlist.sum() == arr.shape[0]
         cdef long nrows = arr.shape[0]
         cdef int disp = arr.size // arr.shape[0]
         cdef int ncount = lenlist.size
+        cdef int *plen = &lenlist[0]
         if arr.dtype == np.int32:
-            self.c_ddstore.create(s2b(name), <int *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <int *> arr.data, disp, <int *> plen, ncount)
         elif arr.dtype == np.int64:
-            self.c_ddstore.create(s2b(name), <long *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <long *> arr.data, disp, <int *> plen, ncount)
         elif arr.dtype == np.float32:
-            self.c_ddstore.create(s2b(name), <float *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <float *> arr.data, disp, <int *> plen, ncount)
         elif arr.dtype == np.float64:
-            self.c_ddstore.create(s2b(name), <double *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <double *> arr.data, disp, <int *> plen, ncount)
         elif arr.dtype == np.dtype('S1'):
-            self.c_ddstore.create(s2b(name), <char *> arr.data, disp, <int *> lenlist.data, ncount)
+            self.c_ddstore.create(s2b(name), <char *> arr.data, disp, <int *> plen, ncount)
         else:
             raise NotImplementedError
 
     def get(self, str name, long id, decoder=None):
         cdef np.ndarray arr
         if (not self.c_ddstore.use_mq) or (self.c_ddstore.use_mq and self.c_ddstore.role):
-            if id >= 0:
-                n = self.query(name, id)
-                print ("query:", id, n)
-                arr = np.chararray(n)
-                self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
-                rtn = arr.data[:n]
-                if decoder is not None:
-                    rtn = decoder(rtn)
-            else:
-                rtn = self.c_ddstore.get(s2b(name), -1, <char *> NULL, 0)
+            n = self.query(name, id)
+            arr = np.chararray(n)
+            self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
+            rtn = arr.data[:n]
+            if decoder is not None:
+                rtn = decoder(rtn)
         else:
             rtn = self.c_ddstore.get(s2b(name), -1, <char *> NULL, 0)
         return rtn

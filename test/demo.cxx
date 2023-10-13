@@ -52,22 +52,19 @@ int main(int argc, char *argv[])
         printf("[%d:%d] buffer[%d] = %g\n", role, rank, i, buffer[i]);
     }
 
-    DDStore dds(comm);
-    dds.create<double>("var", buffer, 1, len, N, use_mq, role);
+    DDStore dds(comm, use_mq, role);
+    dds.create<double>("var", buffer, 1, len, N);
 
     int ntotal = N * comm_size;
     double getbuf[ntotal];
     for (int i = 0; i < ntotal; i++)
     {
-        // printf("[%d:%d] reading: %d\n", role, rank, i);
+        printf("[%d:%d] reading: %d\n", role, rank, ntotal-i-1);
         dds.get<double>("var", ntotal-i-1, &(getbuf[i]), 1);
     }
-    if (role == 1)
+    for (int i = 0; i < ntotal; i++)
     {
-        for (int i = 0; i < ntotal; i++)
-        {
-            printf("[%d:%d] received[%d]: %g\n", role, rank, i, getbuf[i]);
-        }
+        printf("[%d:%d] received[%d]: %g\n", role, rank, i, getbuf[i]);
     }
 
     MPI_Finalize();

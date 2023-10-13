@@ -189,7 +189,7 @@ void DDStore::queue_init(std::string name)
         // setup data mq
         if ((mqd = mq_open(mqd_name, Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
         {
-            perror("produce: mqd open");
+            perror("producer: mqd open");
             return;
         }
 
@@ -198,11 +198,11 @@ void DDStore::queue_init(std::string name)
         {
             if (errno == ENOENT)
             {
-                printf("produce: Waiting for consumer to create message queue...\n");
+                printf("producer: Waiting for consumer to create message queue...\n");
                 usleep(Q_CREATE_WAIT_US);
                 continue;
             }
-            perror("produce: mqr open");
+            perror("producer: mqr open");
             return;
         }
 
@@ -221,7 +221,7 @@ void DDStore::queue_init(std::string name)
         // setup req mq
         if ((mqr = mq_open(mqr_name, Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
         {
-            perror("consume: mqr open");
+            perror("consumer: mqr open");
             return;
         }
 
@@ -230,11 +230,11 @@ void DDStore::queue_init(std::string name)
         {
             if (errno == ENOENT)
             {
-                printf("consume: Waiting for producer to create message queue...\n");
+                printf("consumer: Waiting for producer to create message queue...\n");
                 usleep(Q_CREATE_WAIT_US);
                 continue;
             }
-            perror("consume: mqd open");
+            perror("consumer: mqd open");
             return;
         }
     }

@@ -288,6 +288,7 @@ class DDStore
             // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
 
             MPI_Win win = varinfo.win;
+            printf("[%d:%d] MPI_Win_lock\n");
             MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
             /*
             int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
@@ -295,6 +296,7 @@ class DDStore
                         int target_count, MPI_Datatype target_datatype, MPI_Win
                         win)
             */
+            printf("[%d:%d] MPI_Get\n");
             MPI_Get(buffer,              /* pre-allocated buffer on RMA origin process */
                     nbyte,               /* count on RMA origin process */
                     MPI_BYTE,            /* type on RMA origin process */
@@ -303,6 +305,7 @@ class DDStore
                     nbyte,               /* count on RMA target process */
                     MPI_BYTE,            /* type on RMA target process */
                     win);                /* window object */
+            printf("[%d:%d] MPI_Win_unlock\n");
             MPI_Win_unlock(target, win);
 
             if (use_mq && (role == 0))

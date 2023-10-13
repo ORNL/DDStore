@@ -90,7 +90,7 @@ class DDStore
         VarInfo_t var;
         MPI_Win win;
         
-        if ((use_mq == 0) || (use_mq && (role == 0)))
+        if ((this->use_mq == 0) || (this->use_mq && (this->role == 0)))
         {
             MPI_Win_create(buffer,                                /* pre-allocated buffer */
                         (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
@@ -155,14 +155,14 @@ class DDStore
             var.offsets = displs;
         }
 
-        // std::cout << this->rank << ": " << "use_mq,role = " << use_mq << ", " << role << std::endl;
-        if (use_mq)
+        // std::cout << this->rank << ": " << "use_mq,role = " << this->use_mq << ", " << this->role << std::endl;
+        if (this->use_mq)
         {
             queue_init(name);
         }
 
         // exchange lenlist
-        if (use_mq)
+        if (this->use_mq)
         {
             QueInfo_t queinfo;
             mqd_t mq = 0;
@@ -178,7 +178,7 @@ class DDStore
 
             int nchunk;
 
-            if (role == 0)
+            if (this->role == 0)
             {
                 ntotal = var.lenlist.size();
                 nbytes = ntotal * sizeof(int);
@@ -196,7 +196,7 @@ class DDStore
 
                 for (int i = 0; i < ntotal; i++)
                 {
-                    printf("lenlist[%d]: %d\n", i, var.lenlist[i]);
+                    printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
                 }
             }
             else
@@ -205,20 +205,20 @@ class DDStore
 
                 std::vector<int> lenlist(ntotal);
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize  + 1;
-                printf("pulld: recv ntotal (%d): %d %d\n", rc, ntotal, nchunk);
+                printf("[%d:%d] pulld: recv ntotal (%d): %d %d\n", this->role, this->rank, rc, ntotal, nchunk);
 
                 for (int i = 0; i < nchunk; i++) 
                 {
                     rc = mq_receive(mq, (char *)(lenlist.data() + i * attr.mq_msgsize), attr.mq_msgsize, NULL);
                     nbytes += rc;
-                    printf("[%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->rank, rc, i, nbytes);
+                    printf("[%d:%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
                 }
 
                 var.lenlist = lenlist;
 
                 for (int i = 0; i < ntotal; i++)
                 {
-                    printf("lenlist[%d]: %d\n", i, var.lenlist[i]);
+                    printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
                 }
             }
         }
@@ -241,7 +241,7 @@ class DDStore
         mqd_t mqd = 0;
         mqd_t mqr = 0;
 
-        if (use_mq)
+        if (this->use_mq)
         {
             queinfo = this->qlist[name];
             mqr = queinfo.mqr;
@@ -259,22 +259,22 @@ class DDStore
         if ( (long unsigned int) nbyte > size * sizeof(T))
             throw std::invalid_argument("Invalid buffer size");
 
-        if (use_mq && (role == 1))
+        if (this->use_mq && (this->role == 1))
         {
 
-            printf("[%d:%d] push request: %ld\n", role, this->rank, id);
+            printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
             this->pushr(mqr, (char *) &id, sizeof(long unsigned int));
 
-            printf("[%d:%d] pull data: %d bytes\n", role, this->rank, nbyte);
+            printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
             this->pulld(mqd, (char *) buffer, nbyte);
         }
         else
         {
-            if (use_mq && (role == 0))
+            if (this->use_mq && (this->role == 0))
             {
                 // get id from mqr
                 this->pullr(mqr, (char *) &id, sizeof(long unsigned int));
-                printf("[%d:%d] pull request: %ld\n", role, this->rank, id);
+                printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
 
                 // reset based on the requested id
                 len = varinfo.lenlist[id];
@@ -288,7 +288,7 @@ class DDStore
             // std::cout << "[" << this->rank << "] id,target,offset,dataoffset,len: " << id << "," << target << "," << offset << "," << dataoffset << "," << len << std::endl;
 
             MPI_Win win = varinfo.win;
-            printf("[%d:%d] MPI_Win_lock\n");
+            printf("[%d:%d] MPI_Win_lock\n", this->role, this->rank);
             MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
             /*
             int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
@@ -296,7 +296,7 @@ class DDStore
                         int target_count, MPI_Datatype target_datatype, MPI_Win
                         win)
             */
-            printf("[%d:%d] MPI_Get\n");
+            printf("[%d:%d] MPI_Get\n", this->role, this->rank);
             MPI_Get(buffer,              /* pre-allocated buffer on RMA origin process */
                     nbyte,               /* count on RMA origin process */
                     MPI_BYTE,            /* type on RMA origin process */
@@ -305,12 +305,12 @@ class DDStore
                     nbyte,               /* count on RMA target process */
                     MPI_BYTE,            /* type on RMA target process */
                     win);                /* window object */
-            printf("[%d:%d] MPI_Win_unlock\n");
+            printf("[%d:%d] MPI_Win_unlock\n", this->role, this->rank);
             MPI_Win_unlock(target, win);
 
-            if (use_mq && (role == 0))
+            if (this->use_mq && (this->role == 0))
             {
-                printf("[%d:%d] push data: %ld\n", role, this->rank, id);
+                printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
                 this->pushd(mqd, (char *)buffer, nbyte);
                 std::free((void *)buffer);
             }

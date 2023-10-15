@@ -2,18 +2,19 @@
 #include <map>
 #include <mpi.h>
 #include <mqueue.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string>
 #include <typeinfo>
 #include <vector>
-#include <stdio.h>
-#include <stdlib.h>
+#include <assert.h>
 
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
 #define Q_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #define Q_ATTR_FLAGS 0
-#define Q_ATTR_MSG_SIZE 4096 //8192
+#define Q_ATTR_MSG_SIZE 4096 // 8192
 #define Q_ATTR_MAX_MSG 10
 #define Q_ATTR_CURMSGS 0
 #define Q_CREATE_WAIT_US 1000000
@@ -35,6 +36,7 @@ struct VarInfo
     MPI_Win win;
     bool active;
     bool fence_active;
+    void *base;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -59,7 +61,7 @@ class DDStore
     DDStore(MPI_Comm comm, int use_mq, int role);
     ~DDStore();
 
-    int use_mq; 
+    int use_mq;
     int role; // 0 = producer, 1 = consumer
 
     void query(std::string name, VarInfo_t &varinfo);
@@ -89,19 +91,23 @@ class DDStore
 
         VarInfo_t var;
         MPI_Win win;
-        
-        if ((this->use_mq == 0) || (this->use_mq && (this->role == 0)))
-        {
-            void* p = NULL;
-            MPI_Alloc_mem((MPI_Aint)(l_ntotal * disp * sizeof(T)), MPI_INFO_NULL, &p);
-            memcpy(p, buffer, l_ntotal * disp * sizeof(T));
+        void *base = NULL;
 
-            MPI_Win_create(p,                                /* pre-allocated buffer */
-                        (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
-                        disp * sizeof(T),                      /* displacement units */
-                        MPI_INFO_NULL,                         /* info object */
-                        this->comm,                            /* communicator */
-                        &win);                                 /* window object */
+        if (!this->use_mq || (this->use_mq && (this->role == 0)))
+        {
+            int err = MPI_Alloc_mem((MPI_Aint)(l_ntotal * disp * sizeof(T)), MPI_INFO_NULL, &base);
+            if (err)
+            {
+                exit(1);
+            }
+            memcpy(base, buffer, l_ntotal * disp * sizeof(T));
+
+            MPI_Win_create(base,                                  /* pre-allocated buffer */
+                           (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
+                           disp * sizeof(T),                      /* displacement units */
+                           MPI_INFO_NULL,                         /* info object */
+                           this->comm,                            /* communicator */
+                           &win);                                 /* window object */
 
             // Use MPI_Allgatherv
             // Note: expect possible limit for using int32 (due to MPI)
@@ -186,7 +192,7 @@ class DDStore
             {
                 ntotal = var.lenlist.size();
                 nbytes = ntotal * sizeof(int);
-                rc = mq_send(mq, (char *) &ntotal, sizeof(int), 0);
+                rc = mq_send(mq, (char *)&ntotal, sizeof(int), 0);
 
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
                 for (int i = 0; i < nchunk; i++)
@@ -205,13 +211,13 @@ class DDStore
             }
             else
             {
-                rc = mq_receive(mq, (char *) &ntotal, attr.mq_msgsize, NULL);
+                rc = mq_receive(mq, (char *)&ntotal, attr.mq_msgsize, NULL);
 
                 std::vector<int> lenlist(ntotal);
-                nchunk = ntotal * sizeof(int) / attr.mq_msgsize  + 1;
+                nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
                 printf("[%d:%d] pulld: recv ntotal (%d): %d %d\n", this->role, this->rank, rc, ntotal, nchunk);
 
-                for (int i = 0; i < nchunk; i++) 
+                for (int i = 0; i < nchunk; i++)
                 {
                     rc = mq_receive(mq, (char *)(lenlist.data() + i * attr.mq_msgsize), attr.mq_msgsize, NULL);
                     nbytes += rc;
@@ -234,6 +240,7 @@ class DDStore
         var.win = win;
         var.active = true;
         var.fence_active = false;
+        var.base = base;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }
@@ -257,27 +264,27 @@ class DDStore
             throw std::invalid_argument("Invalid data type");
         int len = 0;
         int nbyte = 0;
-        
+
         len = varinfo.lenlist[id];
         nbyte = varinfo.disp * sizeof(T) * len;
-        if ( (long unsigned int) nbyte > size * sizeof(T))
+        if ((long unsigned int)nbyte > size * sizeof(T))
             throw std::invalid_argument("Invalid buffer size");
 
         if (this->use_mq && (this->role == 1))
         {
 
             printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
-            this->pushr(mqr, (char *) &id, sizeof(long unsigned int));
+            this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
 
             printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
-            this->pulld(mqd, (char *) buffer, nbyte);
+            this->pulld(mqd, (char *)buffer, nbyte);
         }
         else
         {
             if (this->use_mq && (this->role == 0))
             {
                 // get id from mqr
-                this->pullr(mqr, (char *) &id, sizeof(long unsigned int));
+                this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
                 printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
 
                 // reset based on the requested id

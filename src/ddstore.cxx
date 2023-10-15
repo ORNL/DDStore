@@ -46,7 +46,8 @@ void init_log(int rank)
 #endif
 }
 
-DDStore::DDStore() : use_mq(0), role(0)
+DDStore::DDStore()
+    : use_mq(0), role(0)
 {
     this->comm = MPI_COMM_SELF;
     MPI_Comm_size(this->comm, &this->comm_size);
@@ -54,7 +55,8 @@ DDStore::DDStore() : use_mq(0), role(0)
     init_log(this->rank);
 }
 
-DDStore::DDStore(MPI_Comm comm) : use_mq(0), role(0)
+DDStore::DDStore(MPI_Comm comm)
+    : use_mq(0), role(0)
 {
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
@@ -78,30 +80,33 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role)
 
 DDStore::~DDStore()
 {
-    for (auto &x : this->qlist)
+    if (this->use_mq)
     {
-        if (mq_close(x.second.mqr))
+        for (auto &x : this->qlist)
         {
-            perror("mqr: mq_close");
-        }
-        if (mq_close(x.second.mqd))
-        {
-            perror("mqd: mq_close");
-        }
-        if (this->role == 0)
-        {
-            // producer destroys the queue
-            if (mq_unlink(x.second.mqd_name.c_str()))
+            if (mq_close(x.second.mqr))
             {
-                perror("mqd: mq_unlink");
+                perror("mqr: mq_close");
             }
-        }
-        if (this->role == 1)
-        {
-            // consumer destroys the queue
-            if (mq_unlink(x.second.mqr_name.c_str()))
+            if (mq_close(x.second.mqd))
             {
-                perror("mqr: mq_unlink");
+                perror("mqd: mq_close");
+            }
+            if (this->role == 0)
+            {
+                // producer destroys the queue
+                if (mq_unlink(x.second.mqd_name.c_str()))
+                {
+                    perror("mqd: mq_unlink");
+                }
+            }
+            if (this->role == 1)
+            {
+                // consumer destroys the queue
+                if (mq_unlink(x.second.mqr_name.c_str()))
+                {
+                    perror("mqr: mq_unlink");
+                }
             }
         }
     }
@@ -146,7 +151,10 @@ void DDStore::free()
             if (x.second.active)
             {
                 if (!this->use_mq || (this->use_mq && (this->role == 0)))
+                {
                     MPI_Win_free(&x.second.win);
+                    MPI_Free_mem(x.second.base);
+                }
             }
             x.second.active = false;
         }
@@ -169,8 +177,7 @@ void DDStore::queue_init(std::string name)
     //     if (lenlist[i] > mqd_msgsize)
     //         mqd_msgsize = lenlist[i];
     // mqd_msgsize *=  varinfo.itemsize * varinfo.disp;
-    mqd_msgsize = (long) Q_ATTR_MSG_SIZE;
-
+    mqd_msgsize = (long)Q_ATTR_MSG_SIZE;
 
     snprintf(mqd_name, 128, "%sd-%s-%d", Q_NAME, name.c_str(), this->rank);
     snprintf(mqr_name, 128, "%sr-%s-%d", Q_NAME, name.c_str(), this->rank);
@@ -179,10 +186,10 @@ void DDStore::queue_init(std::string name)
     {
         // producer
         struct mq_attr q_attr = {
-            .mq_flags = Q_ATTR_FLAGS,       /* Flags: 0 or O_NONBLOCK */
-            .mq_maxmsg = Q_ATTR_MAX_MSG,    /* Max. # of messages on queue */
-            .mq_msgsize = mqd_msgsize,  /* Max. message size (bytes) */
-            .mq_curmsgs = Q_ATTR_CURMSGS,   /* # of messages currently in queue */
+            .mq_flags = Q_ATTR_FLAGS,     /* Flags: 0 or O_NONBLOCK */
+            .mq_maxmsg = Q_ATTR_MAX_MSG,  /* Max. # of messages on queue */
+            .mq_msgsize = mqd_msgsize,    /* Max. message size (bytes) */
+            .mq_curmsgs = Q_ATTR_CURMSGS, /* # of messages currently in queue */
         };
         printf("[%d:%d] mqd_name: %s\n", this->role, this->rank, mqd_name);
         printf("[%d:%d] mqd_msgsize: %ld\n", this->role, this->rank, mqd_msgsize);
@@ -205,16 +212,15 @@ void DDStore::queue_init(std::string name)
             perror("producer: mqr open");
             return;
         }
-
     }
     else
     {
         // consumer
         struct mq_attr q_attr = {
-            .mq_flags = Q_ATTR_FLAGS,       /* Flags: 0 or O_NONBLOCK */
-            .mq_maxmsg = Q_ATTR_MAX_MSG,    /* Max. # of messages on queue */
-            .mq_msgsize = mqr_msgsize,  /* Max. message size (bytes) */
-            .mq_curmsgs = Q_ATTR_CURMSGS,   /* # of messages currently in queue */
+            .mq_flags = Q_ATTR_FLAGS,     /* Flags: 0 or O_NONBLOCK */
+            .mq_maxmsg = Q_ATTR_MAX_MSG,  /* Max. # of messages on queue */
+            .mq_msgsize = mqr_msgsize,    /* Max. message size (bytes) */
+            .mq_curmsgs = Q_ATTR_CURMSGS, /* # of messages currently in queue */
         };
         printf("[%d:%d] mqr_name: %s\n", this->role, this->rank, mqr_name);
         printf("[%d:%d] mqr_msgsize: %ld\n", this->role, this->rank, mqr_msgsize);
@@ -252,7 +258,7 @@ void DDStore::queue_init(std::string name)
 
 void DDStore::pushr(mqd_t mq, char *buffer, long size)
 {
-    printf ("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
+    printf("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
 
     struct mq_attr attr;
     mq_getattr(mq, &attr);
@@ -291,15 +297,27 @@ void DDStore::pullr(mqd_t mq, char *buffer, long size)
     }
 
     memset(buffer, 0, size);
-    rc = mq_receive(mq, buffer, size, NULL);
-    if (rc < 0)
+    printf("[%d:%d] pullr: ready to receive\n", this->role, this->rank);
+    // rc = mq_receive(mq, buffer, size, NULL);
+    rc = -1;
+    while (rc < 0)
     {
-        perror("pullr: recv error");
+        struct timespec tm;
+        clock_gettime(CLOCK_REALTIME, &tm);
+        tm.tv_sec += 1;  // Set for 1 seconds
+        rc = mq_timedreceive(mq, buffer, size, NULL, &tm);
+        // printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
+        if (rc < 0)
+        {
+            perror("pullr: recv error");
+            sleep(1);
+        }
+        else
+        {
+            printf("[%d:%d] pullr: recv (%d)\n", this->role, this->rank, rc);
+        }
     }
-    else
-    {
-        printf("[%d:%d] pullr: recv (%d)\n", this->role, this->rank, rc);
-    }
+    printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
 }
 
 void DDStore::pushd(mqd_t mq, char *buffer, long size)
@@ -317,7 +335,7 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     int nchunk = size / attr.mq_msgsize;
     if (size > nchunk * attr.mq_msgsize)
         nchunk += 1;
-    printf ("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
+    printf("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
 
     int rc;
     rc = mq_send(mq, (const char *)&nchunk, sizeof(int), 0);
@@ -367,12 +385,12 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     {
         printf("[%d:%d] pulld: recv head (%d)\n", this->role, this->rank, rc);
     }
-    printf ("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
+    printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
 
     memset(buffer, 0, size);
 
     int nbytes = 0;
-    for (int i = 0; i < nchunk; i++) 
+    for (int i = 0; i < nchunk; i++)
     {
         int len = attr.mq_msgsize;
         if (i == nchunk - 1)

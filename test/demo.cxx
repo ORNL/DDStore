@@ -46,7 +46,7 @@ int main(int argc, char *argv[])
     for (int i = 0; i < N; i++)
     {
         buffer[i] = i + N * rank + 1;
-        if (role == 1) 
+        if (role == 1)
             buffer[i] *= -1;
         len[i] = 1;
         printf("[%d:%d] buffer[%d] = %g\n", role, rank, i, buffer[i]);
@@ -59,8 +59,8 @@ int main(int argc, char *argv[])
     double getbuf[ntotal];
     for (int i = 0; i < ntotal; i++)
     {
-        printf("[%d:%d] reading: %d\n", role, rank, ntotal-i-1);
-        dds.get<double>("var", ntotal-i-1, &(getbuf[i]), 1);
+        printf("[%d:%d] reading: %d\n", role, rank, ntotal - i - 1);
+        dds.get<double>("var", ntotal - i - 1, &(getbuf[i]), 1);
     }
     for (int i = 0; i < ntotal; i++)
     {

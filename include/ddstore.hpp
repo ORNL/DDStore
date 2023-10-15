@@ -92,7 +92,11 @@ class DDStore
         
         if ((this->use_mq == 0) || (this->use_mq && (this->role == 0)))
         {
-            MPI_Win_create(buffer,                                /* pre-allocated buffer */
+            void* p = NULL;
+            MPI_Alloc_mem((MPI_Aint)(l_ntotal * disp * sizeof(T)), MPI_INFO_NULL, &p);
+            memcpy(p, buffer, l_ntotal * disp * sizeof(T));
+
+            MPI_Win_create(p,                                /* pre-allocated buffer */
                         (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
                         disp * sizeof(T),                      /* displacement units */
                         MPI_INFO_NULL,                         /* info object */

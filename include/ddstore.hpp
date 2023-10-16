@@ -290,7 +290,8 @@ class DDStore
                 // reset based on the requested id
                 len = varinfo.lenlist[id];
                 nbyte = varinfo.disp * sizeof(T) * len;
-                buffer = (T *)std::malloc(nbyte);
+                // buffer = (T *)std::malloc(nbyte);
+                MPI_Alloc_mem((MPI_Aint)nbyte, MPI_INFO_NULL, &buffer);
             }
 
             int target = sortedsearch(varinfo.offsets, id);
@@ -323,7 +324,8 @@ class DDStore
             {
                 printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
                 this->pushd(mqd, (char *)buffer, nbyte);
-                std::free((void *)buffer);
+                // std::free((void *)buffer);
+                MPI_Free_mem((void *)buffer);
             }
         }
 

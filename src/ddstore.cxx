@@ -93,7 +93,10 @@ void DDStore::free()
         for (auto &x : this->varlist)
         {
             if (x.second.active)
+            {
                 MPI_Win_free(&x.second.win);
+                MPI_Free_mem(x.second.base);
+            }
             x.second.active = false;
         }
     }

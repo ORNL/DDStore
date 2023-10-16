@@ -14,6 +14,7 @@ struct VarInfo
     MPI_Win win;
     bool active;
     bool fence_active;
+    void *base;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -33,8 +34,16 @@ class DDStore
 
     template <typename T> void add(std::string name, T *buffer, long nrows, int disp)
     {
+        void *base;
+        int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
+        if (err)
+        {
+            exit(1);
+        }
+        memcpy(base, buffer, nrows * disp * sizeof(T));
+
         MPI_Win win;
-        MPI_Win_create(buffer,                             /* pre-allocated buffer */
+        MPI_Win_create(base,                             /* pre-allocated buffer */
                        (MPI_Aint)nrows * disp * sizeof(T), /* size in bytes */
                        disp * sizeof(T),                   /* displacement units */
                        MPI_INFO_NULL,                      /* info object */
@@ -70,6 +79,7 @@ class DDStore
         var.lenlist = lenlist;
         var.active = true;
         var.fence_active = false;
+        var.base = base;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }

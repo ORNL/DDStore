@@ -79,8 +79,8 @@ class DistDataset(Dataset):
         label = np.zeros(1, dtype=np.int32)
         val = np.ascontiguousarray(val)
         assert val.data.contiguous
-        self.ddstore.get(f"{self.label}data", val, idx)
-        self.ddstore.get(f"{self.label}labels", label, idx)
+        self.ddstore.get_ndarray(f"{self.label}data", val, idx)
+        self.ddstore.get_ndarray(f"{self.label}labels", label, idx)
         # print("rank", self.rank, "fetching idx", idx)
         val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))

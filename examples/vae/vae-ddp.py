@@ -1,4 +1,9 @@
 from __future__ import print_function
+import mpi4py
+
+mpi4py.rc.thread_level = "serialized"
+mpi4py.rc.threads = False
+
 import argparse
 import torch
 import torch.utils.data
@@ -209,8 +214,8 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
-trainset = DistDataset(datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor()), "train", comm)
-# trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
+# trainset = DistDataset(datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor()), "train", comm)
+trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
 train_loader = torch.utils.data.DataLoader(trainset, 
@@ -233,11 +238,18 @@ def loss_function(recon_x, x, mu, logvar):
 
 
 def train(epoch):
+    use_ddstore = (
+        hasattr(train_loader.dataset, "ddstore")
+        and hasattr(train_loader.dataset.ddstore, "epoch_begin")
+    )
+
     model.train()
     train_loss = 0
-    train_loader.dataset.ddstore.epoch_begin()
+    if use_ddstore:
+        train_loader.dataset.ddstore.epoch_begin()
     for batch_idx, (data, _) in enumerate(train_loader):
-        train_loader.dataset.ddstore.epoch_end()
+        if use_ddstore:
+            train_loader.dataset.ddstore.epoch_end()
         # print(rank, device)
         data = data.to(device)
         # print(rank, "data")
@@ -258,9 +270,11 @@ def train(epoch):
                 100. * batch_idx / len(train_loader),
                 loss.item() / len(data)))
 
-        train_loader.dataset.ddstore.epoch_begin()
+        if use_ddstore:
+            train_loader.dataset.ddstore.epoch_begin()
     
-    train_loader.dataset.ddstore.epoch_end()
+    if use_ddstore:
+        train_loader.dataset.ddstore.epoch_end()
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
 

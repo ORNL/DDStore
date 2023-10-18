@@ -161,7 +161,7 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
-args = parser.parse_args()
+parser.add_argument("--mq", action="store_true", help="use mq")
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
@@ -214,8 +214,8 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
-# trainset = DistDataset(datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor()), "train", comm)
-trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
+trainset = DistDataset(datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor()), "train", comm)
+# trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
 train_loader = torch.utils.data.DataLoader(trainset, 

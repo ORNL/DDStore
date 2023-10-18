@@ -18,7 +18,7 @@ def nsplit(a, n):
 class DistDataset(Dataset):
     """Distributed dataset class"""
 
-    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None):
+    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, use_mq=False, role=1):
         super().__init__()
         
         self.dataset = list()
@@ -33,7 +33,7 @@ class DistDataset(Dataset):
         self.ddstore_comm = self.comm.Split(self.rank // self.ddstore_width, self.rank)
         self.ddstore_comm_rank = self.ddstore_comm.Get_rank()
         self.ddstore_comm_size = self.ddstore_comm.Get_size()
-        self.ddstore = dds.PyDDStore(self.ddstore_comm)
+        self.ddstore = dds.PyDDStore(self.ddstore_comm, use_mq=use_mq, role=role)
 
         ## set total before set subset
         self.total_ns = len(data)
@@ -54,19 +54,22 @@ class DistDataset(Dataset):
         nbytes = 0
         for (data, label) in self.dataset:
             val = data.cpu().numpy()
-            val = val.flatten()            
+            # val = val.flatten()
             self.data.append(val)
             self.labels.append(label)
+        lenlist = [28*28,] * len(self.data)
 
         self.data = np.concatenate(self.data)
+        print ("#1: data.shape: ", self.data.shape)
         self.data = np.ascontiguousarray(self.data)
 
-        
         self.labels = np.array(self.labels, dtype=np.int32)
+        print ("#2: labels.shape: ", self.labels.shape)
         self.labels = np.ascontiguousarray(self.labels)
 
         self.ddstore.add(f"{self.label}data", self.data)
-        self.ddstore.add(f"{self.label}labels", self.labels)
+        # self.ddstore.add(f"{self.label}labels", self.labels)
+        print ("Init done.")
 
     def len(self):
         return self.total_ns
@@ -81,7 +84,7 @@ class DistDataset(Dataset):
         assert val.data.contiguous
         self.ddstore.get_ndarray(f"{self.label}data", val, idx)
         self.ddstore.get_ndarray(f"{self.label}labels", label, idx)
-        # print("rank", self.rank, "fetching idx", idx)
+        print("rank", self.rank, "fetching idx", idx)
         val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))
         return (val, label[0])

@@ -8,6 +8,7 @@
 #include <typeinfo>
 #include <vector>
 #include <assert.h>
+#include <cstring>
 
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
@@ -88,6 +89,7 @@ class DDStore
         long l_ntotal = 0;
         for (int i = 0; i < ncount; i++)
             l_ntotal += l_lenlist[i];
+        std::cout << this->rank << ": " << "l_ntotal,disp,ncount = " << l_ntotal << ", " << disp << ", " << ncount << std::endl;
 
         VarInfo_t var;
         MPI_Win win;
@@ -100,7 +102,7 @@ class DDStore
             {
                 exit(1);
             }
-            memcpy(base, buffer, l_ntotal * disp * sizeof(T));
+            std::memcpy(base, buffer, l_ntotal * disp * sizeof(T));
 
             MPI_Win_create(base,                                  /* pre-allocated buffer */
                            (MPI_Aint)l_ntotal * disp * sizeof(T), /* size in bytes */
@@ -129,7 +131,7 @@ class DDStore
             //     std::cout << this->rank << ": " << "recvcounts[" << i << "] = " << recvcounts[i] << std::endl;
             // for (long unsigned int i = 0; i < displs.size(); i++)
             //     std::cout << this->rank << ": " << "displs[" << i << "] = " << displs[i] << std::endl;
-            // std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
+            std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
 
             std::vector<int> lenlist(ntotal);
             std::vector<long unsigned int> dataoffsets(ntotal);
@@ -191,17 +193,27 @@ class DDStore
             if (this->role == 0)
             {
                 ntotal = var.lenlist.size();
-                nbytes = ntotal * sizeof(int);
                 rc = mq_send(mq, (char *)&ntotal, sizeof(int), 0);
 
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
+                printf("[%d:%d] pushd: send ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
                 for (int i = 0; i < nchunk; i++)
                 {
                     int len = attr.mq_msgsize;
                     if (i == nchunk - 1)
-                        len = nbytes - i * attr.mq_msgsize;
+                        len = ntotal * sizeof(int) - i * attr.mq_msgsize;
 
+                    printf("[%d:%d] pushd: ready to send: %d %d\n", this->role, this->rank, i, len);
                     rc = mq_send(mq, (char *)(var.lenlist.data() + i * attr.mq_msgsize), len, 0);
+                    if (rc < 0)
+                    {
+                        printf("[%d:%d] Error send lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+                        perror("producer error on mq_send: ");
+                        i--;
+                        continue;
+                    }
+                    nbytes += len;
+                    printf("[%d:%d] pushd: send lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
                 }
 
                 for (int i = 0; i < ntotal; i++)
@@ -215,11 +227,18 @@ class DDStore
 
                 std::vector<int> lenlist(ntotal);
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
-                printf("[%d:%d] pulld: recv ntotal (%d): %d %d\n", this->role, this->rank, rc, ntotal, nchunk);
+                printf("[%d:%d] pulld: recv ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
 
                 for (int i = 0; i < nchunk; i++)
                 {
                     rc = mq_receive(mq, (char *)(lenlist.data() + i * attr.mq_msgsize), attr.mq_msgsize, NULL);
+                    if (rc < 0)
+                    {
+                        printf("[%d:%d] Error recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+                        perror("consumer error on mq_receive: ");
+                        i--;
+                        continue;
+                    }
                     nbytes += rc;
                     printf("[%d:%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
                 }

@@ -195,7 +195,9 @@ class DDStore
                 ntotal = var.lenlist.size();
                 rc = mq_send(mq, (char *)&ntotal, sizeof(int), 0);
 
-                nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
+                nchunk = ntotal * sizeof(int) / attr.mq_msgsize;
+                if ((ntotal * sizeof(int)) % attr.mq_msgsize != 0)
+                    nchunk += 1;
                 printf("[%d:%d] pushd: send ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
                 for (int i = 0; i < nchunk; i++)
                 {
@@ -204,7 +206,7 @@ class DDStore
                         len = ntotal * sizeof(int) - i * attr.mq_msgsize;
 
                     printf("[%d:%d] pushd: ready to send: %d %d\n", this->role, this->rank, i, len);
-                    rc = mq_send(mq, (char *)(var.lenlist.data() + i * attr.mq_msgsize), len, 0);
+                    rc = mq_send(mq, (char *)var.lenlist.data() + i * attr.mq_msgsize, len, 0);
                     if (rc < 0)
                     {
                         printf("[%d:%d] Error send lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
@@ -226,12 +228,14 @@ class DDStore
                 rc = mq_receive(mq, (char *)&ntotal, attr.mq_msgsize, NULL);
 
                 std::vector<int> lenlist(ntotal);
-                nchunk = ntotal * sizeof(int) / attr.mq_msgsize + 1;
+                nchunk = ntotal * sizeof(int) / attr.mq_msgsize;
+                if ((ntotal * sizeof(int)) % attr.mq_msgsize != 0)
+                    nchunk += 1;
                 printf("[%d:%d] pulld: recv ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
 
                 for (int i = 0; i < nchunk; i++)
                 {
-                    rc = mq_receive(mq, (char *)(lenlist.data() + i * attr.mq_msgsize), attr.mq_msgsize, NULL);
+                    rc = mq_receive(mq, (char *)lenlist.data() + i * attr.mq_msgsize, attr.mq_msgsize, NULL);
                     if (rc < 0)
                     {
                         printf("[%d:%d] Error recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);

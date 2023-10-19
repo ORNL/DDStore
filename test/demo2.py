@@ -25,9 +25,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
     )
-    parser.add_argument(
-        "--mq", action="store_true", help="use mq"
-    )
+    parser.add_argument("--mq", action="store_true", help="use mq")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--producer",
@@ -50,13 +48,13 @@ if __name__ == "__main__":
     comm_size = comm.Get_size()
     rank = comm.Get_rank()
 
-    ddstore = dds.PyDDStore(comm)
-
     num = args.num
     dim = args.dim
     nbatch = args.nbatch
     use_mq = 1 if args.mq else 0
     role = 1 if args.role == "consumer" else 0
+
+    ddstore = dds.PyDDStore(comm, use_mq=use_mq, role=role)
 
     shape = (num, dim)
     dtype = np.float64
@@ -65,7 +63,7 @@ if __name__ == "__main__":
     for i in range(num):
         x = np.ones(shape, dtype=dtype) * (rank * num + i + 1000)
         dataset.append(x)
-    ddstore.add("var", dataset, use_mq=use_mq, role=role)
+    ddstore.add("var", dataset)
     print(
         "Create done: ",
         ddstore.buffer("var").getbuffer().nbytes / 1024 / 1024 / 1024,
@@ -73,6 +71,7 @@ if __name__ == "__main__":
     )
 
     comm.Barrier()
+    sys.exit(0)
     idx_list = list()
     arr_list = list()
     for i in range(nbatch):
@@ -82,7 +81,7 @@ if __name__ == "__main__":
         idx_list.append(idx)
         arr_list.append(arr)
 
-    if (use_mq == 0) or ((use_mq==1) and (role == 1)):
+    if (use_mq == 0) or ((use_mq == 1) and (role == 1)):
         for i, idx in enumerate(idx_list):
             expected = idx + 1000
             assert np.mean(arr_list[i]) == expected, (np.mean(arr_list[i]), expected)

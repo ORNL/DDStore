@@ -78,11 +78,19 @@ if __name__ == "__main__":
         help="num. of data (default: %(default)s)",
         default=1024 * 1024,
     )
-    parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
-    parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
+    parser.add_argument(
+        "--dim", type=int, help="dim (default: %(default)s)", default=64
+    )
+    parser.add_argument(
+        "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
+    )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--gloo", help="gloo", action="store_const", dest="backend", const="gloo")
-    group.add_argument("--nccl", help="nccl", action="store_const", dest="backend", const="nccl")
+    group.add_argument(
+        "--gloo", help="gloo", action="store_const", dest="backend", const="gloo"
+    )
+    group.add_argument(
+        "--nccl", help="nccl", action="store_const", dest="backend", const="nccl"
+    )
     parser.set_defaults(backend="gloo")
     args = parser.parse_args()
 

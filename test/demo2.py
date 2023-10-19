@@ -71,7 +71,6 @@ if __name__ == "__main__":
     )
 
     comm.Barrier()
-    sys.exit(0)
     idx_list = list()
     arr_list = list()
     for i in range(nbatch):
@@ -86,6 +85,6 @@ if __name__ == "__main__":
             expected = idx + 1000
             assert np.mean(arr_list[i]) == expected, (np.mean(arr_list[i]), expected)
     comm.Barrier()
-    print(rank, "done.")
+    print(rank, "Done.")
     ddstore.free()
     sys.exit(0)

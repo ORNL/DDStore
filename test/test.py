@@ -161,6 +161,6 @@ if __name__ == "__main__":
         expected = idx // num + 1
         assert np.mean(buff_list[i]) == expected, (np.mean(buff_list[i]), expected)
     comm.Barrier()
-    print(rank, "done.")
+    print(rank, "Done.")
     ddstore.free()
     sys.exit(0)

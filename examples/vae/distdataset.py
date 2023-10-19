@@ -68,7 +68,7 @@ class DistDataset(Dataset):
         self.labels = np.ascontiguousarray(self.labels)
 
         self.ddstore.add(f"{self.label}data", self.data)
-        # self.ddstore.add(f"{self.label}labels", self.labels)
+        self.ddstore.add(f"{self.label}labels", self.labels)
         print ("Init done.")
 
     def len(self):
@@ -84,7 +84,6 @@ class DistDataset(Dataset):
         assert val.data.contiguous
         self.ddstore.get_ndarray(f"{self.label}data", val, idx)
         self.ddstore.get_ndarray(f"{self.label}labels", label, idx)
-        print("rank", self.rank, "fetching idx", idx)
         val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))
         return (val, label[0])

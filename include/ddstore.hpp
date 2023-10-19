@@ -198,14 +198,14 @@ class DDStore
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize;
                 if ((ntotal * sizeof(int)) % attr.mq_msgsize != 0)
                     nchunk += 1;
-                printf("[%d:%d] pushd: send ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
+                // printf("[%d:%d] pushd: send ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
                 for (int i = 0; i < nchunk; i++)
                 {
                     int len = attr.mq_msgsize;
                     if (i == nchunk - 1)
                         len = ntotal * sizeof(int) - i * attr.mq_msgsize;
 
-                    printf("[%d:%d] pushd: ready to send: %d %d\n", this->role, this->rank, i, len);
+                    // printf("[%d:%d] pushd: ready to send: %d %d\n", this->role, this->rank, i, len);
                     rc = mq_send(mq, (char *)var.lenlist.data() + i * attr.mq_msgsize, len, 0);
                     if (rc < 0)
                     {
@@ -215,13 +215,13 @@ class DDStore
                         continue;
                     }
                     nbytes += len;
-                    printf("[%d:%d] pushd: send lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+                    // printf("[%d:%d] pushd: send lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
                 }
 
-                for (int i = 0; i < ntotal; i++)
-                {
-                    printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
-                }
+                // for (int i = 0; i < ntotal; i++)
+                // {
+                //     printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
+                // }
             }
             else
             {
@@ -231,7 +231,7 @@ class DDStore
                 nchunk = ntotal * sizeof(int) / attr.mq_msgsize;
                 if ((ntotal * sizeof(int)) % attr.mq_msgsize != 0)
                     nchunk += 1;
-                printf("[%d:%d] pulld: recv ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
+                // printf("[%d:%d] pulld: recv ntotal (%d): %d %ld %d\n", this->role, this->rank, rc, ntotal, ntotal * sizeof(int), nchunk);
 
                 for (int i = 0; i < nchunk; i++)
                 {
@@ -244,15 +244,15 @@ class DDStore
                         continue;
                     }
                     nbytes += rc;
-                    printf("[%d:%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+                    // printf("[%d:%d] pulld: recv lenlist (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
                 }
 
                 var.lenlist = lenlist;
 
-                for (int i = 0; i < ntotal; i++)
-                {
-                    printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
-                }
+                // for (int i = 0; i < ntotal; i++)
+                // {
+                //     printf("[%d:%d] lenlist[%d]: %d\n", this->role, this->rank, i, var.lenlist[i]);
+                // }
             }
         }
 
@@ -296,10 +296,10 @@ class DDStore
         if (this->use_mq && (this->role == 1))
         {
 
-            printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
+            // printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
             this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
 
-            printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
+            // printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
             this->pulld(mqd, (char *)buffer, nbyte);
         }
         else
@@ -308,7 +308,7 @@ class DDStore
             {
                 // get id from mqr
                 this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
-                printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                // printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
 
                 // reset based on the requested id
                 len = varinfo.lenlist[id];
@@ -345,7 +345,7 @@ class DDStore
 
             if (this->use_mq && (this->role == 0))
             {
-                printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
+                // printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
                 this->pushd(mqd, (char *)buffer, nbyte);
                 // std::free((void *)buffer);
                 MPI_Free_mem((void *)buffer);

@@ -258,7 +258,7 @@ void DDStore::queue_init(std::string name)
 
 void DDStore::pushr(mqd_t mq, char *buffer, long size)
 {
-    printf("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
+    // printf("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
 
     struct mq_attr attr;
     mq_getattr(mq, &attr);
@@ -274,10 +274,7 @@ void DDStore::pushr(mqd_t mq, char *buffer, long size)
     {
         perror("pushr: send error");
     }
-    else
-    {
-        printf("[%d:%d] pushr: send (%d)\n", this->role, this->rank, rc);
-    }
+    // printf("[%d:%d] pushr: send (%d)\n", this->role, this->rank, rc);
 }
 
 void DDStore::pullr(mqd_t mq, char *buffer, long size)
@@ -297,27 +294,33 @@ void DDStore::pullr(mqd_t mq, char *buffer, long size)
     }
 
     memset(buffer, 0, size);
-    printf("[%d:%d] pullr: ready to receive\n", this->role, this->rank);
-    // rc = mq_receive(mq, buffer, size, NULL);
-    rc = -1;
-    while (rc < 0)
+    // printf("[%d:%d] pullr: ready to receive\n", this->role, this->rank);
+    rc = mq_receive(mq, buffer, size, NULL);
+    if (rc < 0)
     {
-        struct timespec tm;
-        clock_gettime(CLOCK_REALTIME, &tm);
-        tm.tv_sec += 1;  // Set for 1 seconds
-        rc = mq_timedreceive(mq, buffer, size, NULL, &tm);
-        // printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
-        if (rc < 0)
-        {
-            perror("pullr: recv error");
-            sleep(1);
-        }
-        else
-        {
-            printf("[%d:%d] pullr: recv (%d)\n", this->role, this->rank, rc);
-        }
+        perror("pullr: recv error");
+        sleep(1);
     }
-    printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
+    // timeout version
+    // rc = -1;
+    // while (rc < 0)
+    // {
+    //     struct timespec tm;
+    //     clock_gettime(CLOCK_REALTIME, &tm);
+    //     tm.tv_sec += 1;  // Set for 1 seconds
+    //     rc = mq_timedreceive(mq, buffer, size, NULL, &tm);
+    //     // printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
+    //     if (rc < 0)
+    //     {
+    //         perror("pullr: recv error");
+    //         sleep(1);
+    //     }
+    //     else
+    //     {
+    //         printf("[%d:%d] pullr: recv (%d)\n", this->role, this->rank, rc);
+    //     }
+    // }
+    // printf("[%d:%d] pullr: done with receive\n", this->role, this->rank);
 }
 
 void DDStore::pushd(mqd_t mq, char *buffer, long size)
@@ -335,7 +338,7 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     int nchunk = size / attr.mq_msgsize;
     if (size > nchunk * attr.mq_msgsize)
         nchunk += 1;
-    printf("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
+    // printf("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
 
     int rc;
     rc = mq_send(mq, (const char *)&nchunk, sizeof(int), 0);
@@ -343,10 +346,7 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     {
         perror("pushd: send head error");
     }
-    else
-    {
-        printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
-    }
+    // printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
 
     int nbytes = 0;
     for (int i = 0; i < nchunk; i++)
@@ -359,12 +359,11 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
         if (rc < 0)
         {
             perror("pushd: send data error");
+            i--;
+            continue;
         }
-        else
-        {
-            nbytes += len;
-            // printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
-        }
+        nbytes += len;
+        // printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }
 
@@ -381,11 +380,7 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     {
         perror("pulld: recv head error");
     }
-    else
-    {
-        printf("[%d:%d] pulld: recv head (%d)\n", this->role, this->rank, rc);
-    }
-    printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
+    // printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
 
     memset(buffer, 0, size);
 
@@ -400,11 +395,10 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
         if (rc < 0)
         {
             perror("pulld: recv data error");
+            i--;
+            continue;
         }
-        else
-        {
-            nbytes += rc;
-            // printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
-        }
+        nbytes += rc;
+        // printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }

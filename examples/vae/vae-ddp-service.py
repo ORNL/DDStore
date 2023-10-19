@@ -47,9 +47,11 @@ if __name__ == "__main__":
     comm = MPI.COMM_WORLD
     comm_size = comm.Get_size()
     rank = comm.Get_rank()
-    print ("MPI setup:", comm_size, rank)
+    print("MPI setup:", comm_size, rank)
 
-    trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
+    trainset = datasets.MNIST(
+        "data", train=True, download=True, transform=transforms.ToTensor()
+    )
     trainset = DistDataset(trainset, "trainset", **opt)
     print("trainset size: %d" % len(trainset))
 

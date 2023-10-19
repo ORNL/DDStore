@@ -11,16 +11,20 @@ try:
 except ImportError:
     pass
 
+
 def nsplit(a, n):
     k, m = divmod(len(a), n)
     return (a[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(n))
 
+
 class DistDataset(Dataset):
     """Distributed dataset class"""
 
-    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, use_mq=False, role=1):
+    def __init__(
+        self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, use_mq=False, role=1
+    ):
         super().__init__()
-        
+
         self.dataset = list()
         self.label = label
         self.comm = comm
@@ -52,24 +56,26 @@ class DistDataset(Dataset):
         self.labels = list()
 
         nbytes = 0
-        for (data, label) in self.dataset:
+        for data, label in self.dataset:
             val = data.cpu().numpy()
             # val = val.flatten()
             self.data.append(val)
             self.labels.append(label)
-        lenlist = [28*28,] * len(self.data)
+        lenlist = [
+            28 * 28,
+        ] * len(self.data)
 
         self.data = np.concatenate(self.data)
-        print ("#1: data.shape: ", self.data.shape)
+        print("#1: data.shape: ", self.data.shape)
         self.data = np.ascontiguousarray(self.data)
 
         self.labels = np.array(self.labels, dtype=np.int32)
-        print ("#2: labels.shape: ", self.labels.shape)
+        print("#2: labels.shape: ", self.labels.shape)
         self.labels = np.ascontiguousarray(self.labels)
 
         self.ddstore.add(f"{self.label}data", self.data)
         self.ddstore.add(f"{self.label}labels", self.labels)
-        print ("Init done.")
+        print("Init done.")
 
     def len(self):
         return self.total_ns

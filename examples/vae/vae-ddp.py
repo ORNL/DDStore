@@ -24,6 +24,8 @@ import psutil
 """
 Functions for DDP on HPC
 """
+
+
 def init_comm_size_and_rank():
     world_size = None
     world_rank = 0
@@ -43,6 +45,7 @@ def init_comm_size_and_rank():
 
     return int(world_size), int(world_rank)
 
+
 def find_ifname(myaddr):
     """
     Find socket ifname for a given ip adress. This is for "GLOO" ddp setup.
@@ -60,6 +63,7 @@ def find_ifname(myaddr):
             break
 
     return ifname
+
 
 def parse_slurm_nodelist(nodelist):
     """
@@ -93,6 +97,7 @@ def parse_slurm_nodelist(nodelist):
                     nlist.append(node)
 
     return nlist
+
 
 def setup_ddp():
     """ "Initialize DDP"""
@@ -148,20 +153,56 @@ def setup_ddp():
     return world_size, world_rank
 
 
-parser = argparse.ArgumentParser(description='VAE MNIST Example')
-parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                    help='number of epochs to train (default: 10)')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='disables CUDA training')
-parser.add_argument('--no-mps', action='store_true', default=False,
-                        help='disables macOS GPU training')
-parser.add_argument('--seed', type=int, default=1, metavar='S',
-                    help='random seed (default: 1)')
-parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                    help='how many batches to wait before logging training status')
+parser = argparse.ArgumentParser(description="VAE MNIST Example")
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=128,
+    metavar="N",
+    help="input batch size for training (default: 128)",
+)
+parser.add_argument(
+    "--epochs",
+    type=int,
+    default=10,
+    metavar="N",
+    help="number of epochs to train (default: 10)",
+)
+parser.add_argument(
+    "--no-cuda", action="store_true", default=False, help="disables CUDA training"
+)
+parser.add_argument(
+    "--no-mps", action="store_true", default=False, help="disables macOS GPU training"
+)
+parser.add_argument(
+    "--seed", type=int, default=1, metavar="S", help="random seed (default: 1)"
+)
+parser.add_argument(
+    "--log-interval",
+    type=int,
+    default=10,
+    metavar="N",
+    help="how many batches to wait before logging training status",
+)
 parser.add_argument("--mq", action="store_true", help="use mq")
+group = parser.add_mutually_exclusive_group()
+group.add_argument(
+    "--producer",
+    help="producer",
+    action="store_const",
+    dest="role",
+    const="producer",
+)
+group.add_argument(
+    "--consumer",
+    help="consumer",
+    action="store_const",
+    dest="role",
+    const="consumer",
+)
+parser.set_defaults(role="consumer")
+args = parser.parse_args()
+
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
@@ -173,6 +214,7 @@ elif use_mps:
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
+
 
 class VAE(nn.Module):
     def __init__(self):
@@ -189,9 +231,9 @@ class VAE(nn.Module):
         return self.fc21(h1), self.fc22(h1)
 
     def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
+        std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
-        return mu + eps*std
+        return mu + eps * std
 
     def decode(self, z):
         h3 = F.relu(self.fc3(z))
@@ -202,9 +244,10 @@ class VAE(nn.Module):
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
 
+
 comm = MPI.COMM_WORLD
 comm_size, rank = setup_ddp()
-print ("DDP setup:", comm_size, rank, device)
+print("DDP setup:", comm_size, rank, device)
 
 model = VAE().to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
@@ -214,19 +257,29 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
-trainset = DistDataset(datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor()), "train", comm)
+trainset = DistDataset(
+    datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
+    "train",
+    comm,
+)
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-train_loader = torch.utils.data.DataLoader(trainset, 
-        batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler)
+train_loader = torch.utils.data.DataLoader(
+    trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+)
 
-testset = datasets.MNIST('data', train=False, download=True,transform=transforms.ToTensor())
-test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, **kwargs)
+testset = datasets.MNIST(
+    "data", train=False, download=True, transform=transforms.ToTensor()
+)
+test_loader = torch.utils.data.DataLoader(
+    testset, batch_size=args.batch_size, shuffle=False, **kwargs
+)
+
 
 # Reconstruction + KL divergence losses summed over all elements and batch
 def loss_function(recon_x, x, mu, logvar):
-    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), reduction='sum')
+    BCE = F.binary_cross_entropy(recon_x, x.view(-1, 784), reduction="sum")
 
     # see Appendix B from VAE paper:
     # Kingma and Welling. Auto-Encoding Variational Bayes. ICLR, 2014
@@ -238,9 +291,8 @@ def loss_function(recon_x, x, mu, logvar):
 
 
 def train(epoch):
-    use_ddstore = (
-        hasattr(train_loader.dataset, "ddstore")
-        and hasattr(train_loader.dataset.ddstore, "epoch_begin")
+    use_ddstore = hasattr(train_loader.dataset, "ddstore") and hasattr(
+        train_loader.dataset.ddstore, "epoch_begin"
     )
 
     model.train()
@@ -265,18 +317,26 @@ def train(epoch):
         optimizer.step()
         # print(rank, "step")
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader),
-                loss.item() / len(data)))
+            print(
+                "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                    epoch,
+                    batch_idx * len(data),
+                    len(train_loader.dataset),
+                    100.0 * batch_idx / len(train_loader),
+                    loss.item() / len(data),
+                )
+            )
 
         if use_ddstore:
             train_loader.dataset.ddstore.epoch_begin()
-    
+
     if use_ddstore:
         train_loader.dataset.ddstore.epoch_end()
-    print('====> Epoch: {} Average loss: {:.4f}'.format(
-          epoch, train_loss / len(train_loader.dataset)))
+    print(
+        "====> Epoch: {} Average loss: {:.4f}".format(
+            epoch, train_loss / len(train_loader.dataset)
+        )
+    )
 
 
 def test(epoch):
@@ -289,13 +349,18 @@ def test(epoch):
             test_loss += loss_function(recon_batch, data, mu, logvar).item()
             if i == 0:
                 n = min(data.size(0), 8)
-                comparison = torch.cat([data[:n],
-                                      recon_batch.view(args.batch_size, 1, 28, 28)[:n]])
-                save_image(comparison.cpu(),
-                         'results/reconstruction_' + str(epoch) + '.png', nrow=n)
+                comparison = torch.cat(
+                    [data[:n], recon_batch.view(args.batch_size, 1, 28, 28)[:n]]
+                )
+                save_image(
+                    comparison.cpu(),
+                    "results/reconstruction_" + str(epoch) + ".png",
+                    nrow=n,
+                )
 
     test_loss /= len(test_loader.dataset)
-    print('====> Test set loss: {:.4f}'.format(test_loss))
+    print("====> Test set loss: {:.4f}".format(test_loss))
+
 
 if __name__ == "__main__":
     # print("main", rank)
@@ -305,6 +370,6 @@ if __name__ == "__main__":
         with torch.no_grad():
             sample = torch.randn(64, 20).to(device)
             sample = model.module.decode(sample).cpu()
-            save_image(sample.view(64, 1, 28, 28),
-                       'results/sample_' + str(epoch) + '.png')
-
+            save_image(
+                sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
+            )

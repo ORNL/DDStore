@@ -133,23 +133,29 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
 
 void DDStore::epoch_begin()
 {
-    for (auto &x : this->varlist)
+    if (!this->use_mq || (this->use_mq && (this->role == 0)))
     {
-        if (x.second.fence_active)
-            throw std::logic_error("Fence already activated");
-        MPI_Win_fence(0, x.second.win);
-        x.second.fence_active = true;
+        for (auto &x : this->varlist)
+        {
+            if (x.second.fence_active)
+                throw std::logic_error("Fence already activated");
+            MPI_Win_fence(0, x.second.win);
+            x.second.fence_active = true;
+        }
     }
 }
 
 void DDStore::epoch_end()
 {
-    for (auto &x : this->varlist)
+    if (!this->use_mq || (this->use_mq && (this->role == 0)))
     {
-        if (not x.second.fence_active)
-            throw std::logic_error("Fence is not activated");
-        MPI_Win_fence(0, x.second.win);
-        x.second.fence_active = false;
+        for (auto &x : this->varlist)
+        {
+            if (not x.second.fence_active)
+                throw std::logic_error("Fence is not activated");
+            MPI_Win_fence(0, x.second.win);
+            x.second.fence_active = false;
+        }
     }
 }
 
@@ -359,7 +365,7 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     {
         perror("pushd: send head error");
     }
-    // printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
+    printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
 
     int nbytes = 0;
     for (int i = 0; i < nchunk; i++)
@@ -376,7 +382,7 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
             continue;
         }
         nbytes += len;
-        // printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+        printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }
 
@@ -393,7 +399,7 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     {
         perror("pulld: recv head error");
     }
-    // printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
+    printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
 
     memset(buffer, 0, size);
 
@@ -412,6 +418,6 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
             continue;
         }
         nbytes += rc;
-        // printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+        printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }

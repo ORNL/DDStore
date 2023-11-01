@@ -30,7 +30,7 @@ class DistDataset(Dataset):
         self.comm = comm
         self.rank = self.comm.Get_rank()
         self.comm_size = self.comm.Get_size()
-        print("init", self.rank, self.comm_size)
+        print("init: rank,size,label =", self.rank, self.comm_size, label)
         self.ddstore_width = (
             ddstore_width if ddstore_width is not None else self.comm_size
         )
@@ -41,7 +41,7 @@ class DistDataset(Dataset):
 
         ## set total before set subset
         self.total_ns = len(data)
-        print("init", self.total_ns)
+        print("init: total_ns =", self.total_ns)
 
         # WHEN READY FOR WHOLE DATA SET CHANGE THE RANGE TO range(len(data))
         rx = list(nsplit(range(len(data)), self.ddstore_comm_size))[

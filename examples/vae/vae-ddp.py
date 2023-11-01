@@ -20,6 +20,7 @@ import torch.distributed as dist
 import os
 import socket
 import psutil
+import sys
 
 """
 Functions for DDP on HPC
@@ -314,6 +315,7 @@ def train(epoch):
     for batch_idx, (data, _) in enumerate(train_loader):
         if use_ddstore:
             train_loader.dataset.ddstore.epoch_end()
+        print(rank, "batch_idx:", batch_idx)
         # print(rank, device)
         data = data.to(device)
         # print(rank, "data")

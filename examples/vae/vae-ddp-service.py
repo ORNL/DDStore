@@ -12,6 +12,7 @@ from torchvision import datasets, transforms
 from distdataset import DistDataset
 
 import time
+import numpy as np
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -20,6 +21,14 @@ if __name__ == "__main__":
     parser.add_argument("--width", type=int, help="ddstore width", default=6)
     parser.add_argument("--mq", action="store_true", help="use mq")
     parser.add_argument("--stream", action="store_true", help="use stream mode")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="number of epochs to train (default: 10)",
+    )
+
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--producer",
@@ -76,16 +85,22 @@ if __name__ == "__main__":
         comm.Barrier()
     else:
         # trainset.ddstore.epoch_begin()
-        for i in range(0, len(trainset), 1000):
+        cnt = 0
+        while True:
             if mode == 0:
+                i = 0
                 print(">>> [%d] producer waiting ..." % (rank))
             else:
-                print(">>> [%d] producer streaming begin ..." % (rank))
+                i = np.random.randint(len(trainset))
+                print(">>> [%d] producer streaming begin ... %d" % (rank, i))
             rtn = trainset.get(i)
             if mode == 0:
                 print(">>> [%d] producer responded." % (rank))
             else:
                 print(">>> [%d] producer streaming end." % (rank))
+                cnt += 1
+                if cnt >= args.epochs * len(trainset):
+                    break
             # comm.Barrier()
             """
             if i%500:

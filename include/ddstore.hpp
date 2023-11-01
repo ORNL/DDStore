@@ -303,7 +303,7 @@ class DDStore
 
             if (this->mode == 0)
             {
-                // printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
+                printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
                 this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
             }
 
@@ -319,7 +319,7 @@ class DDStore
                 {
                     // get id from mqr
                     this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
-                    // printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                    printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
                 }
 
                 // reset based on the requested id

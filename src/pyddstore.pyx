@@ -51,6 +51,7 @@ cdef extern from "ddstore.hpp":
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
         DDStore(libmpi.MPI_Comm comm, int use_mq, int role)
+        DDStore(libmpi.MPI_Comm comm, int use_mq, int role, int mode)
         void create[T](string name, T* buffer, int disp, int* local_lenlist, int ncount) except +
         int get[T](string name, long id, T* buffer, int size) except +
         void epoch_begin()
@@ -59,6 +60,7 @@ cdef extern from "ddstore.hpp":
         void query(string name, VarInfo &varinfo)
         int use_mq
         int role
+        int mode
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -70,8 +72,8 @@ cdef class PyDDStore:
     cdef DDStore c_ddstore
     cdef dict buffer_list
 
-    def __cinit__(self, MPI.Comm comm, use_mq=0, role=0):
-        self.c_ddstore = DDStore(comm.ob_mpi, use_mq, role)
+    def __cinit__(self, MPI.Comm comm, use_mq=0, role=0, mode=0):
+        self.c_ddstore = DDStore(comm.ob_mpi, use_mq, role, mode)
         self.buffer_list = dict()
 
     cpdef test(self):
@@ -141,15 +143,21 @@ cdef class PyDDStore:
 
     def get(self, str name, long id, decoder=None):
         cdef np.ndarray arr
-        if (not self.c_ddstore.use_mq) or (self.c_ddstore.use_mq and self.c_ddstore.role):
-            n = self.query(name, id)
+        cdef int use_mq = self.c_ddstore.use_mq
+        cdef int role = self.c_ddstore.role
+        cdef int mode = self.c_ddstore.mode
+        if (not use_mq) or (use_mq and (role == 1)):
+            if mode == 0:
+                n = self.query(name, id)
+            else:
+                n = self.querymax(name)
             arr = np.chararray(n)
             self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
             rtn = arr.data[:n]
             if decoder is not None:
                 rtn = decoder(rtn)
         else:
-            rtn = self.c_ddstore.get(s2b(name), -1, <char *> NULL, 0)
+            rtn = self.c_ddstore.get(s2b(name), id, <char *> NULL, 0)
         return rtn
 
     def get_ndarray(self, str name, np.ndarray arr, long id):
@@ -173,7 +181,12 @@ cdef class PyDDStore:
         cdef VarInfo varinfo
         self.c_ddstore.query(s2b(name), varinfo)
         return varinfo.lenlist[id]
-    
+
+    def querymax(self, str name, long id):
+        cdef VarInfo varinfo
+        self.c_ddstore.query(s2b(name), varinfo)
+        return max(varinfo.lenlist)
+
     def buffer(self, str name):
         return self.buffer_list[name]
 

@@ -19,6 +19,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--width", type=int, help="ddstore width", default=6)
     parser.add_argument("--mq", action="store_true", help="use mq")
+    parser.add_argument("--stream", action="store_true", help="use stream mode")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--producer",
@@ -38,10 +39,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     role = 1 if args.role == "consumer" else 0  ## 0: producer, 1: consumer
+    mode = 1 if args.stream else 0  ## 0: mq, 1: stream mq
     opt = {
         "ddstore_width": args.width,
         "use_mq": args.mq,
         "role": role,
+        "mode": mode,
     }
 
     comm = MPI.COMM_WORLD
@@ -60,6 +63,8 @@ if __name__ == "__main__":
     if role == 1:
         t = 0
         for i in range(0, len(trainset), 1000):
+            if mode == 1:
+                i = 0
             print(">>> [%d] consumer asking ... %d" % (rank, i))
             t0 = time.time()
             trainset.__getitem__(i)
@@ -70,15 +75,19 @@ if __name__ == "__main__":
         comm.Barrier()
     else:
         # trainset.ddstore.epoch_begin()
-        cnt = 0
-        while True:
-            print(">>> [%d] producer waiting ..." % (rank))
-            rtn = trainset.get(0)
-            print(">>> [%d] producer responded." % (rank))
-            cnt += 1
+        for i in range(0, len(trainset), 1000):
+            if mode == 0:
+                print(">>> [%d] producer waiting ..." % (rank))
+            else:
+                print(">>> [%d] producer streaming begin ..." % (rank))
+            rtn = trainset.get(i)
+            if mode == 0:
+                print(">>> [%d] producer responded." % (rank))
+            else:
+                print(">>> [%d] producer streaming end." % (rank))
             # comm.Barrier()
             """
-            if cnt%500:
+            if i%500:
                 comm.Barrier()
                 #trainset.ddstore.epoch_end()
                 #trainset.ddstore.epoch_begin()

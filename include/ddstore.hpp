@@ -60,10 +60,12 @@ class DDStore
     DDStore();
     DDStore(MPI_Comm comm);
     DDStore(MPI_Comm comm, int use_mq, int role);
+    DDStore(MPI_Comm comm, int use_mq, int role, int mode);
     ~DDStore();
 
     int use_mq;
-    int role; // 0 = producer, 1 = consumer
+    int role; // 0: producer, 1: consumer
+    int mode; // 0: mq, 1: stream mq
 
     void query(std::string name, VarInfo_t &varinfo);
     void epoch_begin();
@@ -296,19 +298,26 @@ class DDStore
         if (this->use_mq && (this->role == 1))
         {
 
-            // printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
-            this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
+            if (this->mode == 0)
+            {
+                // printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
+                this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
+            }
 
             // printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
+            // we assume the buffer is always big enough for stream get
             this->pulld(mqd, (char *)buffer, nbyte);
         }
         else
         {
             if (this->use_mq && (this->role == 0))
             {
-                // get id from mqr
-                this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
-                // printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                if (this-> mode == 0) 
+                {
+                    // get id from mqr
+                    this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
+                    // printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                }
 
                 // reset based on the requested id
                 len = varinfo.lenlist[id];

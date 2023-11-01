@@ -47,7 +47,7 @@ void init_log(int rank)
 }
 
 DDStore::DDStore()
-    : use_mq(0), role(0)
+    : use_mq(0), role(0), mode(0)
 {
     this->comm = MPI_COMM_SELF;
     MPI_Comm_size(this->comm, &this->comm_size);
@@ -56,7 +56,7 @@ DDStore::DDStore()
 }
 
 DDStore::DDStore(MPI_Comm comm)
-    : use_mq(0), role(0)
+    : use_mq(0), role(0), mode(0)
 {
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
@@ -68,6 +68,7 @@ DDStore::DDStore(MPI_Comm comm)
 }
 
 DDStore::DDStore(MPI_Comm comm, int use_mq, int role)
+    : mode(0)
 {
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
@@ -76,6 +77,18 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role)
 
     this->use_mq = use_mq;
     this->role = role;
+}
+
+DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
+{
+    this->comm = comm;
+    MPI_Comm_size(this->comm, &this->comm_size);
+    MPI_Comm_rank(this->comm, &this->rank);
+    init_log(this->rank);
+
+    this->use_mq = use_mq;
+    this->role = role;
+    this->mode = mode;
 }
 
 DDStore::~DDStore()

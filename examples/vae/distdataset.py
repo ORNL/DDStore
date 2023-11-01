@@ -21,7 +21,7 @@ class DistDataset(Dataset):
     """Distributed dataset class"""
 
     def __init__(
-        self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, use_mq=False, role=1
+        self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, use_mq=False, role=1, mode=0
     ):
         super().__init__()
 
@@ -37,7 +37,7 @@ class DistDataset(Dataset):
         self.ddstore_comm = self.comm.Split(self.rank // self.ddstore_width, self.rank)
         self.ddstore_comm_rank = self.ddstore_comm.Get_rank()
         self.ddstore_comm_size = self.ddstore_comm.Get_size()
-        self.ddstore = dds.PyDDStore(self.ddstore_comm, use_mq=use_mq, role=role)
+        self.ddstore = dds.PyDDStore(self.ddstore_comm, use_mq=use_mq, role=role, mode=mode)
 
         ## set total before set subset
         self.total_ns = len(data)

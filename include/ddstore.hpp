@@ -292,8 +292,11 @@ class DDStore
 
         len = varinfo.lenlist[id];
         nbyte = varinfo.disp * sizeof(T) * len;
-        if ((long unsigned int)nbyte > size * sizeof(T))
-            throw std::invalid_argument("Invalid buffer size");
+        if (this->use_mq && (this->role == 1))
+        {
+            if ((long unsigned int)nbyte > size * sizeof(T))
+                throw std::invalid_argument("Invalid buffer size");
+        }
 
         if (this->use_mq && (this->role == 1))
         {

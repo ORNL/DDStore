@@ -26,6 +26,7 @@ if __name__ == "__main__":
         "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
     )
     parser.add_argument("--mq", action="store_true", help="use mq")
+    parser.add_argument("--stream", action="store_true", help="use stream")
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--producer",
@@ -53,8 +54,9 @@ if __name__ == "__main__":
     nbatch = args.nbatch
     use_mq = 1 if args.mq else 0
     role = 1 if args.role == "consumer" else 0
+    mode = 1 if args.stream else 0
 
-    ddstore = dds.PyDDStore(comm, use_mq=use_mq, role=role)
+    ddstore = dds.PyDDStore(comm, use_mq=use_mq, role=role, mode=mode)
 
     shape = (num, dim)
     dtype = np.float64

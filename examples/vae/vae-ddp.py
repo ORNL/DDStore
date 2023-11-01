@@ -258,7 +258,7 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
-use_mq = 1 if args.mq else 0  ## 0: mq, 1: stream mq
+use_mq = 1 if args.mq else 0  ## 0: false, 1: true
 role = 1 if args.role == "consumer" else 0  ## 0: producer, 1: consumer
 mode = 1 if args.stream else 0  ## 0: mq, 1: stream mq
 opt = {
@@ -269,7 +269,7 @@ opt = {
 
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
-    "train",
+    "trainset",
     comm,
     **opt
 )

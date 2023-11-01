@@ -38,11 +38,12 @@ if __name__ == "__main__":
     parser.set_defaults(role="consumer")
     args = parser.parse_args()
 
+    use_mq = 1 if args.mq else 0  ## 0: false, 1: true
     role = 1 if args.role == "consumer" else 0  ## 0: producer, 1: consumer
     mode = 1 if args.stream else 0  ## 0: mq, 1: stream mq
     opt = {
         "ddstore_width": args.width,
-        "use_mq": args.mq,
+        "use_mq": use_mq,
         "role": role,
         "mode": mode,
     }
@@ -55,7 +56,7 @@ if __name__ == "__main__":
     trainset = datasets.MNIST(
         "data", train=True, download=True, transform=transforms.ToTensor()
     )
-    trainset = DistDataset(trainset, "trainset", **opt)
+    trainset = DistDataset(trainset, "trainset", comm, **opt)
     print("trainset size: %d" % len(trainset))
 
     comm.Barrier()

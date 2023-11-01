@@ -185,6 +185,7 @@ parser.add_argument(
     help="how many batches to wait before logging training status",
 )
 parser.add_argument("--mq", action="store_true", help="use mq")
+parser.add_argument("--stream", action="store_true", help="use stream mode")
 group = parser.add_mutually_exclusive_group()
 group.add_argument(
     "--producer",
@@ -257,10 +258,20 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
+use_mq = 1 if args.mq else 0  ## 0: mq, 1: stream mq
+role = 1 if args.role == "consumer" else 0  ## 0: producer, 1: consumer
+mode = 1 if args.stream else 0  ## 0: mq, 1: stream mq
+opt = {
+    "use_mq": use_mq,
+    "role": role,
+    "mode": mode,
+}
+
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
     "train",
     comm,
+    **opt
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
@@ -272,6 +283,7 @@ train_loader = torch.utils.data.DataLoader(
 testset = datasets.MNIST(
     "data", train=False, download=True, transform=transforms.ToTensor()
 )
+
 test_loader = torch.utils.data.DataLoader(
     testset, batch_size=args.batch_size, shuffle=False, **kwargs
 )

@@ -47,36 +47,18 @@ void init_log(int rank)
 }
 
 DDStore::DDStore()
-    : use_mq(0), role(0), mode(0)
+    : DDStore(MPI_COMM_SELF, 0, 0, 0)
 {
-    this->comm = MPI_COMM_SELF;
-    MPI_Comm_size(this->comm, &this->comm_size);
-    MPI_Comm_rank(this->comm, &this->rank);
-    init_log(this->rank);
 }
 
 DDStore::DDStore(MPI_Comm comm)
-    : use_mq(0), role(0), mode(0)
+    : DDStore(comm, 0, 0, 0)
 {
-    this->comm = comm;
-    MPI_Comm_size(this->comm, &this->comm_size);
-    MPI_Comm_rank(this->comm, &this->rank);
-    init_log(this->rank);
-
-    this->use_mq = use_mq;
-    this->role = role;
 }
 
 DDStore::DDStore(MPI_Comm comm, int use_mq, int role)
-    : mode(0)
+    : DDStore(comm, use_mq, role, 0)
 {
-    this->comm = comm;
-    MPI_Comm_size(this->comm, &this->comm_size);
-    MPI_Comm_rank(this->comm, &this->rank);
-    init_log(this->rank);
-
-    this->use_mq = use_mq;
-    this->role = role;
 }
 
 DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
@@ -89,6 +71,14 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
     this->use_mq = use_mq;
     this->role = role;
     this->mode = mode;
+
+    char *value = std::getenv("DDSTORE_VERBOSE");
+    int verbose = 0;
+    if (value != NULL)
+    {
+        verbose = atoi(value);
+    }
+    this->verbose = verbose;
 }
 
 DDStore::~DDStore()
@@ -277,7 +267,8 @@ void DDStore::queue_init(std::string name)
 
 void DDStore::pushr(mqd_t mq, char *buffer, long size)
 {
-    // printf("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
+    if (this->verbose)
+        printf("[%d:%d] pushr: %ld\n", this->role, this->rank, size);
 
     struct mq_attr attr;
     mq_getattr(mq, &attr);
@@ -293,7 +284,8 @@ void DDStore::pushr(mqd_t mq, char *buffer, long size)
     {
         perror("pushr: send error");
     }
-    // printf("[%d:%d] pushr: send (%d)\n", this->role, this->rank, rc);
+    if (this->verbose)
+        printf("[%d:%d] pushr: send (%d)\n", this->role, this->rank, rc);
 }
 
 void DDStore::pullr(mqd_t mq, char *buffer, long size)
@@ -313,7 +305,8 @@ void DDStore::pullr(mqd_t mq, char *buffer, long size)
     }
 
     memset(buffer, 0, size);
-    // printf("[%d:%d] pullr: ready to receive\n", this->role, this->rank);
+    if (this->verbose)
+        printf("[%d:%d] pullr: ready to receive\n", this->role, this->rank);
     rc = mq_receive(mq, buffer, size, NULL);
     if (rc < 0)
     {
@@ -357,7 +350,8 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     int nchunk = size / attr.mq_msgsize;
     if (size > nchunk * attr.mq_msgsize)
         nchunk += 1;
-    // printf("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
+    if (this->verbose)
+        printf("[%d:%d] pushd: %ld %d\n", this->role, this->rank, size, nchunk);
 
     int rc;
     rc = mq_send(mq, (const char *)&nchunk, sizeof(int), 0);
@@ -365,7 +359,8 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     {
         perror("pushd: send head error");
     }
-    printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
+    if (this->verbose)
+        printf("[%d:%d] pushd: send head (%d)\n", this->role, this->rank, rc);
 
     int nbytes = 0;
     for (int i = 0; i < nchunk; i++)
@@ -382,7 +377,8 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
             continue;
         }
         nbytes += len;
-        printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+        if (this->verbose)
+            printf("[%d:%d] pushd: send data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }
 
@@ -399,7 +395,8 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     {
         perror("pulld: recv head error");
     }
-    printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
+    if (this->verbose)
+        printf("[%d:%d] pulld: %ld %d\n", this->role, this->rank, size, nchunk);
 
     memset(buffer, 0, size);
 
@@ -418,6 +415,7 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
             continue;
         }
         nbytes += rc;
-        printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
+        if (this->verbose)
+            printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
 }

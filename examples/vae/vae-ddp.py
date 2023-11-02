@@ -20,7 +20,7 @@ import torch.distributed as dist
 import os
 import socket
 import psutil
-import sys
+import re
 
 """
 Functions for DDP on HPC
@@ -103,8 +103,8 @@ def parse_slurm_nodelist(nodelist):
 def setup_ddp():
     """ "Initialize DDP"""
 
-    if os.getenv("HYDRAGNN_BACKEND") is not None:
-        backend = os.environ["HYDRAGNN_BACKEND"]
+    if os.getenv("DDSTORE_BACKEND") is not None:
+        backend = os.environ["DDSTORE_BACKEND"]
     elif dist.is_nccl_available() and torch.cuda.is_available():
         backend = "nccl"
     elif torch.distributed.is_gloo_available():
@@ -115,8 +115,8 @@ def setup_ddp():
     world_size, world_rank = init_comm_size_and_rank()
 
     ## Default setting
-    master_addr = "127.0.0.1"
-    master_port = "8889"
+    master_addr = os.getenv("MASTER_ADDR", "127.0.0.1")
+    master_port = os.getenv("MASTER_PORT", "8889")
 
     if os.getenv("LSB_HOSTS") is not None:
         ## source: https://www.olcf.ornl.gov/wp-content/uploads/2019/12/Scaling-DL-on-Summit.pdf
@@ -165,9 +165,9 @@ parser.add_argument(
 parser.add_argument(
     "--epochs",
     type=int,
-    default=10,
+    default=1,
     metavar="N",
-    help="number of epochs to train (default: 10)",
+    help="number of epochs to train (default: 1)",
 )
 parser.add_argument(
     "--no-cuda", action="store_true", default=False, help="disables CUDA training"
@@ -377,7 +377,7 @@ def test(epoch):
 
 
 if __name__ == "__main__":
-    # print("main", rank)
+    os.makedirs("results", exist_ok=True)
     for epoch in range(1, args.epochs + 1):
         train(epoch)
         test(epoch)

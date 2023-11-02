@@ -1,3 +1,5 @@
+#include <assert.h>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <mpi.h>
@@ -7,8 +9,6 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
-#include <assert.h>
-#include <cstring>
 
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
@@ -64,8 +64,9 @@ class DDStore
     ~DDStore();
 
     int use_mq;
-    int role; // 0: producer, 1: consumer
-    int mode; // 0: mq, 1: stream mq
+    int role;    // 0: producer, 1: consumer
+    int mode;    // 0: mq, 1: stream mq
+    int verbose; // 0: non verbose, 1: verbose
 
     void query(std::string name, VarInfo_t &varinfo);
     void epoch_begin();
@@ -91,7 +92,8 @@ class DDStore
         long l_ntotal = 0;
         for (int i = 0; i < ncount; i++)
             l_ntotal += l_lenlist[i];
-        std::cout << this->rank << ": " << "l_ntotal,disp,ncount = " << l_ntotal << ", " << disp << ", " << ncount << std::endl;
+        std::cout << this->rank << ": "
+                  << "l_ntotal,disp,ncount = " << l_ntotal << ", " << disp << ", " << ncount << std::endl;
 
         VarInfo_t var;
         MPI_Win win;
@@ -133,7 +135,8 @@ class DDStore
             //     std::cout << this->rank << ": " << "recvcounts[" << i << "] = " << recvcounts[i] << std::endl;
             // for (long unsigned int i = 0; i < displs.size(); i++)
             //     std::cout << this->rank << ": " << "displs[" << i << "] = " << displs[i] << std::endl;
-            std::cout << this->rank << ": " << "ntotal = " << ntotal << std::endl;
+            std::cout << this->rank << ": "
+                      << "ntotal = " << ntotal << std::endl;
 
             std::vector<int> lenlist(ntotal);
             std::vector<long unsigned int> dataoffsets(ntotal);
@@ -303,11 +306,13 @@ class DDStore
 
             if (this->mode == 0)
             {
-                printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
+                if (this->verbose)
+                    printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
                 this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
             }
 
-            // printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
+            if (this->verbose)
+                printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
             // we assume the buffer is always big enough for stream get
             this->pulld(mqd, (char *)buffer, nbyte);
         }
@@ -315,11 +320,12 @@ class DDStore
         {
             if (this->use_mq && (this->role == 0))
             {
-                if (this-> mode == 0) 
+                if (this->mode == 0)
                 {
                     // get id from mqr
                     this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
-                    printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                    if (this->verbose)
+                        printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
                 }
 
                 // reset based on the requested id
@@ -357,7 +363,8 @@ class DDStore
 
             if (this->use_mq && (this->role == 0))
             {
-                // printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
+                if (this->verbose)
+                    printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
                 this->pushd(mqd, (char *)buffer, nbyte);
                 // std::free((void *)buffer);
                 MPI_Free_mem((void *)buffer);

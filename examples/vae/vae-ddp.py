@@ -304,8 +304,10 @@ def loss_function(recon_x, x, mu, logvar):
 
 
 def train(epoch):
-    use_ddstore = hasattr(train_loader.dataset, "ddstore") and hasattr(
-        train_loader.dataset.ddstore, "epoch_begin"
+    use_ddstore = (
+        hasattr(train_loader.dataset, "ddstore")
+        and hasattr(train_loader.dataset.ddstore, "epoch_begin")
+        and not args.mq
     )
 
     model.train()
@@ -340,7 +342,6 @@ def train(epoch):
                     loss.item() / len(data),
                 )
             )
-
         if use_ddstore:
             train_loader.dataset.ddstore.epoch_begin()
 
@@ -387,3 +388,4 @@ if __name__ == "__main__":
             save_image(
                 sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
             )
+    print("Done.")

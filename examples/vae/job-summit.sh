@@ -10,22 +10,29 @@
 [ -z $JOBSIZE ] && JOBSIZE=$(((LSB_DJOB_NUMPROC-1)/42))
 NP=$((JOBSIZE*6))
 
-## Prepar
-jskill all
-\rm -f run0.log run1.log
-jsrun -n$JOBSIZE bash -c "rm -f /dev/mqueue/*"
-sleep 3
+cleanup() {
+    jskill all
+    \rm -f run0.log run1.log
+    jsrun -n$JOBSIZE bash -c "rm -f /dev/mqueue/*"
+    jsrun -n$JOBSIZE bash -c "ls /dev/mqueue/*"
+}
 
+export DDSTORE_VERBOSE=1
 ## For single run:
-#time jsrun -n$NN -g1 -c6 -brs python -u vae-ddp.py --epochs 3 2>&1 | tee run1.log 
+cleanup
+(time jsrun -n$NP -g1 -c6 -brs python -u vae-ddp.py) 2>&1 | tee run-v0.log 
 
 ## For producer-consumer run:
-time jsrun -n$NN -g0 -c1 -brs python -u vae-ddp-service.py --mq --producer 2>&1 > run0.log &
+cleanup
+MASTER_PORT=8889 jsrun -n$NP -g0 -c1 -brs python -u vae-ddp-service.py --mq --producer 2>&1 > run-v1-role0.log &
 sleep 3
-#time jsrun -n$NN -g1 -c6 -brs python -u vae-ddp-service.py --mq --consumer 2>&1 | tee run1.log 
-time jsrun -n$NN -g1 -c6 -brs python -u vae-ddp.py --epochs 3 --mq --consumer 2>&1 | tee run1.log 
+(time MASTER_PORT=8890 jsrun -n$NP -g1 -c6 -brs python -u vae-ddp.py --mq --consumer) 2>&1 | tee run-v1-role1.log 
 
-## Cleanup
+## For producer-consumer stream run:
+cleanup
+MASTER_PORT=8889 jsrun -n$NP -g0 -c1 -brs python -u vae-ddp-service.py --mq --producer --stream 2>&1 > run-v2-role0.log &
 sleep 3
-jskill all
+(time MASTER_PORT=8890 jsrun -n$NP -g1 -c6 -brs python -u vae-ddp.py --mq --consumer --stream) 2>&1 | tee run-v2-role1.log 
+## Cleanup
+cleanup
 

@@ -163,6 +163,13 @@ if __name__ == "__main__":
         metavar="N",
         help="number of epochs to train (default: 10)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=128,
+        metavar="N",
+        help="input batch size for training (default: 128)",
+    )
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -231,8 +238,9 @@ if __name__ == "__main__":
             # comm.Barrier()
     else:
         for k in range(args.epochs):
-            # trainset.ddstore.epoch_begin()
-            for i in sample_list:
+            comm.Barrier()
+            trainset.ddstore.epoch_begin()
+            for seq, i in enumerate(sample_list):
                 if mode == 0:
                     i = 0
                     print(">>> [%d] producer waiting ..." % (rank))
@@ -243,5 +251,8 @@ if __name__ == "__main__":
                     print(">>> [%d] producer responded." % (rank))
                 else:
                     print(">>> [%d] producer streaming end." % (rank))
-            # trainset.ddstore.epoch_end()
+                if (seq + 1) % args.batch_size == 0:
+                    trainset.ddstore.epoch_end()
+                    trainset.ddstore.epoch_begin()
+            trainset.ddstore.epoch_end()
     sys.exit(0)

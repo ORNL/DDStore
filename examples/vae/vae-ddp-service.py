@@ -153,7 +153,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("--width", type=int, help="ddstore width", default=6)
     parser.add_argument("--mq", action="store_true", help="use mq")
     parser.add_argument("--stream", action="store_true", help="use stream mode")
     parser.add_argument(
@@ -193,7 +192,6 @@ if __name__ == "__main__":
     role = 1 if args.role == "consumer" else 0  ## 0: producer, 1: consumer
     mode = 1 if args.stream else 0  ## 0: mq, 1: stream mq
     opt = {
-        "ddstore_width": args.width,
         "use_mq": use_mq,
         "role": role,
         "mode": mode,

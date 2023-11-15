@@ -61,7 +61,7 @@ cdef class PyDDStore:
     def add(self, str name, np.ndarray arr):
         assert arr.flags.c_contiguous
         cdef long nrows = arr.shape[0]
-        cdef int disp = arr.size / arr.shape[0]
+        cdef int disp = arr.size // arr.shape[0]
         if arr.dtype == np.int32:
             self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp)
         elif arr.dtype == np.int64:

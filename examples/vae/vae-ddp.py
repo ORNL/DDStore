@@ -21,6 +21,7 @@ import os
 import socket
 import psutil
 import re
+import time
 
 """
 Functions for DDP on HPC
@@ -379,6 +380,8 @@ def test(epoch):
 
 if __name__ == "__main__":
     os.makedirs("results", exist_ok=True)
+    dist.barrier()
+    t0 = time.time()
     for epoch in range(1, args.epochs + 1):
         train(epoch)
         test(epoch)
@@ -388,4 +391,7 @@ if __name__ == "__main__":
             save_image(
                 sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
             )
-    print("Done.")
+
+    dist.barrier()
+    t1 = time.time()
+    print("Done. time: %f"%(t1-t0))

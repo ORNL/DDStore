@@ -11,13 +11,13 @@ defs = [("NPY_NO_DEPRECATED_API", 0)]
 np_inc_path = np.get_include()
 
 extending = Extension(
-    "pyddstore",
+    "pyddstore2",
     sources=["src/pyddstore.pyx", "src/ddstore.cxx"],
     include_dirs=[np_inc_path, "include", "/Users/jyc/sw/boost/1.80.0/include"],
     extra_compile_args=["-std=c++11"],
     define_macros=defs,
     library_dirs=[],
-    libraries=[],
+    libraries=["rt"],
 )
 
 extensions = [
@@ -25,7 +25,7 @@ extensions = [
 ]
 
 setup(
-    name="PyDDStore",
+    name="PyDDStore2",
     version="0.1",
     description="Distributed Data Store",
     ext_modules=cythonize(extensions),

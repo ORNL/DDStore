@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 # from hydragnn.utils.abstractbasedataset import AbstractBaseDataset
 
 try:
-    import pyddstore as dds
+    import pyddstore2 as dds
 except ImportError:
     pass
 

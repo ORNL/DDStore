@@ -6,7 +6,7 @@ mpi4py.rc.threads = False
 import numpy as np
 from mpi4py import MPI
 import argparse
-import pyddstore as dds
+import pyddstore2 as dds
 import sys
 import io
 import pickle

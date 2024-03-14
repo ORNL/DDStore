@@ -182,7 +182,7 @@ cdef class PyDDStore:
         self.c_ddstore.query(s2b(name), varinfo)
         return varinfo.lenlist[id]
 
-    def querymax(self, str name, long id):
+    def querymax(self, str name):
         cdef VarInfo varinfo
         self.c_ddstore.query(s2b(name), varinfo)
         return max(varinfo.lenlist)

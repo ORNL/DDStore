@@ -79,6 +79,12 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
         verbose = atoi(value);
     }
     this->verbose = verbose;
+
+    pthread_spin_init(&this->spinlock, 0);
+    this->mutex = PTHREAD_MUTEX_INITIALIZER;
+
+    this->ndchannel = 8;
+    this->imax = 0;
 }
 
 DDStore::~DDStore()
@@ -91,16 +97,22 @@ DDStore::~DDStore()
             {
                 perror("mqr: mq_close");
             }
-            if (mq_close(x.second.mqd))
+            for (int i = 0; i < this->ndchannel; i++)
             {
-                perror("mqd: mq_close");
+                if (mq_close(x.second.mqd[i]))
+                {
+                    perror("mqd: mq_close");
+                }
             }
             if (this->role == 0)
             {
-                // producer destroys the queue
-                if (mq_unlink(x.second.mqd_name.c_str()))
+                for (int i = 0; i < this->ndchannel; i++)
                 {
-                    perror("mqd: mq_unlink");
+                    // producer destroys the queue
+                    if (mq_unlink(x.second.mqd_name[i].c_str()))
+                    {
+                        perror("mqd: mq_unlink");
+                    }
                 }
             }
             if (this->role == 1)
@@ -173,12 +185,12 @@ void DDStore::free()
 // role: producer (0) or consumer (1)
 void DDStore::queue_init(std::string name)
 {
-    mqd_t mqd;
+    mqd_t mqd[64];
     mqd_t mqr;
-    char mqd_name[128];
+    char *mqd_name_list[64]; // MAX=64
     char mqr_name[128];
     long mqd_msgsize = 0;
-    long mqr_msgsize = sizeof(long unsigned int);
+    long mqr_msgsize = sizeof(Request_t);
 
     // VarInfo_t &varinfo = this->varlist[name];
     // std::vector<int> &lenlist = varinfo.lenlist;
@@ -188,7 +200,11 @@ void DDStore::queue_init(std::string name)
     // mqd_msgsize *=  varinfo.itemsize * varinfo.disp;
     mqd_msgsize = (long)Q_ATTR_MSG_SIZE;
 
-    snprintf(mqd_name, 128, "%sd-%s-%d", Q_NAME, name.c_str(), this->rank);
+    for (int i = 0; i < this->ndchannel; i++) 
+    {
+        mqd_name_list[i] = (char*)malloc(128);
+        snprintf(mqd_name_list[i], 128, "%sd-%s-%d-%d", Q_NAME, name.c_str(), this->rank, i);
+    }
     snprintf(mqr_name, 128, "%sr-%s-%d", Q_NAME, name.c_str(), this->rank);
 
     if (this->role == 0) // producer
@@ -200,13 +216,16 @@ void DDStore::queue_init(std::string name)
             .mq_msgsize = mqd_msgsize,    /* Max. message size (bytes) */
             .mq_curmsgs = Q_ATTR_CURMSGS, /* # of messages currently in queue */
         };
-        printf("[%d:%d] mqd_name: %s\n", this->role, this->rank, mqd_name);
+        printf("[%d:%d] mqd_name0: %s\n", this->role, this->rank, mqd_name_list[0]);
         printf("[%d:%d] mqd_msgsize: %ld\n", this->role, this->rank, mqd_msgsize);
         // setup data mq
-        if ((mqd = mq_open(mqd_name, Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
+        for (int i = 0; i < this->ndchannel; i++) 
         {
-            perror("producer: mqd open");
-            return;
+            if ((mqd[i] = mq_open(mqd_name_list[i], Q_OFLAGS_PRODUCER, Q_MODE, &q_attr)) == (mqd_t)-1)
+            {
+                perror("producer: mqd open");
+                return;
+            }
         }
 
         // setup req mq
@@ -241,23 +260,29 @@ void DDStore::queue_init(std::string name)
         }
 
         // setup data mq
-        while ((mqd = mq_open(mqd_name, Q_OFLAGS_CONSUMER)) == (mqd_t)-1)
+        for (int i = 0; i < this->ndchannel; i++) 
         {
-            if (errno == ENOENT)
+            while ((mqd[i] = mq_open(mqd_name_list[i], Q_OFLAGS_CONSUMER)) == (mqd_t)-1)
             {
-                printf("[%d:%d] consumer: Waiting for producer to create message queue...\n", this->role, this->rank);
-                usleep(Q_CREATE_WAIT_US);
-                continue;
+                if (errno == ENOENT)
+                {
+                    printf("[%d:%d] consumer: Waiting for producer to create message queue...\n", this->role, this->rank);
+                    usleep(Q_CREATE_WAIT_US);
+                    continue;
+                }
+                perror("consumer: mqd open");
+                return;
             }
-            perror("consumer: mqd open");
-            return;
         }
     }
 
     QueInfo_t queinfo;
-    queinfo.mqd = mqd;
+    for (int i = 0; i < this->ndchannel; i++) \
+    {
+        queinfo.mqd[i] = mqd[i];
+        queinfo.mqd_name[i] = std::string(mqd_name_list[i]);
+    }
     queinfo.mqr = mqr;
-    queinfo.mqd_name = std::string(mqd_name);
     queinfo.mqr_name = std::string(mqr_name);
     queinfo.mqd_msgsize = mqd_msgsize;
     queinfo.mqr_msgsize = mqr_msgsize;
@@ -311,7 +336,7 @@ void DDStore::pullr(mqd_t mq, char *buffer, long size)
     if (rc < 0)
     {
         perror("pullr: recv error");
-        sleep(1);
+        usleep(1000);
     }
     // timeout version
     // rc = -1;
@@ -388,7 +413,7 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     int nchunk = 0;
     struct mq_attr attr;
     mq_getattr(mq, &attr);
-    char msg[Q_ATTR_MSG_SIZE];
+    // char msg[Q_ATTR_MSG_SIZE];
 
     rc = mq_receive(mq, (char *)&nchunk, attr.mq_msgsize, NULL);
     if (rc < 0)
@@ -403,10 +428,6 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     int nbytes = 0;
     for (int i = 0; i < nchunk; i++)
     {
-        int len = attr.mq_msgsize;
-        if (i == nchunk - 1)
-            len = size - i * attr.mq_msgsize;
-
         rc = mq_receive(mq, buffer + i * attr.mq_msgsize, attr.mq_msgsize, NULL);
         if (rc < 0)
         {

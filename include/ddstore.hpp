@@ -10,6 +10,11 @@
 #include <typeinfo>
 #include <vector>
 
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
@@ -21,6 +26,13 @@
 #define Q_CREATE_WAIT_US 1000000
 #define MSG_COUNT_DEFAULT 20
 #define MSG_PERIOD_US 100000
+
+struct Request
+{
+    long unsigned int id;
+    int ich;
+};
+typedef struct Request Request_t;
 
 struct VarInfo
 {
@@ -43,9 +55,9 @@ typedef struct VarInfo VarInfo_t;
 
 struct QueInfo
 {
-    mqd_t mqd; // data mq
+    mqd_t mqd[64]; // data mq
     mqd_t mqr; // request mq
-    std::string mqd_name;
+    std::string mqd_name[64];
     std::string mqr_name;
     long mqd_msgsize;
     long mqr_msgsize;
@@ -67,6 +79,7 @@ class DDStore
     int role;    // 0: producer, 1: consumer
     int mode;    // 0: mq, 1: stream mq
     int verbose; // 0: non verbose, 1: verbose
+    int ndchannel; // number of data channels
 
     void query(std::string name, VarInfo_t &varinfo);
     void epoch_begin();
@@ -185,7 +198,7 @@ class DDStore
             mqd_t mq = 0;
 
             queinfo = this->qlist[name];
-            mq = queinfo.mqd;
+            mq = queinfo.mqd[0];
 
             int rc = 0;
             int ntotal = 0;
@@ -279,12 +292,27 @@ class DDStore
         QueInfo_t queinfo;
         mqd_t mqd = 0;
         mqd_t mqr = 0;
+        Request_t req;
+        int ich;
+
+        // pid_t pid = getpid();
+        pid_t tid = syscall(SYS_gettid);
+        // pthread_t tid2 = pthread_self();
+
+        if (this->channelmap.find(tid) == this->channelmap.end()) 
+        {
+            pthread_spin_lock(&(this->spinlock));
+            assert(this->imax < this->ndchannel);
+            printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+            this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
+            this->imax = this->imax + 1;
+            pthread_spin_unlock(&(this->spinlock));
+        }
 
         if (this->use_mq)
         {
             queinfo = this->qlist[name];
             mqr = queinfo.mqr;
-            mqd = queinfo.mqd;
         }
 
         VarInfo_t varinfo = this->varlist[name];
@@ -303,18 +331,31 @@ class DDStore
 
         if (this->use_mq && (this->role == 1))
         {
+            ich = this->channelmap[tid];
+            mqd = queinfo.mqd[ich];
+
+            // printf("[%d:%d:%d] lock\n", this->role, this->rank, tid);
+            // pthread_spin_lock(&(this->spinlock));
+            // // pthread_mutex_lock(&(this->mutex));
+            // printf("[%d:%d:%d] acquired\n", this->role, this->rank, tid);
 
             if (this->mode == 0)
             {
                 if (this->verbose)
-                    printf("[%d:%d] push request: %ld\n", this->role, this->rank, id);
-                this->pushr(mqr, (char *)&id, sizeof(long unsigned int));
+                    printf("[%d:%d] push request: %ld %d\n", this->role, this->rank, id, ich);
+                req.id = id;
+                req.ich = ich;
+                this->pushr(mqr, (char *)&req, sizeof(Request_t));
             }
 
             if (this->verbose)
                 printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
             // we assume the buffer is always big enough for stream get
             this->pulld(mqd, (char *)buffer, nbyte);
+
+            // printf("[%d:%d:%d] unlock\n", this->role, this->rank, tid);
+            // pthread_spin_unlock(&(this->spinlock));
+            // // pthread_mutex_unlock(&(this->mutex));
         }
         else
         {
@@ -323,9 +364,12 @@ class DDStore
                 if (this->mode == 0)
                 {
                     // get id from mqr
-                    this->pullr(mqr, (char *)&id, sizeof(long unsigned int));
+                    this->pullr(mqr, (char *)&req, sizeof(Request_t));
+                    id = req.id;
+                    ich = req.ich;
+                    mqd = queinfo.mqd[ich];
                     if (this->verbose)
-                        printf("[%d:%d] pull request: %ld\n", this->role, this->rank, id);
+                        printf("[%d:%d] pull request: %ld %d\n", this->role, this->rank, id, ich);
                 }
 
                 // reset based on the requested id
@@ -378,9 +422,13 @@ class DDStore
     MPI_Comm comm;
     int comm_size;
     int rank;
+    pthread_spinlock_t spinlock;
+    pthread_mutex_t mutex;
 
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;
+    std::map<pid_t, int> channelmap;
+    int imax;
 
     void queue_init(std::string name);
     void pushr(mqd_t mq, char *buffer, long size);

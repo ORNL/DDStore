@@ -69,11 +69,11 @@ cdef class PyDDstoreVarinfo:
         pass
 
 cdef class PyDDStore:
-    cdef DDStore c_ddstore
+    cdef DDStore* c_ddstore
     cdef dict buffer_list
 
     def __cinit__(self, MPI.Comm comm, use_mq=0, role=0, mode=0):
-        self.c_ddstore = DDStore(comm.ob_mpi, use_mq, role, mode)
+        self.c_ddstore = new DDStore(comm.ob_mpi, use_mq, role, mode)
         self.buffer_list = dict()
 
     cpdef test(self):
@@ -198,3 +198,6 @@ cdef class PyDDStore:
 
     def free(self):
         self.c_ddstore.free()
+
+    def __dealloc__(self):
+        del self.c_ddstore

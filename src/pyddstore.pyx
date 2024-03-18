@@ -54,6 +54,7 @@ cdef extern from "ddstore.hpp":
         DDStore(libmpi.MPI_Comm comm, int use_mq, int role, int mode)
         void create[T](string name, T* buffer, int disp, int* local_lenlist, int ncount) except +
         int get[T](string name, long id, T* buffer, int size) except +
+        int get[T](string name, long id, T* buffer, int size, int stream_ichannel) except +
         void epoch_begin()
         void epoch_end()
         void free()
@@ -141,7 +142,7 @@ cdef class PyDDStore:
         else:
             raise NotImplementedError
 
-    def get(self, str name, long id, decoder=None):
+    def get(self, str name, long id, decoder=None, stream_ichannel=0):
         cdef np.ndarray arr
         cdef int use_mq = self.c_ddstore.use_mq
         cdef int role = self.c_ddstore.role
@@ -157,7 +158,7 @@ cdef class PyDDStore:
             if decoder is not None:
                 rtn = decoder(rtn)
         else:
-            rtn = self.c_ddstore.get(s2b(name), id, <char *> NULL, 0)
+            rtn = self.c_ddstore.get(s2b(name), id, <char *> NULL, 0, stream_ichannel)
         return rtn
 
     def get_ndarray(self, str name, np.ndarray arr, long id):

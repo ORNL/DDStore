@@ -287,7 +287,7 @@ class DDStore
     }
 
     template <typename T>
-    int get(std::string name, long unsigned int id, T *buffer, int size)
+    int get(std::string name, long unsigned int id, T *buffer, int size, int stream_ichannel = 0)
     {
         QueInfo_t queinfo;
         mqd_t mqd = 0;
@@ -370,6 +370,11 @@ class DDStore
                     mqd = queinfo.mqd[ich];
                     if (this->verbose)
                         printf("[%d:%d] pull request: %ld %d\n", this->role, this->rank, id, ich);
+                }
+                else
+                {
+                    // stream mode
+                    mqd = queinfo.mqd[stream_ichannel];
                 }
 
                 // reset based on the requested id

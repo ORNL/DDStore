@@ -25,7 +25,8 @@
 #define Q_ATTR_CURMSGS 0
 #define Q_CREATE_WAIT_US 1000000
 #define MSG_COUNT_DEFAULT 20
-#define MSG_PERIOD_US 100000
+#define MSG_PERIOD_US 1000
+#define NCH 4
 
 struct Request
 {

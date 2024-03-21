@@ -83,7 +83,7 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
     pthread_spin_init(&this->spinlock, 0);
     this->mutex = PTHREAD_MUTEX_INITIALIZER;
 
-    this->ndchannel = 8;
+    this->ndchannel = NCH;
     this->imax = 0;
 }
 
@@ -336,7 +336,7 @@ void DDStore::pullr(mqd_t mq, char *buffer, long size)
     if (rc < 0)
     {
         perror("pullr: recv error");
-        usleep(1000);
+        usleep(MSG_PERIOD_US);
     }
     // timeout version
     // rc = -1;

@@ -86,12 +86,17 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
     this->ndchannel = NCH;
     this->imax = 0;
 
-    char fname[128];
-    snprintf(fname, 128, "filelock-%d.lock", this->rank);
-    this->fd = open(fname, O_WRONLY | O_CREAT, 0666);
-    if (this->fd == -1)
+    if (this->use_mq && (this->role == 1))
     {
-        perror("Error opening lockfile");
+        int fd;
+        char fname[128];
+        snprintf(fname, 128, "ddstore-filelock-%d.lock", this->rank);
+        fd = open(fname, O_WRONLY | O_CREAT, 0666);
+
+        char buffer[4];
+        snprintf(buffer, 4, "%3d", this->imax);
+        write(fd, buffer, 3);
+        close(fd);
     }
 }
 

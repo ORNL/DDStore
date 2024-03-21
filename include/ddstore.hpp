@@ -303,63 +303,62 @@ class DDStore
         pid_t tid = syscall(SYS_gettid);
         // pthread_t tid2 = pthread_self();
 
-        if (this->channelmap.find(tid) == this->channelmap.end()) 
+        if (this->use_mq && (this->role == 1))
         {
-            /*
-            // multi-thread
-            pthread_spin_lock(&(this->spinlock));
-            assert(this->imax < this->ndchannel);
-            printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
-            this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
-            this->imax = this->imax + 1;
-            pthread_spin_unlock(&(this->spinlock));
-            */
-
-            // multi-process
-            // Initializing the flock structure
-            struct flock lock;
-            lock.l_type = F_WRLCK; // Exclusive write lock
-            lock.l_whence = SEEK_SET; // Relative to the beginning of the file
-            lock.l_start = 0; // Start of the lock
-            lock.l_len = 0; // 0 means lock the whole file
-
-            // Attempting to acquire the lock
-            if (fcntl(this->fd, F_SETLKW, &lock) == -1)
+            if (this->channelmap.find(tid) == this->channelmap.end())
             {
-                perror("Error locking file");
-                return 1;
-            }
+                /*
+                // multi-thread
+                pthread_spin_lock(&(this->spinlock));
+                assert(this->imax < this->ndchannel);
+                printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+                this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
+                this->imax = this->imax + 1;
+                pthread_spin_unlock(&(this->spinlock));
+                */
 
-            char buffer[4];
-            int bytesRead;
-            bytesRead = read(this->fd, buffer, 3);
-            buffer[bytesRead] = '\0';
-            this->imax = atoi(buffer);
+                // multi-process
+                // Initializing the flock structure
+                struct flock lock;
+                lock.l_type = F_WRLCK; // Exclusive write lock
+                lock.l_whence = SEEK_SET; // Relative to the beginning of the file
+                lock.l_start = 0; // Start of the lock
+                lock.l_len = 0; // 0 means lock the whole file
 
-            // insert
-            this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
-            this->imax = this->imax + 1;
-            printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+                int fd;
+                char fname[128];
+                snprintf(fname, 128, "ddstore-filelock-%d.lock", this->rank);
+                fd = open(fname, O_RDWR);
 
+                // Attempting to acquire the lock
+                if (fcntl(fd, F_SETLKW, &lock) == -1)
+                {
+                    perror("Error locking file");
+                }
 
-            // Now the file is locked, we can write to it
-            snprintf(buffer, 4, "%3d", this->imax);
-            if (write(this->fd, buffer, 3) == -1) 
-            {
-                perror("Error writing to file");
-                // It's important to unlock the file if writing fails
+                char buffer[4];
+                int bytesRead;
+                bytesRead = read(fd, buffer, 3);
+                buffer[bytesRead] = '\0';
+                this->imax = atoi(buffer);
+
+                // insert
+                this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
+                printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+                this->imax = this->imax + 1;
+
+                // Now the file is locked, we can write to it
+                snprintf(buffer, 4, "%3d", this->imax);
+                lseek(fd, 0, SEEK_SET);
+                write(fd, buffer, 3);
+
+                // Unlocking the file
                 lock.l_type = F_UNLCK;
-                fcntl(this->fd, F_SETLK, &lock);
-                close(this->fd);
-                return 1;
-            }
-
-            // Unlocking the file
-            lock.l_type = F_UNLCK;
-            if (fcntl(this->fd, F_SETLK, &lock) == -1)
-            {
-                perror("Error unlocking file");
-                return 1;
+                if (fcntl(fd, F_SETLK, &lock) == -1)
+                {
+                    perror("Error unlocking file");
+                }
+                close(fd);
             }
         }
 
@@ -474,7 +473,6 @@ class DDStore
     int rank;
     pthread_spinlock_t spinlock;
     pthread_mutex_t mutex;
-    int fd;
 
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;

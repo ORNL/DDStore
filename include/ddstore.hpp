@@ -15,6 +15,9 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include <fcntl.h>
+#include <errno.h>
+
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
@@ -26,7 +29,7 @@
 #define Q_CREATE_WAIT_US 1000000
 #define MSG_COUNT_DEFAULT 20
 #define MSG_PERIOD_US 1000
-#define NCH 4
+#define NCH 2
 
 struct Request
 {
@@ -302,12 +305,62 @@ class DDStore
 
         if (this->channelmap.find(tid) == this->channelmap.end()) 
         {
+            /*
+            // multi-thread
             pthread_spin_lock(&(this->spinlock));
             assert(this->imax < this->ndchannel);
             printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
             this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
             this->imax = this->imax + 1;
             pthread_spin_unlock(&(this->spinlock));
+            */
+
+            // multi-process
+            // Initializing the flock structure
+            struct flock lock;
+            lock.l_type = F_WRLCK; // Exclusive write lock
+            lock.l_whence = SEEK_SET; // Relative to the beginning of the file
+            lock.l_start = 0; // Start of the lock
+            lock.l_len = 0; // 0 means lock the whole file
+
+            // Attempting to acquire the lock
+            if (fcntl(this->fd, F_SETLKW, &lock) == -1)
+            {
+                perror("Error locking file");
+                return 1;
+            }
+
+            char buffer[4];
+            int bytesRead;
+            bytesRead = read(this->fd, buffer, 3);
+            buffer[bytesRead] = '\0';
+            this->imax = atoi(buffer);
+
+            // insert
+            this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
+            this->imax = this->imax + 1;
+            printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+
+
+            // Now the file is locked, we can write to it
+            snprintf(buffer, 4, "%3d", this->imax);
+            if (write(this->fd, buffer, 3) == -1) 
+            {
+                perror("Error writing to file");
+                // It's important to unlock the file if writing fails
+                lock.l_type = F_UNLCK;
+                fcntl(this->fd, F_SETLK, &lock);
+                close(this->fd);
+                return 1;
+            }
+
+            // Unlocking the file
+            lock.l_type = F_UNLCK;
+            if (fcntl(this->fd, F_SETLK, &lock) == -1)
+            {
+                perror("Error unlocking file");
+                return 1;
+            }
         }
 
         if (this->use_mq)
@@ -335,11 +388,6 @@ class DDStore
             ich = this->channelmap[tid];
             mqd = queinfo.mqd[ich];
 
-            // printf("[%d:%d:%d] lock\n", this->role, this->rank, tid);
-            // pthread_spin_lock(&(this->spinlock));
-            // // pthread_mutex_lock(&(this->mutex));
-            // printf("[%d:%d:%d] acquired\n", this->role, this->rank, tid);
-
             if (this->mode == 0)
             {
                 if (this->verbose)
@@ -353,10 +401,6 @@ class DDStore
                 printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
             // we assume the buffer is always big enough for stream get
             this->pulld(mqd, (char *)buffer, nbyte);
-
-            // printf("[%d:%d:%d] unlock\n", this->role, this->rank, tid);
-            // pthread_spin_unlock(&(this->spinlock));
-            // // pthread_mutex_unlock(&(this->mutex));
         }
         else
         {
@@ -430,6 +474,7 @@ class DDStore
     int rank;
     pthread_spinlock_t spinlock;
     pthread_mutex_t mutex;
+    int fd;
 
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;

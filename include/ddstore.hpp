@@ -23,13 +23,13 @@
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
 #define Q_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #define Q_ATTR_FLAGS 0
-#define Q_ATTR_MSG_SIZE 4096 // 8192
+#define Q_ATTR_MSG_SIZE 2048 // 8192
 #define Q_ATTR_MAX_MSG 10
 #define Q_ATTR_CURMSGS 0
 #define Q_CREATE_WAIT_US 1000000
 #define MSG_COUNT_DEFAULT 20
 #define MSG_PERIOD_US 1000
-#define NCH 2
+#define NCH 4
 
 struct Request
 {

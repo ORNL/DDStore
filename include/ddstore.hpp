@@ -385,19 +385,21 @@ class DDStore
         if (this->use_mq && (this->role == 1))
         {
             ich = this->channelmap[tid];
+            if (this->verbose)
+                printf("[%d:%d:%d] ich: %d\n", this->role, this->rank, tid, ich);
             mqd = queinfo.mqd[ich];
 
             if (this->mode == 0)
             {
                 if (this->verbose)
-                    printf("[%d:%d] push request: %ld %d\n", this->role, this->rank, id, ich);
+                    printf("[%d:%d:%d] push request: %ld %d\n", this->role, this->rank, tid, id, ich);
                 req.id = id;
                 req.ich = ich;
                 this->pushr(mqr, (char *)&req, sizeof(Request_t));
             }
 
             if (this->verbose)
-                printf("[%d:%d] pull data: %d bytes\n", this->role, this->rank, nbyte);
+                printf("[%d:%d:%d] pull data: %d bytes\n", this->role, this->rank, tid, nbyte);
             // we assume the buffer is always big enough for stream get
             this->pulld(mqd, (char *)buffer, nbyte);
         }
@@ -419,6 +421,8 @@ class DDStore
                 {
                     // stream mode
                     mqd = queinfo.mqd[stream_ichannel];
+                    if (this->verbose)
+                        printf("[%d:%d] stream: %ld %d\n", this->role, this->rank, id, stream_ichannel);
                 }
 
                 // reset based on the requested id

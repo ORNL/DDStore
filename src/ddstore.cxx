@@ -80,10 +80,33 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
     }
     this->verbose = verbose;
 
+    char *env_attr_msg_size = std::getenv("DDSTORE_ATTR_MSG_SIZE");
+    int attr_msg_size = 2048;
+    if (env_attr_msg_size != NULL)
+    {
+        attr_msg_size = atoi(env_attr_msg_size);
+    }
+    this->attr_msg_size = attr_msg_size;
+
+    char *env_attr_max_msg = std::getenv("DDSTORE_ATTR_MAX_MSG");
+    int attr_max_msg = 10;
+    if (env_attr_max_msg != NULL)
+    {
+        attr_max_msg = atoi(env_attr_max_msg);
+    }
+    this->attr_max_msg = attr_max_msg;
+
+    char *env_max_ndchannel = std::getenv("DDSTORE_MAX_NDCHANNEL");
+    int max_ndchannel = 4;
+    if (env_max_ndchannel != NULL)
+    {
+        max_ndchannel = atoi(env_max_ndchannel);
+    }
+    this->ndchannel = max_ndchannel;
+
+
     pthread_spin_init(&this->spinlock, 0);
     this->mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    this->ndchannel = NCH;
     this->imax = 0;
 
     if (this->use_mq && (this->role == 1))
@@ -211,7 +234,7 @@ void DDStore::queue_init(std::string name)
     //     if (lenlist[i] > mqd_msgsize)
     //         mqd_msgsize = lenlist[i];
     // mqd_msgsize *=  varinfo.itemsize * varinfo.disp;
-    mqd_msgsize = (long)Q_ATTR_MSG_SIZE;
+    mqd_msgsize = (long)this->attr_msg_size;
 
     for (int i = 0; i < this->ndchannel; i++) 
     {
@@ -225,7 +248,7 @@ void DDStore::queue_init(std::string name)
         // producer
         struct mq_attr q_attr = {
             .mq_flags = Q_ATTR_FLAGS,     /* Flags: 0 or O_NONBLOCK */
-            .mq_maxmsg = Q_ATTR_MAX_MSG,  /* Max. # of messages on queue */
+            .mq_maxmsg = this->attr_max_msg,  /* Max. # of messages on queue */
             .mq_msgsize = mqd_msgsize,    /* Max. message size (bytes) */
             .mq_curmsgs = Q_ATTR_CURMSGS, /* # of messages currently in queue */
         };
@@ -259,7 +282,7 @@ void DDStore::queue_init(std::string name)
         // consumer
         struct mq_attr q_attr = {
             .mq_flags = Q_ATTR_FLAGS,     /* Flags: 0 or O_NONBLOCK */
-            .mq_maxmsg = Q_ATTR_MAX_MSG,  /* Max. # of messages on queue */
+            .mq_maxmsg = this->attr_max_msg,  /* Max. # of messages on queue */
             .mq_msgsize = mqr_msgsize,    /* Max. message size (bytes) */
             .mq_curmsgs = Q_ATTR_CURMSGS, /* # of messages currently in queue */
         };
@@ -384,6 +407,21 @@ void DDStore::pushd(mqd_t mq, char *buffer, long size)
     // printf("mq_maxmsg %ld\n", attr.mq_maxmsg);
     // printf("mqd_msgsize %ld\n", attr.mq_msgsize);
     // printf("mq_curmsgs %ld\n", attr.mq_curmsgs);
+
+    /*
+    int count = 0;
+    while (attr.mq_curmsgs >= attr.mq_maxmsg)
+    {
+        usleep(MSG_PERIOD_US);
+        count++;
+        if (count > 10)
+        {
+            perror("pushd: queue is full. skip");
+            return;
+        }
+        mq_getattr(mq, &attr);
+    }
+    */
 
     int nchunk = size / attr.mq_msgsize;
     if (size > nchunk * attr.mq_msgsize)

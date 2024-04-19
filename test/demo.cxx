@@ -6,18 +6,20 @@
 
 int main(int argc, char *argv[])
 {
-    if (argc > 4)
+    if (argc > 5)
     {
         fprintf(stderr, "Usage: %s <nsample> <use_mq> <role>\n", argv[0]);
         fprintf(stderr, "  nsample: number of samples per process\n");
         fprintf(stderr, "  use_mq: 0 = false, 1 = true\n");
         fprintf(stderr, "  role: 0 = producer, 1 = consumer\n");
+        fprintf(stderr, "  mode: 0 = mq, 1 = stream, 2 = shmem\n");
         return EINVAL;
     }
 
     int N = 10;
     int use_mq = 0;
     int role = 0;
+    int mode = 0;
 
     if (argc > 1)
         N = atoi(argv[1]);
@@ -27,7 +29,11 @@ int main(int argc, char *argv[])
 
     if (argc > 3)
         role = atoi(argv[3]);
-    printf("nsample,use_mq,role: %d %d %d\n", N, use_mq, role);
+
+    if (argc > 4)
+        mode = atoi(argv[4]);
+        
+    printf("nsample,use_mq,role,mode: %d %d %d\n", N, use_mq, role, mode);
 
     MPI_Init(&argc, &argv);
 
@@ -52,7 +58,7 @@ int main(int argc, char *argv[])
         printf("[%d:%d] buffer[%d] = %g\n", role, rank, i, buffer[i]);
     }
 
-    DDStore dds(comm, use_mq, role);
+    DDStore dds(comm, use_mq, role, mode);
     dds.create<double>("var", buffer, 1, len, N);
 
     int ntotal = N * comm_size;

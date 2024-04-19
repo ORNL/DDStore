@@ -26,7 +26,20 @@ if __name__ == "__main__":
         "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
     )
     parser.add_argument("--mq", action="store_true", help="use mq")
-    parser.add_argument("--stream", action="store_true", help="use stream")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--default",
+        action="store_const",
+        help="use default",
+        dest="mode",
+        const="default",
+    )
+    group.add_argument(
+        "--stream", action="store_const", help="use stream", dest="mode", const="stream"
+    )
+    group.add_argument(
+        "--shmem", action="store_const", help="use shmem", dest="mode", const="shmem"
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
         "--producer",
@@ -42,7 +55,7 @@ if __name__ == "__main__":
         dest="role",
         const="consumer",
     )
-    parser.set_defaults(role="producer")
+    parser.set_defaults(role="producer", mode="default")
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
@@ -54,8 +67,10 @@ if __name__ == "__main__":
     nbatch = args.nbatch
     use_mq = 1 if args.mq else 0
     role = 1 if args.role == "consumer" else 0
-    mode = 1 if args.stream else 0
+    mode = 1 if args.mode == "stream" else 0
+    mode = 2 if args.mode == "shmem" else mode
 
+    print("use_mq=", use_mq, "role=", role, "mode=", mode)
     ddstore = dds.PyDDStore(comm, use_mq=use_mq, role=role, mode=mode)
 
     shape = (num, dim)

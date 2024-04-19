@@ -13,10 +13,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/syscall.h>
-#include <unistd.h>
 
 #include <fcntl.h>
 #include <errno.h>
+
+#include <sys/mman.h>
+#include <semaphore.h>
 
 #define Q_NAME "/ddstore"
 #define Q_OFLAGS_CONSUMER (O_RDONLY)
@@ -30,6 +32,8 @@
 #define MSG_COUNT_DEFAULT 20
 #define MSG_PERIOD_US 1000
 #define NCH 4
+#define SHM_QUEUE_CAPACITY 4
+#define SHM_QUEUE_BUFFERSIZE 16384
 
 struct Request
 {
@@ -57,6 +61,16 @@ struct VarInfo
 };
 typedef struct VarInfo VarInfo_t;
 
+struct SharedQueue
+{
+    int head;
+    int tail;
+    int capacity;
+    int buffersize;
+    void* buffer[SHM_QUEUE_CAPACITY]; // Flexible array member
+};
+typedef struct SharedQueue SharedQueue_t;
+
 struct QueInfo
 {
     mqd_t mqd[64]; // data mq
@@ -65,10 +79,43 @@ struct QueInfo
     std::string mqr_name;
     long mqd_msgsize;
     long mqr_msgsize;
+
+    SharedQueue* shqueue[64];
+    int shm_fd[64];
+    size_t shm_len[64];
+    sem_t *mutex[64];
+    sem_t *items[64];
+    sem_t *spaces[64];
 };
 typedef struct QueInfo QueInfo_t;
 
 int sortedsearch(std::vector<int> &vec, long unsigned int idx);
+
+static void enqueue(SharedQueue *queue, void *buffer, int len, sem_t *mutex, sem_t *items, sem_t *spaces) 
+{
+    sem_wait(spaces); // Wait for space to become available (blocks if the queue is full)
+    sem_wait(mutex); // Enter critical section
+
+    memcpy(queue->buffer[queue->tail], buffer, len);
+    queue->tail = (queue->tail + 1) % queue->capacity;
+
+    sem_post(mutex); // Leave critical section
+    sem_post(items); // Signal that an item has been added
+}
+
+static void dequeue(SharedQueue *queue, void *buffer, int len, sem_t *mutex, sem_t *items, sem_t *spaces)
+{
+    int value;
+
+    sem_wait(items); // Wait for an item to become available
+    sem_wait(mutex); // Enter critical section
+
+    memcpy(buffer, queue->buffer[queue->head], len);
+    queue->head = (queue->head + 1) % queue->capacity;
+
+    sem_post(mutex); // Leave critical section
+    sem_post(spaces); // Signal that a space has been freed up
+}
 
 class DDStore
 {
@@ -81,7 +128,7 @@ class DDStore
 
     int use_mq;
     int role;    // 0: producer, 1: consumer
-    int mode;    // 0: mq, 1: stream mq
+    int mode;    // 0: mq, 1: stream mq, 2: shmem
     int verbose; // 0: non verbose, 1: verbose
     int ndchannel; // number of data channels
 
@@ -299,6 +346,11 @@ class DDStore
         Request_t req;
         int ich;
 
+        SharedQueue* shqueue;
+        sem_t *mutex;
+        sem_t *items;
+        sem_t *spaces;
+
         // pid_t pid = getpid();
         pid_t tid = syscall(SYS_gettid);
         // pthread_t tid2 = pthread_self();
@@ -389,7 +441,12 @@ class DDStore
                 printf("[%d:%d:%d] ich: %d\n", this->role, this->rank, tid, ich);
             mqd = queinfo.mqd[ich];
 
-            if (this->mode == 0)
+            shqueue = queinfo.shqueue[ich];
+            mutex = queinfo.mutex[ich];
+            items = queinfo.items[ich];
+            spaces = queinfo.spaces[ich];
+
+            if ((this->mode == 0) || (this->mode == 2))
             {
                 if (this->verbose)
                     printf("[%d:%d:%d] push request: %ld %d\n", this->role, this->rank, tid, id, ich);
@@ -400,20 +457,34 @@ class DDStore
 
             if (this->verbose)
                 printf("[%d:%d:%d] pull data: %d bytes\n", this->role, this->rank, tid, nbyte);
+
             // we assume the buffer is always big enough for stream get
-            this->pulld(mqd, (char *)buffer, nbyte);
+            if (this->mode < 2)
+            {
+                this->pulld(mqd, (char *)buffer, nbyte);
+            }
+            else
+            {
+                this->pulld(shqueue, (char *)buffer, nbyte, mutex, items, spaces);
+            }
         }
         else
         {
             if (this->use_mq && (this->role == 0))
             {
-                if (this->mode == 0)
+                if ((this->mode == 0) || (this->mode == 2))
                 {
                     // get id from mqr
                     this->pullr(mqr, (char *)&req, sizeof(Request_t));
                     id = req.id;
                     ich = req.ich;
                     mqd = queinfo.mqd[ich];
+
+                    shqueue = queinfo.shqueue[ich];
+                    mutex = queinfo.mutex[ich];
+                    items = queinfo.items[ich];
+                    spaces = queinfo.spaces[ich];
+                    
                     if (this->verbose)
                         printf("[%d:%d] pull request: %ld %d\n", this->role, this->rank, id, ich);
                 }
@@ -462,7 +533,16 @@ class DDStore
             {
                 if (this->verbose)
                     printf("[%d:%d] push data: %ld\n", this->role, this->rank, id);
-                this->pushd(mqd, (char *)buffer, nbyte);
+                
+                if (this->mode < 2)
+                {
+                    this->pushd(mqd, (char *)buffer, nbyte);
+                }
+                else
+                {
+                    this->pushd(shqueue, (char *)buffer, nbyte, mutex, items, spaces);
+                }
+
                 // std::free((void *)buffer);
                 MPI_Free_mem((void *)buffer);
             }
@@ -476,7 +556,13 @@ class DDStore
     int comm_size;
     int rank;
     pthread_spinlock_t spinlock;
-    pthread_mutex_t mutex;
+
+    // int shm_fd;
+    // size_t shm_len;
+    // SharedQueue *queue;
+    // sem_t *mutex;
+    // sem_t *items;
+    // sem_t *spaces;
 
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;
@@ -488,4 +574,6 @@ class DDStore
     void pullr(mqd_t mq, char *buffer, long size);
     void pushd(mqd_t mq, char *buffer, long size);
     void pulld(mqd_t mq, char *buffer, long size);
+    void pushd(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces);
+    void pulld(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces);
 };

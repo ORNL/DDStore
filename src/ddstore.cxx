@@ -13,6 +13,25 @@
 #define LOG BOOST_LOG_TRIVIAL(debug)
 #endif
 
+#define CHECK_FD(msg, x) \
+if (x == -1) \
+{ \
+    perror(msg); \
+    exit(EXIT_FAILURE); \
+}
+
+#define CHECK_MAP(msg, x) \
+if (ptr == MAP_FAILED) { \
+    perror(msg); \
+    exit(EXIT_FAILURE); \
+}
+
+#define CHECK_SEM(msg, x) \
+if (ptr == SEM_FAILED) { \
+    perror(msg); \
+    exit(EXIT_FAILURE); \
+}
+
 int sortedsearch(std::vector<int> &vec, long unsigned int idx)
 {
     int rtn = 0;
@@ -81,7 +100,6 @@ DDStore::DDStore(MPI_Comm comm, int use_mq, int role, int mode)
     this->verbose = verbose;
 
     pthread_spin_init(&this->spinlock, 0);
-    this->mutex = PTHREAD_MUTEX_INITIALIZER;
 
     this->ndchannel = NCH;
     this->imax = 0;
@@ -136,6 +154,39 @@ DDStore::~DDStore()
                     perror("mqr: mq_unlink");
                 }
             }
+
+            // // FIXME: got segfault with python
+            // for (int i = 0; i < this->ndchannel; i++)
+            // {
+            //     int shm_fd = x.second.shm_fd[i];
+            //     SharedQueue* shqueue = x.second.shqueue[i];
+            //     size_t shm_len = x.second.shm_len[i];
+            //     sem_t *mutex = x.second.mutex[i];
+            //     sem_t *items = x.second.items[i];
+            //     sem_t *spaces = x.second.spaces[i];
+
+            //     munmap(shqueue, shm_len);
+            //     close(shm_fd);
+            //     sem_close(mutex);
+            //     sem_close(items);
+            //     sem_close(spaces);
+
+            //     if (this->role == 1)
+            //     {
+            //         char shname[128];
+            //         snprintf(shname, 128, "/%s-shmem-%d-%d", Q_NAME, this->rank, i);
+            //         shm_unlink(shname);
+
+            //         snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
+            //         sem_unlink(shname);
+
+            //         snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
+            //         sem_unlink(shname);
+
+            //         snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
+            //         sem_unlink(shname);
+            //     }
+            // }
         }
     }
     this->free();
@@ -198,12 +249,16 @@ void DDStore::free()
 // role: producer (0) or consumer (1)
 void DDStore::queue_init(std::string name)
 {
+    QueInfo_t queinfo;
+
     mqd_t mqd[64];
     mqd_t mqr;
     char *mqd_name_list[64]; // MAX=64
     char mqr_name[128];
     long mqd_msgsize = 0;
     long mqr_msgsize = sizeof(Request_t);
+    
+    char shname[128];
 
     // VarInfo_t &varinfo = this->varlist[name];
     // std::vector<int> &lenlist = varinfo.lenlist;
@@ -222,6 +277,51 @@ void DDStore::queue_init(std::string name)
 
     if (this->role == 0) // producer
     {
+        for (int i = 0; i < this->ndchannel; i++)
+        {
+            snprintf(shname, 128, "/%s-shmem-%d-%d", Q_NAME, this->rank, i);
+            int shm_fd = shm_open(shname, O_CREAT | O_RDWR, 0666);
+            CHECK_FD("shm_open", shm_fd)
+
+            size_t shm_len = sizeof(SharedQueue) + SHM_QUEUE_BUFFERSIZE * SHM_QUEUE_CAPACITY;
+            ftruncate(shm_fd, shm_len);
+            void *ptr = mmap(NULL, shm_len, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            CHECK_MAP("mmap", ptr)
+
+            SharedQueue *shqueue = (SharedQueue *) ptr;
+
+            // Initialize queue
+            shqueue->head = 0;
+            shqueue->tail = 0;
+            shqueue->capacity = SHM_QUEUE_CAPACITY;
+            shqueue->buffersize = SHM_QUEUE_BUFFERSIZE;
+            for (int i = 0; i < SHM_QUEUE_CAPACITY; i++)
+            {
+                shqueue->buffer[i] = ptr + sizeof(SharedQueue) + i * SHM_QUEUE_BUFFERSIZE;
+            }
+
+            // Semaphore initialization
+            snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
+            sem_t *mutex = sem_open(shname, O_CREAT | O_EXCL, 0666, 1);
+            CHECK_SEM("mutex", mutex)
+
+            snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
+            sem_t *items = sem_open(shname, O_CREAT | O_EXCL, 0666, 0);
+            CHECK_SEM("items", items)
+
+            snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
+            sem_t *spaces = sem_open(shname, O_CREAT | O_EXCL, 0666, SHM_QUEUE_CAPACITY);
+            CHECK_SEM("spaces", spaces)
+
+            printf("#A: %d %p %p %p\n", i, mutex, items, spaces);
+            queinfo.shqueue[i] = shqueue;
+            queinfo.shm_len[i] = shm_len;
+            queinfo.shm_fd[i] = shm_fd;
+            queinfo.mutex[i] = mutex;
+            queinfo.items[i] = items;
+            queinfo.spaces[i] = spaces;
+        }
+        
         // producer
         struct mq_attr q_attr = {
             .mq_flags = Q_ATTR_FLAGS,     /* Flags: 0 or O_NONBLOCK */
@@ -287,10 +387,41 @@ void DDStore::queue_init(std::string name)
                 return;
             }
         }
+
+        for (int i = 0; i < this->ndchannel; i++)
+        {
+            snprintf(shname, 128, "/%s-shmem-%d-%d", Q_NAME, this->rank, i);
+            int shm_fd = shm_open(shname, O_RDWR, 0666);
+            CHECK_FD("shm_open", shm_fd)
+
+            size_t shm_len = sizeof(SharedQueue) + SHM_QUEUE_BUFFERSIZE * SHM_QUEUE_CAPACITY;
+            void *ptr = mmap(NULL, shm_len, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            CHECK_MAP("mmap", ptr)
+
+            SharedQueue *shqueue = (SharedQueue *) ptr;
+
+            // Semaphore initialization
+            snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
+            sem_t *mutex = sem_open(shname, 0);
+            CHECK_SEM("mutex", mutex)
+
+            snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
+            sem_t *items = sem_open(shname, 0);
+            CHECK_SEM("items", items)
+
+            snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
+            sem_t *spaces = sem_open(shname, 0);
+            CHECK_SEM("spaces", spaces)
+
+            queinfo.shqueue[i] = shqueue;
+            queinfo.shm_fd[i] = shm_fd;
+            queinfo.mutex[i] = mutex;
+            queinfo.items[i] = items;
+            queinfo.spaces[i] = spaces;
+        }  
     }
 
-    QueInfo_t queinfo;
-    for (int i = 0; i < this->ndchannel; i++) \
+    for (int i = 0; i < this->ndchannel; i++)
     {
         queinfo.mqd[i] = mqd[i];
         queinfo.mqd_name[i] = std::string(mqd_name_list[i]);
@@ -452,4 +583,14 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
         if (this->verbose)
             printf("[%d:%d] pulld: recv data (%d), i,total: %d %d\n", this->role, this->rank, rc, i, nbytes);
     }
+}
+
+void DDStore::pushd(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces)
+{
+    enqueue(queue, buffer, size, mutex, items, spaces);
+}
+
+void DDStore::pulld(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces)
+{
+    dequeue(queue, buffer, size, mutex, items, spaces);
 }

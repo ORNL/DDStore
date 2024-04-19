@@ -25,8 +25,6 @@
 #define Q_OFLAGS_PRODUCER (O_CREAT | O_WRONLY)
 #define Q_MODE (S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
 #define Q_ATTR_FLAGS 0
-#define Q_ATTR_MSG_SIZE 2048 // 8192
-#define Q_ATTR_MAX_MSG 10
 #define Q_ATTR_CURMSGS 0
 #define Q_CREATE_WAIT_US 1000000
 #define MSG_COUNT_DEFAULT 20
@@ -131,6 +129,8 @@ class DDStore
     int mode;    // 0: mq, 1: stream mq, 2: shmem
     int verbose; // 0: non verbose, 1: verbose
     int ndchannel; // number of data channels
+    long attr_msg_size;
+    long attr_max_msg;
 
     void query(std::string name, VarInfo_t &varinfo);
     void epoch_begin();
@@ -396,7 +396,7 @@ class DDStore
 
                 // insert
                 this->channelmap.insert(std::pair<pid_t, int>(tid, this->imax));
-                printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
+                // printf("[%d:%d:%d] insert channelmap: %d\n", this->role, this->rank, tid, this->imax);
                 this->imax = this->imax + 1;
 
                 // Now the file is locked, we can write to it

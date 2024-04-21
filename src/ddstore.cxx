@@ -186,15 +186,15 @@ DDStore::~DDStore()
             //     int shm_fd = x.second.shm_fd[i];
             //     SharedQueue* shqueue = x.second.shqueue[i];
             //     size_t shm_len = x.second.shm_len[i];
-            //     sem_t *mutex = x.second.mutex[i];
-            //     sem_t *items = x.second.items[i];
-            //     sem_t *spaces = x.second.spaces[i];
+            //     sem_t *sem_mutex = x.second.sem_mutex[i];
+            //     sem_t *sem_readable = x.second.sem_readable[i];
+            //     sem_t *sem_writable = x.second.sem_writable[i];
 
             //     munmap(shqueue, shm_len);
             //     close(shm_fd);
-            //     sem_close(mutex);
-            //     sem_close(items);
-            //     sem_close(spaces);
+            //     sem_close(sem_mutex);
+            //     sem_close(sem_readable);
+            //     sem_close(sem_writable);
 
             //     if (this->role == 1)
             //     {
@@ -202,13 +202,13 @@ DDStore::~DDStore()
             //         snprintf(shname, 128, "/%s-shmem-%d-%d", Q_NAME, this->rank, i);
             //         shm_unlink(shname);
 
-            //         snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
+            //         snprintf(shname, 128, "/%s-sem_mutex-%d-%d", Q_NAME, this->rank, i);
             //         sem_unlink(shname);
 
-            //         snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
+            //         snprintf(shname, 128, "/%s-sem_readable-%d-%d", Q_NAME, this->rank, i);
             //         sem_unlink(shname);
 
-            //         snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
+            //         snprintf(shname, 128, "/%s-sem_writable-%d-%d", Q_NAME, this->rank, i);
             //         sem_unlink(shname);
             //     }
             // }
@@ -308,7 +308,7 @@ void DDStore::queue_init(std::string name)
             int shm_fd = shm_open(shname, O_CREAT | O_RDWR, 0666);
             CHECK_FD("shm_open", shm_fd)
 
-            size_t shm_len = sizeof(SharedQueue) + SHM_QUEUE_BUFFERSIZE * SHM_QUEUE_CAPACITY;
+            size_t shm_len = sizeof(SharedQueue);
             ftruncate(shm_fd, shm_len);
             void *ptr = mmap(NULL, shm_len, PROT_WRITE, MAP_SHARED, shm_fd, 0);
             CHECK_MAP("mmap", ptr)
@@ -320,31 +320,26 @@ void DDStore::queue_init(std::string name)
             shqueue->tail = 0;
             shqueue->capacity = SHM_QUEUE_CAPACITY;
             shqueue->buffersize = SHM_QUEUE_BUFFERSIZE;
-            for (int i = 0; i < SHM_QUEUE_CAPACITY; i++)
-            {
-                shqueue->buffer[i] = ptr + sizeof(SharedQueue) + i * SHM_QUEUE_BUFFERSIZE;
-            }
 
             // Semaphore initialization
-            snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
-            sem_t *mutex = sem_open(shname, O_CREAT | O_EXCL, 0666, 1);
-            CHECK_SEM("mutex", mutex)
+            snprintf(shname, 128, "/%s-sem_mutex-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_mutex = sem_open(shname, O_CREAT | O_EXCL, 0666, 1);
+            CHECK_SEM("sem_mutex", sem_mutex)
 
-            snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
-            sem_t *items = sem_open(shname, O_CREAT | O_EXCL, 0666, 0);
-            CHECK_SEM("items", items)
+            snprintf(shname, 128, "/%s-sem_readable-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_readable = sem_open(shname, O_CREAT | O_EXCL, 0666, 0);
+            CHECK_SEM("sem_readable", sem_readable)
 
-            snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
-            sem_t *spaces = sem_open(shname, O_CREAT | O_EXCL, 0666, SHM_QUEUE_CAPACITY);
-            CHECK_SEM("spaces", spaces)
+            snprintf(shname, 128, "/%s-sem_writable-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_writable = sem_open(shname, O_CREAT | O_EXCL, 0666, SHM_QUEUE_CAPACITY);
+            CHECK_SEM("sem_writable", sem_writable)
 
-            printf("#A: %d %p %p %p\n", i, mutex, items, spaces);
             queinfo.shqueue[i] = shqueue;
             queinfo.shm_len[i] = shm_len;
             queinfo.shm_fd[i] = shm_fd;
-            queinfo.mutex[i] = mutex;
-            queinfo.items[i] = items;
-            queinfo.spaces[i] = spaces;
+            queinfo.sem_mutex[i] = sem_mutex;
+            queinfo.sem_readable[i] = sem_readable;
+            queinfo.sem_writable[i] = sem_writable;
         }
         
         // producer
@@ -419,30 +414,31 @@ void DDStore::queue_init(std::string name)
             int shm_fd = shm_open(shname, O_RDWR, 0666);
             CHECK_FD("shm_open", shm_fd)
 
-            size_t shm_len = sizeof(SharedQueue) + SHM_QUEUE_BUFFERSIZE * SHM_QUEUE_CAPACITY;
+            size_t shm_len = sizeof(SharedQueue);
             void *ptr = mmap(NULL, shm_len, PROT_WRITE, MAP_SHARED, shm_fd, 0);
             CHECK_MAP("mmap", ptr)
 
             SharedQueue *shqueue = (SharedQueue *) ptr;
 
             // Semaphore initialization
-            snprintf(shname, 128, "/%s-mutex-%d-%d", Q_NAME, this->rank, i);
-            sem_t *mutex = sem_open(shname, 0);
-            CHECK_SEM("mutex", mutex)
+            snprintf(shname, 128, "/%s-sem_mutex-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_mutex = sem_open(shname, 0);
+            CHECK_SEM("sem_mutex", sem_mutex)
 
-            snprintf(shname, 128, "/%s-items-%d-%d", Q_NAME, this->rank, i);
-            sem_t *items = sem_open(shname, 0);
-            CHECK_SEM("items", items)
+            snprintf(shname, 128, "/%s-sem_readable-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_readable = sem_open(shname, 0);
+            CHECK_SEM("sem_readable", sem_readable)
 
-            snprintf(shname, 128, "/%s-spaces-%d-%d", Q_NAME, this->rank, i);
-            sem_t *spaces = sem_open(shname, 0);
-            CHECK_SEM("spaces", spaces)
+            snprintf(shname, 128, "/%s-sem_writable-%d-%d", Q_NAME, this->rank, i);
+            sem_t *sem_writable = sem_open(shname, 0);
+            CHECK_SEM("sem_writable", sem_writable)
 
             queinfo.shqueue[i] = shqueue;
             queinfo.shm_fd[i] = shm_fd;
-            queinfo.mutex[i] = mutex;
-            queinfo.items[i] = items;
-            queinfo.spaces[i] = spaces;
+            queinfo.shm_len[i] = shm_len;
+            queinfo.sem_mutex[i] = sem_mutex;
+            queinfo.sem_readable[i] = sem_readable;
+            queinfo.sem_writable[i] = sem_writable;
         }  
     }
 
@@ -625,12 +621,12 @@ void DDStore::pulld(mqd_t mq, char *buffer, long size)
     }
 }
 
-void DDStore::pushd(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces)
+void DDStore::pushd(SharedQueue *queue, char *buffer, long size, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable)
 {
-    enqueue(queue, buffer, size, mutex, items, spaces);
+    enqueue(queue, buffer, size, sem_mutex, sem_readable, sem_writable);
 }
 
-void DDStore::pulld(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces)
+void DDStore::pulld(SharedQueue *queue, char *buffer, long size, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable)
 {
-    dequeue(queue, buffer, size, mutex, items, spaces);
+    dequeue(queue, buffer, size, sem_mutex, sem_readable, sem_writable);
 }

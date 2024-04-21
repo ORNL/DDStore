@@ -65,7 +65,7 @@ struct SharedQueue
     int tail;
     int capacity;
     int buffersize;
-    void* buffer[SHM_QUEUE_CAPACITY]; // Flexible array member
+    char* buffer[SHM_QUEUE_CAPACITY*SHM_QUEUE_BUFFERSIZE];
 };
 typedef struct SharedQueue SharedQueue_t;
 
@@ -81,38 +81,39 @@ struct QueInfo
     SharedQueue* shqueue[64];
     int shm_fd[64];
     size_t shm_len[64];
-    sem_t *mutex[64];
-    sem_t *items[64];
-    sem_t *spaces[64];
+    sem_t *sem_mutex[64];
+    sem_t *sem_readable[64];
+    sem_t *sem_writable[64];
 };
 typedef struct QueInfo QueInfo_t;
 
 int sortedsearch(std::vector<int> &vec, long unsigned int idx);
 
-static void enqueue(SharedQueue *queue, void *buffer, int len, sem_t *mutex, sem_t *items, sem_t *spaces) 
+static void enqueue(SharedQueue *queue, void *buffer, int len, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable)
 {
-    sem_wait(spaces); // Wait for space to become available (blocks if the queue is full)
-    sem_wait(mutex); // Enter critical section
+    sem_wait(sem_writable); // Wait for space to become available (blocks if the queue is full)
+    sem_wait(sem_mutex); // Enter critical section
 
-    memcpy(queue->buffer[queue->tail], buffer, len);
+    // FIXME: warning of using pointer of type 'void *' in arithmetic
+    void *ptr = (void*) queue->buffer + queue->tail * queue->buffersize;
+    memcpy(ptr, buffer, len);
     queue->tail = (queue->tail + 1) % queue->capacity;
 
-    sem_post(mutex); // Leave critical section
-    sem_post(items); // Signal that an item has been added
+    sem_post(sem_mutex); // Leave critical section
+    sem_post(sem_readable); // Signal that an item has been added
 }
 
-static void dequeue(SharedQueue *queue, void *buffer, int len, sem_t *mutex, sem_t *items, sem_t *spaces)
+static void dequeue(SharedQueue *queue, void *buffer, int len, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable)
 {
-    int value;
+    sem_wait(sem_readable); // Wait for an item to become available
+    sem_wait(sem_mutex); // Enter critical section
 
-    sem_wait(items); // Wait for an item to become available
-    sem_wait(mutex); // Enter critical section
-
-    memcpy(buffer, queue->buffer[queue->head], len);
+    void *ptr = (void*) queue->buffer + queue->head * queue->buffersize;
+    memcpy(buffer, ptr, len);
     queue->head = (queue->head + 1) % queue->capacity;
 
-    sem_post(mutex); // Leave critical section
-    sem_post(spaces); // Signal that a space has been freed up
+    sem_post(sem_mutex); // Leave critical section
+    sem_post(sem_writable); // Signal that a space has been freed up
 }
 
 class DDStore
@@ -347,9 +348,9 @@ class DDStore
         int ich;
 
         SharedQueue* shqueue;
-        sem_t *mutex;
-        sem_t *items;
-        sem_t *spaces;
+        sem_t *sem_mutex;
+        sem_t *sem_readable;
+        sem_t *sem_writable;
 
         // pid_t pid = getpid();
         pid_t tid = syscall(SYS_gettid);
@@ -442,9 +443,9 @@ class DDStore
             mqd = queinfo.mqd[ich];
 
             shqueue = queinfo.shqueue[ich];
-            mutex = queinfo.mutex[ich];
-            items = queinfo.items[ich];
-            spaces = queinfo.spaces[ich];
+            sem_mutex = queinfo.sem_mutex[ich];
+            sem_readable = queinfo.sem_readable[ich];
+            sem_writable = queinfo.sem_writable[ich];
 
             if ((this->mode == 0) || (this->mode == 2))
             {
@@ -465,7 +466,7 @@ class DDStore
             }
             else
             {
-                this->pulld(shqueue, (char *)buffer, nbyte, mutex, items, spaces);
+                this->pulld(shqueue, (char *)buffer, nbyte, sem_mutex, sem_readable, sem_writable);
             }
         }
         else
@@ -481,10 +482,10 @@ class DDStore
                     mqd = queinfo.mqd[ich];
 
                     shqueue = queinfo.shqueue[ich];
-                    mutex = queinfo.mutex[ich];
-                    items = queinfo.items[ich];
-                    spaces = queinfo.spaces[ich];
-                    
+                    sem_mutex = queinfo.sem_mutex[ich];
+                    sem_readable = queinfo.sem_readable[ich];
+                    sem_writable = queinfo.sem_writable[ich];
+
                     if (this->verbose)
                         printf("[%d:%d] pull request: %ld %d\n", this->role, this->rank, id, ich);
                 }
@@ -540,7 +541,7 @@ class DDStore
                 }
                 else
                 {
-                    this->pushd(shqueue, (char *)buffer, nbyte, mutex, items, spaces);
+                    this->pushd(shqueue, (char *)buffer, nbyte, sem_mutex, sem_readable, sem_writable);
                 }
 
                 // std::free((void *)buffer);
@@ -557,13 +558,6 @@ class DDStore
     int rank;
     pthread_spinlock_t spinlock;
 
-    // int shm_fd;
-    // size_t shm_len;
-    // SharedQueue *queue;
-    // sem_t *mutex;
-    // sem_t *items;
-    // sem_t *spaces;
-
     std::map<std::string, VarInfo_t> varlist;
     std::map<std::string, QueInfo_t> qlist;
     std::map<pid_t, int> channelmap;
@@ -574,6 +568,6 @@ class DDStore
     void pullr(mqd_t mq, char *buffer, long size);
     void pushd(mqd_t mq, char *buffer, long size);
     void pulld(mqd_t mq, char *buffer, long size);
-    void pushd(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces);
-    void pulld(SharedQueue *queue, char *buffer, long size, sem_t *mutex, sem_t *items, sem_t *spaces);
+    void pushd(SharedQueue *queue, char *buffer, long size, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable);
+    void pulld(SharedQueue *queue, char *buffer, long size, sem_t *sem_mutex, sem_t *sem_readable, sem_t *sem_writable);
 };

@@ -33,7 +33,7 @@ int main(int argc, char *argv[])
     if (argc > 4)
         mode = atoi(argv[4]);
         
-    printf("nsample,use_mq,role,mode: %d %d %d\n", N, use_mq, role, mode);
+    printf("nsample,use_mq,role,mode: %d %d %d %d\n", N, use_mq, role, mode);
 
     MPI_Init(&argc, &argv);
 

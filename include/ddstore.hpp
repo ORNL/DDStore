@@ -30,7 +30,7 @@
 #define MSG_COUNT_DEFAULT 20
 #define MSG_PERIOD_US 1000
 #define NCH 4
-#define SHM_QUEUE_CAPACITY 4
+#define SHM_QUEUE_CAPACITY 256
 #define SHM_QUEUE_BUFFERSIZE 16384
 
 struct Request

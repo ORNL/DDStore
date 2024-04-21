@@ -107,7 +107,7 @@ cdef class PyDDStore:
             for i in range(len(input)):
                 t0 = time.time()
                 pickle.dump(input[i], buffer)
-                print("pickle:", time.time() - t0)
+                #print("pickle:", time.time() - t0)
                 lenlist.append(buffer.getbuffer().nbytes - prev)
                 prev = buffer.getbuffer().nbytes
             lenarr = array.array('i', lenlist)
@@ -161,7 +161,7 @@ cdef class PyDDStore:
             if decoder is not None:
                 t0 = time.time()
                 rtn = decoder(rtn)
-                print("decode:", time.time()-t0)
+                #print("decode:", time.time() - t0)
         else:
             rtn = self.c_ddstore.get(s2b(name), id, <char *> NULL, 0, stream_ichannel)
         return rtn

@@ -166,20 +166,21 @@ cdef class PyDDStore:
             rtn = self.c_ddstore.get(s2b(name), id, <char *> NULL, 0, stream_ichannel)
         return rtn
 
-    def get_ndarray(self, str name, np.ndarray arr, long id):
+    def get_ndarray(self, str name, np.ndarray arr, long id, stream_ichannel=0):
         assert arr.flags.c_contiguous
-        cdef long count = arr.shape[0]
-        assert arr.shape[0] >= count
         if arr.dtype == np.int32:
-            self.c_ddstore.get(s2b(name), id, <int *> arr.data, arr.size)
+            self.c_ddstore.get(s2b(name), id, <int *> arr.data, arr.size, stream_ichannel)
         elif arr.dtype == np.int64:
-            self.c_ddstore.get(s2b(name), id, <long *> arr.data, arr.size)
+            self.c_ddstore.get(s2b(name), id, <long *> arr.data, arr.size, stream_ichannel)
         elif arr.dtype == np.float32:
-            self.c_ddstore.get(s2b(name), id, <float *> arr.data, arr.size)
+            self.c_ddstore.get(s2b(name), id, <float *> arr.data, arr.size, stream_ichannel)
         elif arr.dtype == np.float64:
-            self.c_ddstore.get(s2b(name), id, <double *> arr.data, arr.size)
+            self.c_ddstore.get(s2b(name), id, <double *> arr.data, arr.size, stream_ichannel)
         elif arr.dtype == np.dtype('S1'):
-            self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size)
+            self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.size, stream_ichannel)
+        elif arr.dtype.names is not None:
+            ## structured arrays
+            self.c_ddstore.get(s2b(name), id, <char *> arr.data, arr.itemsize, stream_ichannel)
         else:
             raise NotImplementedError
     

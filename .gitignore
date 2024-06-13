@@ -1,0 +1,6 @@
+# Cython build output
+build/
+src/pyddstore.cpp
+# built module
+PyDDStore.egg-info/
+pyddstore.cpython-*.so

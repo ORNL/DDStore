@@ -2,14 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#ifdef USE_BOOST
-#include <boost/format.hpp>
-#include <boost/log/trivial.hpp>
-#include <boost/log/utility/setup.hpp>
-
-#define LOG BOOST_LOG_TRIVIAL(debug)
-#endif
-
 int sortedsearch(std::vector<long> &vec, long num)
 {
     int rtn = 0;
@@ -24,24 +16,11 @@ int sortedsearch(std::vector<long> &vec, long num)
     return rtn;
 }
 
-void init_log(int rank)
-{
-#ifdef USE_BOOST
-    std::string fmt = boost::str(boost::format("%d: %%Message%%") % rank);
-
-    // Output message to console
-    boost::log::add_console_log(std::cout, boost::log::keywords::format = fmt, boost::log::keywords::auto_flush = true);
-
-    boost::log::add_common_attributes();
-#endif
-}
-
 DDStore::DDStore()
 {
     this->comm = MPI_COMM_SELF;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
-    init_log(this->rank);
 }
 
 DDStore::DDStore(MPI_Comm comm)
@@ -49,7 +28,6 @@ DDStore::DDStore(MPI_Comm comm)
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
-    init_log(this->rank);
 }
 
 DDStore::~DDStore()

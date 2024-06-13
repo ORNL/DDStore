@@ -12,7 +12,7 @@ inc_path = np.get_include()
 
 extending = Extension("pyddstore",
                       sources=["src/pyddstore.pyx", "src/ddstore.cxx"],
-                      include_dirs=[np.get_include(), "include", "/Users/jyc/sw/boost/1.80.0/include"],
+                      include_dirs=[np.get_include(), "include"],
                       extra_compile_args=["-std=c++11"],
                       define_macros=defs,
                       library_dirs=[],

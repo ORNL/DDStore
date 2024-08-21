@@ -4,7 +4,6 @@ from os.path import dirname, join, abspath
 
 import numpy as np
 from Cython.Build import cythonize
-from numpy.distutils.misc_util import get_info
 from setuptools.extension import Extension
 
 defs = [('NPY_NO_DEPRECATED_API', 0)]

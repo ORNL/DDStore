@@ -34,13 +34,13 @@ class DDStore
 
     template <typename T> void add(std::string name, T *buffer, long nrows, int disp)
     {
-        void *base;
-        int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
-        if (err)
-        {
-            exit(1);
-        }
-        memcpy(base, buffer, nrows * disp * sizeof(T));
+        void *base = buffer;
+        // int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
+        // if (err)
+        // {
+        //     exit(1);
+        // }
+        // memcpy(base, buffer, nrows * disp * sizeof(T));
 
         MPI_Win win;
         MPI_Win_create(base,                             /* pre-allocated buffer */

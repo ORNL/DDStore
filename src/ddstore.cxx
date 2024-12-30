@@ -16,15 +16,23 @@ int sortedsearch(std::vector<long> &vec, long num)
     return rtn;
 }
 
-DDStore::DDStore()
+DDStore::DDStore() : method(0)
 {
     this->comm = MPI_COMM_SELF;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
 }
 
-DDStore::DDStore(MPI_Comm comm)
+DDStore::DDStore(MPI_Comm comm) : method(0)
 {
+    this->comm = comm;
+    MPI_Comm_size(this->comm, &this->comm_size);
+    MPI_Comm_rank(this->comm, &this->rank);
+}
+
+DDStore::DDStore(int method, MPI_Comm comm)
+{
+    this->method = method;
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);

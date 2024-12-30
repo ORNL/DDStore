@@ -1,20 +1,24 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.12.0)
+
 project(DDStore)
-set (CMAKE_CXX_STANDARD 11)
+# set (CMAKE_CXX_STANDARD 11)
 
 find_package(MPI REQUIRED)
-set(Boost_USE_STATIC_LIBS OFF)
-set(Boost_USE_MULTITHREADED OFF)
-set(Boost_USE_STATIC_RUNTIME OFF)
-find_package(Boost COMPONENTS log log_setup)
-message(STATUS "Boost_INCLUDE_DIRS: " "${Boost_INCLUDE_DIRS}")
-message(STATUS "Boost_LIBRARIES: " "${Boost_LIBRARIES}")
-include_directories(${Boost_INCLUDE_DIRS})
 
-add_library(ddstore src/ddstore.cxx)
+# find_package(Boost COMPONENTS log log_setup)
+# message(STATUS "Boost_INCLUDE_DIRS: " "${Boost_INCLUDE_DIRS}")
+# message(STATUS "Boost_LIBRARIES: " "${Boost_LIBRARIES}")
+# include_directories(${Boost_INCLUDE_DIRS})
+
+pkg_check_modules(LIBFABRIC libfabric REQUIRED)
+include_directories(${LIBFABRIC_INCLUDE_DIRS})
+link_directories(${LIBFABRIC_LIBRARY_DIRS})
+
+add_library(ddstore src/ddstore.cxx src/common.cxx)
 set_property(TARGET ddstore PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(ddstore PUBLIC MPI::MPI_CXX)
 target_link_libraries(ddstore PUBLIC ${Boost_LIBRARIES})
+target_link_libraries(ddstore PUBLIC ${LIBFABRIC_LIBRARIES})
 target_include_directories(ddstore PUBLIC include)
 
 add_executable (demo test/demo.cxx)

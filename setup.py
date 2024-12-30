@@ -10,7 +10,7 @@ defs = [('NPY_NO_DEPRECATED_API', 0)]
 inc_path = np.get_include()
 
 extending = Extension("pyddstore",
-                      sources=["src/pyddstore.pyx", "src/ddstore.cxx"],
+                      sources=["src/pyddstore.pyx", "src/ddstore.cxx", "src/common.c"],
                       include_dirs=[np.get_include(), "include"],
                       extra_compile_args=["-std=c++11"],
                       define_macros=defs,

@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "dstore.hpp"
+#include "ddstore.hpp"
 
 int main(int argc, char *argv[])
 {
@@ -25,7 +25,7 @@ int main(int argc, char *argv[])
         printf("%d: buffer[%d] = %g\n", rank, i, buffer[i]);
     }
 
-    DStore ds(comm);
+    DDStore ds(comm);
     ds.add("var", buffer, 2, 2);
 
     double getbuf[4] = {0.0, 0.0, 0.0, 0.0};

@@ -115,8 +115,8 @@ public:
 
         int target = sortedsearch(varinfo.lenlist, start);
         long offset = target > 0 ? varinfo.lenlist[target - 1] : 0;
-        std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
-        std::endl;
+        // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
+        // std::endl;
 
         if (start < offset)
             throw std::invalid_argument("Invalid start on target");
@@ -149,9 +149,9 @@ public:
         }
         else if (this->method == 1)
         {
-            printf("varinfo.disp, T, count: %d %d %d\n", varinfo.disp, sizeof(T), count);
-            printf("target, offset:, %d %d\n", target, offset);
-            
+            // printf("varinfo.disp, T, count: %d %d %d\n", varinfo.disp, sizeof(T), count);
+            // printf("target, offset: %d %d\n", target, offset);
+
             varinfo.fabric_state->recv_data = (char *)buffer;
             varinfo.fabric_state->recv_data_len = varinfo.disp * sizeof(T) * count;
             read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * sizeof(T));

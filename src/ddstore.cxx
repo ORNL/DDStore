@@ -50,23 +50,29 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
 
 void DDStore::epoch_begin()
 {
-    for (auto &x : this->varlist)
+    if (!this->method)
     {
-        if (x.second.fence_active)
-            throw std::logic_error("Fence already activated");
-        MPI_Win_fence(0, x.second.win);
-        x.second.fence_active = true;
+        for (auto &x : this->varlist)
+        {
+            if (x.second.fence_active)
+                throw std::logic_error("Fence already activated");
+            MPI_Win_fence(0, x.second.win);
+            x.second.fence_active = true;
+        }
     }
 }
 
 void DDStore::epoch_end()
 {
-    for (auto &x : this->varlist)
+    if (!this->method)
     {
-        if (not x.second.fence_active)
-            throw std::logic_error("Fence is not activated");
-        MPI_Win_fence(0, x.second.win);
-        x.second.fence_active = false;
+        for (auto &x : this->varlist)
+        {
+            if (not x.second.fence_active)
+                throw std::logic_error("Fence is not activated");
+            MPI_Win_fence(0, x.second.win);
+            x.second.fence_active = false;
+        }
     }
 }
 
@@ -74,14 +80,15 @@ void DDStore::free()
 {
     int flag;
     MPI_Finalized(&flag);
-    if (!flag)
+    if (!this->method && !flag)
     {
         for (auto &x : this->varlist)
         {
             if (x.second.active)
             {
                 MPI_Win_free(&x.second.win);
-                MPI_Free_mem(x.second.base);
+                // (2024/12) no need as using the user pointer
+                // MPI_Free_mem(x.second.base);
             }
             x.second.active = false;
         }

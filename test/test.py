@@ -1,7 +1,8 @@
 import mpi4py
 
-# mpi4py.rc.thread_level = "serialized"
-# mpi4py.rc.threads = False
+## (2024/12): got an assert error on osx without the following line
+mpi4py.rc.thread_level = "serialized"
+mpi4py.rc.threads = False
 
 import numpy as np
 from mpi4py import MPI
@@ -118,7 +119,7 @@ if __name__ == "__main__":
     dist.init_process_group(backend=backend, init_method="env://")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ddstore = dds.PyDDStore(comm)
+    ddstore = dds.PyDDStore(comm, method=1)
 
     num = args.num
     dim = args.dim
@@ -130,9 +131,11 @@ if __name__ == "__main__":
     arr = arr * (rank + 1)
     arr = arr.reshape(shape)
     print(rank, "arr", np.mean(arr), arr.nbytes / 1024 / 1024 / 1024, "(GB)")
+    print(rank, ">>> add")
     ddstore.add("var", arr)
     ddstore.add("var2", arr)
 
+    print(rank, ">>> get")
     comm.Barrier()
     idx_list = list()
     buff_list = list()
@@ -150,6 +153,7 @@ if __name__ == "__main__":
         x = torch.zeros(1).to(device)
         dist.all_reduce(x, op=dist.ReduceOp.SUM)
 
+    print(rank, ">>> checking")
     for i, idx in enumerate(idx_list):
         expected = idx // num + 1
         assert np.mean(buff_list[i]) == expected, (np.mean(buff_list[i]), expected)

@@ -26,7 +26,7 @@ if __name__ == "__main__":
     comm_size = comm.Get_size()
     rank = comm.Get_rank()
 
-    ddstore = dds.PyDDStore(comm)
+    ddstore = dds.PyDDStore(comm, method=1)
 
     num = args.num
     dim = args.dim
@@ -43,9 +43,11 @@ if __name__ == "__main__":
     idx_list = list()
     buff_list = list()
     for i in range(nbatch):
+        ddstore.epoch_begin()
         idx = np.random.randint(num)
         buff = np.zeros((1, dim), dtype=dtype)
         ddstore.get("var", buff, idx)
+        ddstore.epoch_end()
         idx_list.append(idx)
         buff_list.append(buff)
 

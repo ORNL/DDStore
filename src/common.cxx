@@ -326,7 +326,7 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     }
 
     size_t rc;
-    fprintf(stderr, "fabric_state->remote_address: %llu\n", fabric_state->remote_address[src]);
+    // fprintf(stderr, "fabric_state->remote_address: %llu\n", fabric_state->remote_address[src]);
     do
     {
         rc = fi_read(

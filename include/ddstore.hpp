@@ -38,13 +38,14 @@ public:
     template <typename T>
     void add(std::string name, T *buffer, long nrows, int disp)
     {
-        void *base = buffer;
-        // int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
-        // if (err)
-        // {
-        //     exit(1);
-        // }
-        // memcpy(base, buffer, nrows * disp * sizeof(T));
+        void *base = NULL;
+        // (2025/03) jyc: necessary to avoid memory error
+        int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
+        if (err)
+        {
+            exit(1);
+        }
+        memcpy(base, buffer, nrows * disp * sizeof(T));
 
         MPI_Win win;
         struct fabric_state *fabric_state;

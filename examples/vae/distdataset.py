@@ -4,12 +4,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# from hydragnn.utils.abstractbasedataset import AbstractBaseDataset
-
-try:
-    import pyddstore as dds
-except ImportError:
-    pass
+import pyddstore as dds
 
 def nsplit(a, n):
     k, m = divmod(len(a), n)
@@ -33,7 +28,14 @@ class DistDataset(Dataset):
         self.ddstore_comm = self.comm.Split(self.rank // self.ddstore_width, self.rank)
         self.ddstore_comm_rank = self.ddstore_comm.Get_rank()
         self.ddstore_comm_size = self.ddstore_comm.Get_size()
-        self.ddstore = dds.PyDDStore(self.ddstore_comm)
+
+        ddstore_method = int(os.getenv("DDSTORE_METHOD", "0"))
+        gpu_id = int(os.getenv("SLURM_LOCALID"))
+        os.environ["FABRIC_IFACE"] = f"hsn{gpu_id//2}"
+        print("DDStore method:", ddstore_method)
+        print("FABRIC_IFACE:", os.environ["FABRIC_IFACE"])
+
+        self.ddstore = dds.PyDDStore(self.ddstore_comm, method=ddstore_method)
 
         ## set total before set subset
         self.total_ns = len(data)

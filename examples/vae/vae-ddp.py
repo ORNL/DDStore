@@ -1,4 +1,6 @@
 from __future__ import print_function
+from mpi4py import MPI
+
 import argparse
 import torch
 import torch.utils.data
@@ -10,11 +12,11 @@ from torchvision.utils import save_image
 import distdataset
 from distdataset import DistDataset
 
-from mpi4py import MPI
 import torch.distributed as dist
 import os
 import socket
 import psutil
+import re
 
 """
 Functions for DDP on HPC

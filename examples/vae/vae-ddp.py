@@ -15,6 +15,7 @@ import torch.distributed as dist
 import os
 import socket
 import psutil
+import re
 
 """
 Functions for DDP on HPC

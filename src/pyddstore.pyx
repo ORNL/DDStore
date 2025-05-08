@@ -66,6 +66,8 @@ cdef class PyDDStore:
             self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp)
         elif arr.dtype == np.int64:
             self.c_ddstore.add(s2b(name), <long *> arr.data, nrows, disp)
+        elif arr.dtype == np.uint8:
+            self.c_ddstore.add(s2b(name), <char *> arr.data, nrows, disp)
         elif arr.dtype == np.float32:
             self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
         elif arr.dtype == np.float64:
@@ -81,6 +83,8 @@ cdef class PyDDStore:
             self.c_ddstore.get(s2b(name), start, count, <int *> arr.data)
         elif arr.dtype == np.int64:
             self.c_ddstore.get(s2b(name), start, count, <long *> arr.data)
+        elif arr.dtype == np.uint8:
+            self.c_ddstore.get(s2b(name), start, count, <char *> arr.data)
         elif arr.dtype == np.float32:
             self.c_ddstore.get(s2b(name), start, count, <float *> arr.data)
         elif arr.dtype == np.float64:

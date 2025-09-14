@@ -33,7 +33,8 @@ void init_fabric(struct fabric_state *fabric)
 
     fabric->info = NULL;
 
-    fi_getinfo(FI_VERSION(1, 5), NULL, NULL, 0, hints, &info);
+    int version = fi_version();
+    fi_getinfo(version, NULL, NULL, 0, hints, &info);
     if (!info)
     {
         fprintf(stderr, "no fabrics detected.\n");
@@ -49,8 +50,8 @@ void init_fabric(struct fabric_state *fabric)
         char *prov_name = info->fabric_attr->prov_name;
         char *domain_name = info->domain_attr->name;
 
-        if (ifname && strcmp(ifname, domain_name) == 0 &&
-            strcmp(prov_name, "sockets") == 0)
+        // (2025/09) need to hardcode to avoid conflict with MPI
+        if (ifname && (strcmp(ifname, domain_name) == 0) && (strcmp(prov_name, "tcp;ofi_rxm") == 0))
         {
             fprintf(stderr, "using interface set by FABRIC_IFACE.\n");
             useinfo = info;
@@ -207,8 +208,9 @@ void init_fabric(struct fabric_state *fabric)
 
     cq_attr.size = 0;
     cq_attr.format = FI_CQ_FORMAT_DATA;
-    cq_attr.wait_obj = FI_WAIT_UNSPEC;
-    cq_attr.wait_cond = FI_CQ_COND_NONE;
+    // (2025/09) segfault when using providers other than sockets
+    // cq_attr.wait_obj = FI_WAIT_UNSPEC;
+    // cq_attr.wait_cond = FI_CQ_COND_NONE;
     result =
         fi_cq_open(fabric->domain, &cq_attr, &fabric->cq_signal, fabric->ctx);
     if (result != FI_SUCCESS)
@@ -345,12 +347,29 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         return (rc);
     }
 
-    struct fi_cq_data_entry CQEntry = {0};
-    rc = fi_cq_sread(fabric_state->cq_signal, &CQEntry, 1, NULL, -1);
-    if (rc < 1)
+    // (2025/09) segfault when using providers other than sockets
+    // struct fi_cq_data_entry CQEntry = {0};
+    // rc = fi_cq_sread(fabric_state->cq_signal, &CQEntry, 1, NULL, -1);
+    // if (rc < 1)
+    // {
+    //     fprintf(stderr, "Received no completion event for remote read\n");
+    //     return 1;
+    // }
+
+    for (;;)
     {
-        fprintf(stderr, "Received no completion event for remote read\n");
-        return 1;
+        struct fi_cq_data_entry CQEntry = {0};
+        rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
+        if (rc == 1)
+            break;
+        if (rc == -FI_EAVAIL)
+        {
+            struct fi_cq_err_entry ee = {0};
+            fi_cq_readerr(fabric_state->cq_signal, &ee, 0);
+            fprintf(stderr, "fi_cq_read failed with error: prov_errno=%d (%s)\n",
+                    ee.prov_errno, fi_strerror(ee.prov_errno));
+            return 1;
+        }
     }
 
     return 0;

@@ -17,7 +17,10 @@ libraries = list()
 ## libfabric
 libfabric_dir = subprocess.getoutput("pkg-config --variable=prefix libfabric")
 libfabric_include_dir = os.path.join(libfabric_dir, "include")
-libfabric_lib_dir = os.path.join(libfabric_dir, "lib")
+if os.path.exists(os.path.join(libfabric_dir, "lib64")):
+    libfabric_lib_dir = os.path.join(libfabric_dir, "lib64")
+else:
+    libfabric_lib_dir = os.path.join(libfabric_dir, "lib")
 print("libfabric_dir:", libfabric_dir)
 print("libfabric_include_dir:", libfabric_include_dir)
 print("libfabric_lib_dir:", libfabric_lib_dir)

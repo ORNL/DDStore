@@ -25,7 +25,8 @@ int main(int argc, char *argv[])
         printf("%d: buffer[%d] = %g\n", rank, i, buffer[i]);
     }
 
-    DDStore ds(comm);
+    int method = 1; // 0: MPI, 1: libfabric
+    DDStore ds(method, comm);
     ds.add("var", buffer, 2, 2);
 
     double getbuf[4] = {0.0, 0.0, 0.0, 0.0};

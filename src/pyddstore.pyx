@@ -40,6 +40,7 @@ cdef extern from "ddstore.hpp":
     cdef cppclass DDStore:
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
+        DDStore(int method, libmpi.MPI_Comm comm)
         void add[T](string name, T* buffer, long nrows, int disp) except +
         void get[T](string name, long start, long count, T* buffer) except +
         void epoch_begin()
@@ -55,8 +56,9 @@ cdef class PyDDstoreVarinfo:
 cdef class PyDDStore:
     cdef DDStore c_ddstore
 
-    def __cinit__(self, MPI.Comm comm):
-        self.c_ddstore = DDStore(comm.ob_mpi)
+    def __cinit__(self, MPI.Comm comm, int method = 0):
+        print("PyDDStore init method:", method)
+        self.c_ddstore = DDStore(method, comm.ob_mpi)
     
     def add(self, str name, np.ndarray arr):
         assert arr.flags.c_contiguous

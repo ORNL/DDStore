@@ -4,6 +4,7 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include "common.h"
 
 struct VarInfo
 {
@@ -15,6 +16,7 @@ struct VarInfo
     bool active;
     bool fence_active;
     void *base;
+    struct fabric_state *fabric_state;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -22,9 +24,10 @@ int sortedsearch(std::vector<long> &vec, long num);
 
 class DDStore
 {
-  public:
+public:
     DDStore();
     DDStore(MPI_Comm comm);
+    DDStore(int method, MPI_Comm comm);
     ~DDStore();
 
     void query(std::string name, VarInfo_t &varinfo);
@@ -32,7 +35,8 @@ class DDStore
     void epoch_end();
     void free();
 
-    template <typename T> void add(std::string name, T *buffer, long nrows, int disp)
+    template <typename T>
+    void add(std::string name, T *buffer, long nrows, int disp)
     {
         void *base = NULL;
         // (2025/03) jyc: necessary to avoid memory error
@@ -44,12 +48,28 @@ class DDStore
         memcpy(base, buffer, nrows * disp * sizeof(T));
 
         MPI_Win win;
-        MPI_Win_create(base,                             /* pre-allocated buffer */
-                       (MPI_Aint)nrows * disp * sizeof(T), /* size in bytes */
-                       disp * sizeof(T),                   /* displacement units */
-                       MPI_INFO_NULL,                      /* info object */
-                       this->comm,                         /* communicator */
-                       &win /* window object */);
+        struct fabric_state *fabric_state;
+
+        if (this->method == 0)
+        {
+            MPI_Win_create(base,                               /* pre-allocated buffer */
+                           (MPI_Aint)nrows * disp * sizeof(T), /* size in bytes */
+                           disp * sizeof(T),                   /* displacement units */
+                           MPI_INFO_NULL,                      /* info object */
+                           this->comm,                         /* communicator */
+                           &win /* window object */);
+        }
+        else if (this->method == 1)
+        {
+            fabric_state = (struct fabric_state *)malloc(sizeof(struct fabric_state));
+            fabric_state->send_data = (char *)base;
+            fabric_state->send_data_len = nrows * disp * sizeof(T);
+            fabric_state->world_size = this->comm_size;
+            fabric_state->rank = this->rank;
+
+            init_fabric(fabric_state);
+            handshake(fabric_state, this->comm);
+        }
 
         std::vector<long> lenlist(this->comm_size);
         MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
@@ -81,11 +101,13 @@ class DDStore
         var.active = true;
         var.fence_active = false;
         var.base = base;
+        var.fabric_state = fabric_state;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
     }
 
-    template <typename T> void get(std::string name, long start, long count, T *buffer)
+    template <typename T>
+    void get(std::string name, long start, long count, T *buffer)
     {
         VarInfo_t varinfo = this->varlist[name];
 
@@ -106,26 +128,40 @@ class DDStore
         // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
         // std::endl;
 
-        MPI_Win win = varinfo.win;
-        MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
-        /*
-        int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
-                    origin_datatype, int target_rank, MPI_Aint target_disp,
-                    int target_count, MPI_Datatype target_datatype, MPI_Win
-                    win)
-        */
-        MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
-                varinfo.disp * sizeof(T) * count, /* count on RMA origin process */
-                MPI_BYTE,                         /* type on RMA origin process */
-                target,                           /* rank of RMA target process */
-                start - offset,                   /* displacement on RMA target process */
-                varinfo.disp * sizeof(T) * count, /* count on RMA target process */
-                MPI_BYTE,                         /* type on RMA target process */
-                win /* window object */);
-        MPI_Win_unlock(target, win);
+        if (this->method == 0)
+        {
+            MPI_Win win = varinfo.win;
+            MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+            /*
+            int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
+                        origin_datatype, int target_rank, MPI_Aint target_disp,
+                        int target_count, MPI_Datatype target_datatype, MPI_Win
+                        win)
+            */
+            MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
+                    varinfo.disp * sizeof(T) * count, /* count on RMA origin process */
+                    MPI_BYTE,                         /* type on RMA origin process */
+                    target,                           /* rank of RMA target process */
+                    start - offset,                   /* displacement on RMA target process */
+                    varinfo.disp * sizeof(T) * count, /* count on RMA target process */
+                    MPI_BYTE,                         /* type on RMA target process */
+                    win /* window object */);
+            MPI_Win_unlock(target, win);
+        }
+        else if (this->method == 1)
+        {
+            // printf("varinfo.disp, T, count: %d %d %d\n", varinfo.disp, sizeof(T), count);
+            // printf("target, offset: %d %d\n", target, offset);
+
+            varinfo.fabric_state->recv_data = (char *)buffer;
+            varinfo.fabric_state->recv_data_len = varinfo.disp * sizeof(T) * count;
+            read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * sizeof(T));
+        }
     }
 
-  private:
+private:
+    int method; // 0: MPI, 1: libfabric
+
     MPI_Comm comm;
     int comm_size;
     int rank;

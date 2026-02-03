@@ -33,8 +33,8 @@ cpdef bytes s2b(str x):
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
         string name
-        string typeinfo
         int disp
+        int itemsize
 
 
     cdef cppclass DDStore:
@@ -46,6 +46,8 @@ cdef extern from "ddstore.hpp":
         void epoch_begin()
         void epoch_end()
         void free()
+        void init(string name, long nrows, int disp, int itemsize) except +
+        void update[T](string name, T* buffer, long nrows, long offset) except +
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -74,6 +76,8 @@ cdef class PyDDStore:
             self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
         elif arr.dtype == np.float64:
             self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp)
+        elif arr.dtype == np.bool:
+            self.c_ddstore.add(s2b(name), <char *> arr.data, nrows, disp)
         else:
             raise NotImplementedError
 
@@ -91,6 +95,8 @@ cdef class PyDDStore:
             self.c_ddstore.get(s2b(name), start, count, <float *> arr.data)
         elif arr.dtype == np.float64:
             self.c_ddstore.get(s2b(name), start, count, <double *> arr.data)
+        elif arr.dtype == np.bool:
+            self.c_ddstore.get(s2b(name), start, count, <char *> arr.data)
         else:
             raise NotImplementedError
     
@@ -102,3 +108,24 @@ cdef class PyDDStore:
 
     def free(self):
         self.c_ddstore.free()
+    
+    def init(self, str name, long nrows, int disp, int itemsize=1):
+        self.c_ddstore.init(s2b(name), nrows, disp, itemsize)
+
+    def update(self, str name, np.ndarray arr, long offset):
+        assert arr.flags.c_contiguous
+        cdef long nrows = arr.shape[0]
+        if arr.dtype == np.int32:
+            self.c_ddstore.update(s2b(name), <int *> arr.data, nrows, offset)
+        elif arr.dtype == np.int64:
+            self.c_ddstore.update(s2b(name), <long *> arr.data, nrows, offset)
+        elif arr.dtype == np.uint8:
+            self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
+        elif arr.dtype == np.float32:
+            self.c_ddstore.update(s2b(name), <float *> arr.data, nrows, offset)
+        elif arr.dtype == np.float64:
+            self.c_ddstore.update(s2b(name), <double *> arr.data, nrows, offset)
+        elif arr.dtype == np.bool:
+            self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
+        else:
+            raise NotImplementedError

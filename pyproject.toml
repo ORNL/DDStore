@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "Cython", "numpy", "mpi4py"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "PyDDStore"
+version = "0.1"
+description = "Distributed Data Store"
+requires-python = ">=3.6"
+dependencies = ["numpy", "mpi4py"]

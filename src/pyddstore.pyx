@@ -59,7 +59,7 @@ cdef class PyDDStore:
     cdef DDStore c_ddstore
 
     def __cinit__(self, MPI.Comm comm, int method = 0):
-        print("PyDDStore init method:", method)
+        # print("PyDDStore init method:", method)
         self.c_ddstore = DDStore(method, comm.ob_mpi)
     
     def add(self, str name, np.ndarray arr):

@@ -8,7 +8,7 @@
 
 #define DP_AV_DEF_SIZE 512
 #define COMM_FILE_WRITER_TO_READER "./writer_address.bin"
-#define MAX_WORLD_SIZE 8192
+#define MAX_WORLD_SIZE 8*1024*10
 
 #ifdef __cplusplus
 extern "C"

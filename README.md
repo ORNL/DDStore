@@ -68,12 +68,13 @@ mpirun -n 4 python my_script.py
 
 ## API Reference
 
-### `PyDDStore(comm, method=0)`
+### `PyDDStore(comm, method=0, ddstore_width=None)`
 
 | Parameter | Type | Description |
 |---|---|---|
-| `comm` | `mpi4py.MPI.Comm` | MPI communicator for the store group |
+| `comm` | `mpi4py.MPI.Comm` | MPI communicator covering all ranks |
 | `method` | `int` | `0` = MPI RMA (default), `1` = libfabric RDMA |
+| `ddstore_width` | `int` or `None` | Ranks per DDStore group. `None` uses all ranks in `comm` as a single group |
 
 ---
 
@@ -152,13 +153,23 @@ export FABRIC_IFACE=hsn0   # e.g. Cray Slingshot
 
 ## Partitioned / Sub-communicator Usage
 
-To partition a large job into independent DDStore groups (e.g. one store per node):
+`ddstore_width` controls how many MPI ranks form a single DDStore group. The global communicator is split so that each group of `ddstore_width` consecutive ranks shares one independent store, with each group holding a full replica of the dataset partitioned across its members.
+
+**Example — 16 ranks, `ddstore_width=4`:**
+```
+ranks  0– 3  →  DDStore group 0
+ranks  4– 7  →  DDStore group 1
+ranks  8–11  →  DDStore group 2
+ranks 12–15  →  DDStore group 3
+```
+
+This is useful when you want one store per node (e.g. 4 GPUs per node → `ddstore_width=4`), limiting cross-node RDMA traffic to the dataset replication step at startup rather than every sample fetch.
 
 ```python
-ddstore_width = 8   # ranks per store group
-ddstore_comm = comm.Split(rank // ddstore_width, rank)
-store = dds.PyDDStore(ddstore_comm)
+store = dds.PyDDStore(comm, ddstore_width=4)   # e.g. 4 GPUs per store
 ```
+
+If `ddstore_width` is omitted, all ranks in `comm` form a single store.
 
 ## PyTorch Dataset Integration
 

@@ -29,6 +29,9 @@ CC=mpicc CXX=mpicxx pip install .
 
 # Or install in editable/development mode
 CC=mpicc CXX=mpicxx pip install -e .
+
+# Or install directly from GitHub
+CC=mpicc CXX=mpicxx pip install git+https://github.com/ORNL/DDStore.git
 ```
 
 ## Quick Start

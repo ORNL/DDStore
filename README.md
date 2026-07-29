@@ -186,13 +186,13 @@ mpirun -n 4 python examples/vae/vae-ddp.py
 
 ```bash
 # Basic functional test (MPI RMA)
-mpirun -n 4 python test/demo.py
+mpirun -n 4 python examples/scripts/demo.py
 
 # Integration test with PyTorch DDP
-mpirun -n 4 python test/test.py
+mpirun -n 4 python examples/scripts/test.py
 ```
 
-Optional arguments for `test/demo.py` and `test/test.py`:
+Optional arguments for `examples/scripts/demo.py` and `examples/scripts/test.py`:
 
 | Flag | Default | Description |
 |---|---|---|

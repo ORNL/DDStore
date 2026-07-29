@@ -1,21 +1,24 @@
 from mpi4py import MPI
 import numpy as np
+import os
 
 import torch
 from torch.utils.data import Dataset
 
 import pyddstore as dds
 
+
 def nsplit(a, n):
     k, m = divmod(len(a), n)
     return (a[i * k + min(i, m) : (i + 1) * k + min(i + 1, m)] for i in range(n))
+
 
 class DistDataset(Dataset):
     """Distributed dataset class"""
 
     def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None):
         super().__init__()
-        
+
         self.dataset = list()
         self.label = label
         self.comm = comm
@@ -54,16 +57,15 @@ class DistDataset(Dataset):
         self.labels = list()
 
         nbytes = 0
-        for (data, label) in self.dataset:
+        for data, label in self.dataset:
             val = data.cpu().numpy()
-            val = val.flatten()            
+            val = val.flatten()
             self.data.append(val)
             self.labels.append(label)
 
         self.data = np.concatenate(self.data)
         self.data = np.ascontiguousarray(self.data)
 
-        
         self.labels = np.array(self.labels, dtype=np.int32)
         self.labels = np.ascontiguousarray(self.labels)
 

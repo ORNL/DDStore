@@ -256,9 +256,8 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     size_t address_len = DP_AV_DEF_SIZE;
     int world_size = fabric_state->world_size;
     int rank = fabric_state->rank;
-    int src = (rank - 1) % fabric_state->world_size;
 
-    fi_mr_reg(
+    int mr_rc = fi_mr_reg(
         fabric_state->domain,
         fabric_state->send_data,
         fabric_state->send_data_len,
@@ -268,6 +267,11 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
         0,
         &fabric_state->mr,
         NULL);
+    if (mr_rc != FI_SUCCESS)
+    {
+        fprintf(stderr, "fi_mr_reg failed: %s\n", fi_strerror(mr_rc));
+        return 1;
+    }
     fabric_state->key = fi_mr_key(fabric_state->mr);
 
     int status = fi_getname((fid_t)fabric_state->signal, address, &address_len);
@@ -276,6 +280,10 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
         fprintf(stderr, "fi_getname failed: %s\n", fi_strerror(status));
         return 1;
     }
+
+    fabric_state->comm_partner   = (fi_addr_t *)malloc(world_size * sizeof(fi_addr_t));
+    fabric_state->remote_key     = (uint64_t  *)malloc(world_size * sizeof(uint64_t));
+    fabric_state->remote_address = (uint64_t  *)malloc(world_size * sizeof(uint64_t));
 
     char *address_data = (char *)malloc(world_size * address_len);
     for (int i = 0; i < address_len; i++)
@@ -305,12 +313,17 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
         fabric_state->remote_address[i] = pointer_addr_data[i];
     }
 
+    free(address_data);
+    free(key_data);
+    free(pointer_addr_data);
     return 0;
 }
 
 int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset)
 {
-    // register dest buffer
+    // register dest buffer; close previous recv MR first to avoid leaking it
+    if (fabric_state->recv_mr)
+        fi_close(&fabric_state->recv_mr->fid);
     fi_mr_reg(
         fabric_state->domain,
         fabric_state->recv_data,
@@ -319,12 +332,12 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         0,
         0,
         0,
-        &fabric_state->mr,
+        &fabric_state->recv_mr,
         NULL);
     void *memory_descriptor = NULL;
     if (is_local_mr_req(fabric_state))
     {
-        memory_descriptor = fi_mr_desc(fabric_state->mr);
+        memory_descriptor = fi_mr_desc(fabric_state->recv_mr);
     }
 
     size_t rc;

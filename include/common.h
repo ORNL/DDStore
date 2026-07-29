@@ -8,7 +8,6 @@
 
 #define DP_AV_DEF_SIZE 512
 #define COMM_FILE_WRITER_TO_READER "./writer_address.bin"
-#define MAX_WORLD_SIZE 8*1024*10
 
 #ifdef __cplusplus
 extern "C"
@@ -25,15 +24,16 @@ extern "C"
         struct fid_cq *cq_signal;
         struct fid_av *av;
 
-        fi_addr_t comm_partner[MAX_WORLD_SIZE];
+        fi_addr_t *comm_partner;
         char *send_data;
         size_t send_data_len;
         char *recv_data;
         size_t recv_data_len;
         struct fid_mr *mr;
+        struct fid_mr *recv_mr;
         uint64_t key;
-        uint64_t remote_key[MAX_WORLD_SIZE];
-        uint64_t remote_address[MAX_WORLD_SIZE];
+        uint64_t *remote_key;
+        uint64_t *remote_address;
 
         int world_size;
         int rank;

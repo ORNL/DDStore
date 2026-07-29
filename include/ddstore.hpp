@@ -1,6 +1,6 @@
 #include <iostream>
 #include <cstring>
-#include <map>
+#include <unordered_map>
 #include <mpi.h>
 #include <string>
 #include <typeinfo>
@@ -21,7 +21,7 @@ struct VarInfo
 };
 typedef struct VarInfo VarInfo_t;
 
-int sortedsearch(std::vector<long> &vec, long num);
+int sortedsearch(const std::vector<long> &vec, long num);
 
 class DDStore
 {
@@ -48,8 +48,8 @@ public:
         }
         memcpy(base, buffer, nrows * disp * sizeof(T));
 
-        MPI_Win win;
-        struct fabric_state *fabric_state;
+        MPI_Win win = MPI_WIN_NULL;
+        struct fabric_state *fabric_state = NULL;
 
         if (this->method == 0)
         {
@@ -62,13 +62,15 @@ public:
         }
         else if (this->method == 1)
         {
-            fabric_state = (struct fabric_state *)malloc(sizeof(struct fabric_state));
+            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
             fabric_state->send_data = (char *)base;
             fabric_state->send_data_len = nrows * disp * sizeof(T);
             fabric_state->world_size = this->comm_size;
             fabric_state->rank = this->rank;
 
             init_fabric(fabric_state);
+            if (!fabric_state->info)
+                throw std::runtime_error("init_fabric failed: no suitable fabric found");
             handshake(fabric_state, this->comm);
         }
 
@@ -119,8 +121,8 @@ public:
         }
         memset(base, 0, nrows * disp * itemsize);
 
-        MPI_Win win;
-        struct fabric_state *fabric_state;
+        MPI_Win win = MPI_WIN_NULL;
+        struct fabric_state *fabric_state = NULL;
 
         if (this->method == 0)
         {
@@ -133,13 +135,15 @@ public:
         }
         else if (this->method == 1)
         {
-            fabric_state = (struct fabric_state *)malloc(sizeof(struct fabric_state));
+            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
             fabric_state->send_data = (char *)base;
             fabric_state->send_data_len = nrows * disp * itemsize;
             fabric_state->world_size = this->comm_size;
             fabric_state->rank = this->rank;
 
             init_fabric(fabric_state);
+            if (!fabric_state->info)
+                throw std::runtime_error("init_fabric failed: no suitable fabric found");
             handshake(fabric_state, this->comm);
         }
 
@@ -181,7 +185,7 @@ public:
     template <typename T>
     void update(std::string name, T *buffer, long nrows, long offset = 0)
     {
-        VarInfo_t varinfo = this->varlist[name];
+        const VarInfo_t& varinfo = this->varlist.at(name);
 
         void *base = varinfo.base;
         int itemsize = varinfo.itemsize;
@@ -197,7 +201,7 @@ public:
     template <typename T>
     void get(std::string name, long start, long count, T *buffer)
     {
-        VarInfo_t varinfo = this->varlist[name];
+        const VarInfo_t& varinfo = this->varlist.at(name);
 
         if (varinfo.itemsize != sizeof(T))
             throw std::invalid_argument("Invalid data type");
@@ -254,5 +258,5 @@ private:
     int comm_size;
     int rank;
 
-    std::map<std::string, VarInfo_t> varlist;
+    std::unordered_map<std::string, VarInfo_t> varlist;
 };

@@ -14,10 +14,6 @@ from libcpp.typeinfo cimport type_info
 
 from cpython.version cimport PY_MAJOR_VERSION
 
-cdef extern from "string.h" nogil:
-    char   *strdup  (const char *s)
-    size_t strlen   (const char *s)
-
 cpdef str b2s(bytes x):
     if PY_MAJOR_VERSION < 3:
         return str(x)
@@ -28,7 +24,7 @@ cpdef bytes s2b(str x):
     if PY_MAJOR_VERSION < 3:
         return <bytes>x
     else:
-        return strdup(x.encode())
+        return x.encode()
 
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
@@ -76,7 +72,7 @@ cdef class PyDDStore:
             self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
         elif arr.dtype == np.float64:
             self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp)
-        elif arr.dtype == np.bool:
+        elif arr.dtype == np.bool_:
             self.c_ddstore.add(s2b(name), <char *> arr.data, nrows, disp)
         else:
             raise NotImplementedError
@@ -95,7 +91,7 @@ cdef class PyDDStore:
             self.c_ddstore.get(s2b(name), start, count, <float *> arr.data)
         elif arr.dtype == np.float64:
             self.c_ddstore.get(s2b(name), start, count, <double *> arr.data)
-        elif arr.dtype == np.bool:
+        elif arr.dtype == np.bool_:
             self.c_ddstore.get(s2b(name), start, count, <char *> arr.data)
         else:
             raise NotImplementedError
@@ -125,7 +121,7 @@ cdef class PyDDStore:
             self.c_ddstore.update(s2b(name), <float *> arr.data, nrows, offset)
         elif arr.dtype == np.float64:
             self.c_ddstore.update(s2b(name), <double *> arr.data, nrows, offset)
-        elif arr.dtype == np.bool:
+        elif arr.dtype == np.bool_:
             self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
         else:
             raise NotImplementedError

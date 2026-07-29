@@ -21,7 +21,7 @@ target_link_libraries(ddstore PUBLIC ${Boost_LIBRARIES})
 target_link_libraries(ddstore PUBLIC ${LIBFABRIC_LIBRARIES})
 target_include_directories(ddstore PUBLIC include)
 
-add_executable (demo test/demo.cxx)
+add_executable (demo examples/scripts/demo.cxx)
 target_link_libraries (demo PUBLIC ddstore)
 target_include_directories(demo PUBLIC ddstore)
 

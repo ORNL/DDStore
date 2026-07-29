@@ -146,7 +146,7 @@ if __name__ == "__main__":
         ddstore.get("var", buff, idx)
         idx2 = np.random.randint(num * comm_size)
         buff2 = np.zeros((1, dim), dtype=dtype)
-        ddstore.get("var", buff2, idx)
+        ddstore.get("var", buff2, idx2)
         ddstore.epoch_end()
         idx_list.append(idx)
         buff_list.append(buff)

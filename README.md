@@ -184,6 +184,33 @@ mpirun -n 4 python examples/vae/vae-ddp.py
 
 ## Testing
 
+### Unit tests (pytest)
+
+Install test dependencies:
+
+```bash
+pip install pytest pytest-mpi
+```
+
+**Single-rank** — no cluster required, covers all dtypes, `add`/`get`/`init`/`update`, and error cases:
+
+```bash
+mpirun -n 1 python -m pytest test/test_single.py -v
+```
+
+**Multi-rank** — verifies remote reads across all rank pairs and sub-communicator grouping:
+
+```bash
+mpirun -n 4 python -m pytest test/test_multirank.py -v
+```
+
+| Test file | Min ranks | What is tested |
+|---|---|---|
+| `test/test_single.py` | 1 | All dtypes, `add`/`get`, `init`/`update`/`get`, error handling, double `free()` |
+| `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
+
+### Integration scripts
+
 ```bash
 # Basic functional test (MPI RMA)
 mpirun -n 4 python examples/scripts/demo.py

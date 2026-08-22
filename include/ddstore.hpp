@@ -5,6 +5,10 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <rdma/fabric.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_rma.h>
 #include "common.h"
 
 struct VarInfo
@@ -29,12 +33,35 @@ public:
     DDStore();
     DDStore(MPI_Comm comm);
     DDStore(int method, MPI_Comm comm);
+
+    /* Method 2: core member constructor.
+     * handshake_dir: shared directory visible to all processes.
+     * n_core is derived from the communicator size (all ranks in `comm`
+     * are assumed to be core members).                                      */
+    DDStore(int method, MPI_Comm comm,
+            const std::string &handshake_dir);
+
+    /* Method 2: extra member constructor (no MPI communicator required).
+     * The extra member calls join() per variable to discover the data.      */
+    DDStore(int method, const std::string &handshake_dir, int n_core);
+
     ~DDStore();
 
     void query(std::string name, VarInfo_t &varinfo);
+
+    /* Total row count across all core ranks for a variable (added or joined). */
+    long size(std::string name)
+    {
+        const VarInfo_t& varinfo = this->varlist.at(name);
+        return varinfo.lenlist.empty() ? 0 : varinfo.lenlist.back();
+    }
+
     void epoch_begin();
     void epoch_end();
     void free();
+
+    /* Method 2 extra member: discover variable published by core members.   */
+    void join(std::string name);
 
     template <typename T>
     void add(std::string name, T *buffer, long nrows, int disp)
@@ -73,6 +100,68 @@ public:
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
             handshake(fabric_state, this->comm);
         }
+        else if (this->method == 2)
+        {
+            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            fabric_state->send_data     = (char *)base;
+            fabric_state->send_data_len = nrows * disp * sizeof(T);
+            fabric_state->world_size    = this->n_core;
+            fabric_state->rank          = this->rank;
+
+            init_fabric(fabric_state);
+            if (!fabric_state->info)
+                throw std::runtime_error("init_fabric failed: no suitable fabric found");
+
+            /* Register the send buffer as an MR before writing the record. */
+            int mr_rc = fi_mr_reg(
+                fabric_state->domain,
+                fabric_state->send_data,
+                fabric_state->send_data_len,
+                FI_WRITE | FI_REMOTE_READ,
+                0, 0, 0,
+                &fabric_state->mr,
+                NULL);
+            if (mr_rc != FI_SUCCESS)
+                throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
+            fabric_state->key = fi_mr_key(fabric_state->mr);
+
+            /* Write this rank's record to the handshake directory. */
+            if (handshake_write(fabric_state,
+                                this->handshake_dir.c_str(), name.c_str(), this->rank,
+                                nrows, disp, (int)sizeof(T)) != 0)
+                throw std::runtime_error("handshake_write failed");
+
+            /* Wait for all core ranks, then read all records. */
+            std::vector<long> raw_lens(this->n_core);
+            int file_disp = 0, file_itemsize = 0;
+            if (handshake_read(fabric_state,
+                               this->handshake_dir.c_str(), name.c_str(),
+                               this->n_core, this->rank,
+                               raw_lens.data(), &file_disp, &file_itemsize) != 0)
+                throw std::runtime_error("handshake_read failed");
+
+            /* Build prefix-sum lenlist from the raw per-rank row counts. */
+            long sum = 0;
+            std::vector<long> lenlist(this->n_core);
+            for (int i = 0; i < this->n_core; i++)
+            {
+                sum += raw_lens[i];
+                lenlist[i] = sum;
+            }
+
+            VarInfo_t var;
+            var.name         = name;
+            var.itemsize     = (int)sizeof(T);
+            var.disp         = disp;
+            var.win          = MPI_WIN_NULL;
+            var.lenlist      = lenlist;
+            var.active       = true;
+            var.fence_active = false;
+            var.base         = base;
+            var.fabric_state = fabric_state;
+            this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+            return; /* lenlist already stored; skip the MPI_Allgather block below */
+        }
 
         std::vector<long> lenlist(this->comm_size);
         MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
@@ -89,11 +178,6 @@ public:
             sum += lenlist[i];
             lenlist[i] = sum;
         }
-        // for (long unsigned int i = 0; i < lenlist.size(); i++)
-        // {
-        //     std::cout << "lenlist[" << i << "]: " << lenlist[i] << std::endl;
-        // }
-        // std::cout << "sum: " << sum << std::endl;
 
         VarInfo_t var;
         var.name = name;
@@ -146,6 +230,64 @@ public:
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
             handshake(fabric_state, this->comm);
         }
+        else if (this->method == 2)
+        {
+            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            fabric_state->send_data     = (char *)base;
+            fabric_state->send_data_len = nrows * disp * itemsize;
+            fabric_state->world_size    = this->n_core;
+            fabric_state->rank          = this->rank;
+
+            init_fabric(fabric_state);
+            if (!fabric_state->info)
+                throw std::runtime_error("init_fabric failed: no suitable fabric found");
+
+            int mr_rc = fi_mr_reg(
+                fabric_state->domain,
+                fabric_state->send_data,
+                fabric_state->send_data_len,
+                FI_WRITE | FI_REMOTE_READ,
+                0, 0, 0,
+                &fabric_state->mr,
+                NULL);
+            if (mr_rc != FI_SUCCESS)
+                throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
+            fabric_state->key = fi_mr_key(fabric_state->mr);
+
+            if (handshake_write(fabric_state,
+                                this->handshake_dir.c_str(), name.c_str(), this->rank,
+                                nrows, disp, itemsize) != 0)
+                throw std::runtime_error("handshake_write failed");
+
+            std::vector<long> raw_lens(this->n_core);
+            int file_disp = 0, file_itemsize = 0;
+            if (handshake_read(fabric_state,
+                               this->handshake_dir.c_str(), name.c_str(),
+                               this->n_core, this->rank,
+                               raw_lens.data(), &file_disp, &file_itemsize) != 0)
+                throw std::runtime_error("handshake_read failed");
+
+            long sum = 0;
+            std::vector<long> lenlist(this->n_core);
+            for (int i = 0; i < this->n_core; i++)
+            {
+                sum += raw_lens[i];
+                lenlist[i] = sum;
+            }
+
+            VarInfo_t var;
+            var.name         = name;
+            var.itemsize     = itemsize;
+            var.disp         = disp;
+            var.win          = MPI_WIN_NULL;
+            var.lenlist      = lenlist;
+            var.active       = true;
+            var.fence_active = false;
+            var.base         = base;
+            var.fabric_state = fabric_state;
+            this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+            return;
+        }
 
         std::vector<long> lenlist(this->comm_size);
         MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
@@ -162,11 +304,6 @@ public:
             sum += lenlist[i];
             lenlist[i] = sum;
         }
-        // for (long unsigned int i = 0; i < lenlist.size(); i++)
-        // {
-        //     std::cout << "lenlist[" << i << "]: " << lenlist[i] << std::endl;
-        // }
-        // std::cout << "sum: " << sum << std::endl;
 
         VarInfo_t var;
         var.name = name;
@@ -193,8 +330,6 @@ public:
         if (itemsize != sizeof(T))
             throw std::invalid_argument("Invalid data type");
 
-        // std::cout << "Update: " << name << ", nrows: " << nrows << ", offset: " << offset << std::endl;
-        // std::cout << "memcpy: " << (nrows * disp * itemsize)/1024/1024/1024 << " GB" << std::endl;
         memcpy((char*)base + offset * disp * itemsize, buffer, nrows * disp * itemsize);
     }
 
@@ -240,11 +375,9 @@ public:
                     win /* window object */);
             MPI_Win_unlock(target, win);
         }
-        else if (this->method == 1)
+        else if (this->method == 1 || this->method == 2)
         {
-            // printf("varinfo.disp, T, count: %d %d %d\n", varinfo.disp, sizeof(T), count);
-            // printf("target, offset: %d %d\n", target, offset);
-
+            /* Methods 1 and 2 both use libfabric fi_read — same path. */
             varinfo.fabric_state->recv_data = (char *)buffer;
             varinfo.fabric_state->recv_data_len = varinfo.disp * varinfo.itemsize * count;
             read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * varinfo.itemsize);
@@ -252,11 +385,16 @@ public:
     }
 
 private:
-    int method; // 0: MPI, 1: libfabric
+    int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)
 
-    MPI_Comm comm;
-    int comm_size;
-    int rank;
+    MPI_Comm    comm;
+    int         comm_size;
+    int         rank;
+
+    /* Method 2 fields */
+    std::string handshake_dir;  /* shared directory for CoreRecord files     */
+    int         n_core;         /* number of core ranks                      */
+    bool        is_extra;       /* true if this is an extra (read-only) node */
 
     std::unordered_map<std::string, VarInfo_t> varlist;
 };

@@ -9,6 +9,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
 void init_fabric(struct fabric_state *fabric)
 {
@@ -386,4 +390,271 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     }
 
     return 0;
+}
+
+/* =========================================================================
+ * Method 2: file-based handshake helpers
+ * =========================================================================
+ *
+ * File naming convention:
+ *   {dir}/{varname}_rank{rank}.bin   — one CoreRecord per core rank
+ *
+ * Directory resolution priority:
+ *   1. user_dir argument (non-empty string)
+ *   2. DDSTORE_HANDSHAKE_DIR environment variable
+ *   3. "./ddstore_hs" (current working directory fallback)
+ *
+ * The resolved directory must be on a shared filesystem (e.g. Lustre)
+ * visible to all nodes.  It is created automatically if it does not exist.
+ *
+ * Default poll timeout: DDSTORE_HANDSHAKE_TIMEOUT_S env var, default 300 s.
+ * Poll interval: 50 ms.
+ * ========================================================================= */
+
+/* Resolve the handshake directory.
+ * Returns a pointer to a static buffer — copy before next call.             */
+const char *resolve_handshake_dir(const char *user_dir)
+{
+    static char resolved[4096];
+
+    if (user_dir && user_dir[0] != '\0')
+    {
+        snprintf(resolved, sizeof(resolved), "%s", user_dir);
+    }
+    else
+    {
+        const char *env = getenv("DDSTORE_HANDSHAKE_DIR");
+        if (env && env[0] != '\0')
+            snprintf(resolved, sizeof(resolved), "%s", env);
+        else
+            snprintf(resolved, sizeof(resolved), "./ddstore_hs");
+    }
+
+    /* Create the directory if it does not exist (best-effort; ignore EEXIST). */
+    mkdir(resolved, 0755);
+
+    return resolved;
+}
+
+/* Build the canonical path for rank i's record file into `buf`.             */
+static void record_path(char *buf, size_t bufsz,
+                        const char *dir, const char *varname, int rank)
+{
+    snprintf(buf, bufsz, "%s/%s_rank%d.bin", dir, varname, rank);
+}
+
+/* Return the configured timeout in seconds (default 300).                   */
+static int handshake_timeout_s(void)
+{
+    const char *env = getenv("DDSTORE_HANDSHAKE_TIMEOUT_S");
+    if (env) return atoi(env);
+    return 300;
+}
+
+/* --------------------------------------------------------------------------
+ * handshake_write()
+ *
+ * Called by each core rank after init_fabric() and fi_mr_reg().
+ * Writes a CoreRecord to {resolved_dir}/{varname}_rank{rank}.bin.
+ * The directory is resolved via resolve_handshake_dir().
+ * -------------------------------------------------------------------------- */
+int handshake_write(struct fabric_state *fs,
+                    const char *dir, const char *varname, int rank,
+                    long nrows, int disp, int itemsize)
+{
+    const char *rdir = resolve_handshake_dir(dir);
+
+    /* Build the CoreRecord for this rank. */
+    struct CoreRecord rec;
+    memset(&rec, 0, sizeof(rec));
+
+    rec.fabric_address_len = DP_AV_DEF_SIZE;
+    int status = fi_getname((fid_t)fs->signal,
+                            rec.fabric_address, &rec.fabric_address_len);
+    if (status != FI_SUCCESS)
+    {
+        fprintf(stderr, "[handshake_write] fi_getname failed: %s\n",
+                fi_strerror(status));
+        return 1;
+    }
+
+    rec.key          = fs->key;
+    rec.base_address = (uint64_t)(uintptr_t)fs->send_data;
+    rec.nrows        = nrows;
+    rec.disp         = disp;
+    rec.itemsize     = itemsize;
+
+    /* Write to a temp file first, fsync, then atomically rename into place
+     * so readers polling the final path never observe a partially-written
+     * or truncated-then-being-rewritten record.                            */
+    char bin_path[4096];
+    char tmp_path[4096 + 32];
+    record_path(bin_path, sizeof(bin_path), rdir, varname, rank);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f)
+    {
+        fprintf(stderr, "[handshake_write] cannot open %s: ", tmp_path);
+        perror("");
+        return 1;
+    }
+    if (fwrite(&rec, sizeof(rec), 1, f) != 1)
+    {
+        fprintf(stderr, "[handshake_write] fwrite failed for %s\n", tmp_path);
+        fclose(f);
+        unlink(tmp_path);
+        return 1;
+    }
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0)
+    {
+        fprintf(stderr, "[handshake_write] fsync failed for %s: ", tmp_path);
+        perror("");
+        fclose(f);
+        unlink(tmp_path);
+        return 1;
+    }
+    fclose(f);
+
+    if (rename(tmp_path, bin_path) != 0)
+    {
+        fprintf(stderr, "[handshake_write] rename %s -> %s failed: ", tmp_path, bin_path);
+        perror("");
+        unlink(tmp_path);
+        return 1;
+    }
+
+    fprintf(stderr, "[handshake_write] rank %d wrote %s\n", rank, bin_path);
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * handshake_read()
+ *
+ * Called by each core rank after handshake_write().
+ * Polls until all n_core record files are present in the resolved directory,
+ * then reads them and populates:
+ *   fs->comm_partner[0..n_core-1]   (fi_addr_t, via fi_av_insert)
+ *   fs->remote_key[0..n_core-1]
+ *   fs->remote_address[0..n_core-1]
+ *   lenlist[0..n_core-1]            (raw nrows, NOT prefix-summed)
+ *   *out_disp, *out_itemsize        (from rank-0 record; assumed uniform)
+ *
+ * Returns 0 on success, non-zero on error or timeout.
+ * -------------------------------------------------------------------------- */
+int handshake_read(struct fabric_state *fs,
+                   const char *dir, const char *varname,
+                   int n_core, int my_rank,
+                   long *lenlist, int *out_disp, int *out_itemsize)
+{
+    const char *rdir = resolve_handshake_dir(dir);
+    int timeout_s = handshake_timeout_s();
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+    /* Allocate arrays sized for n_core peers. */
+    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
+    {
+        fprintf(stderr, "[handshake_read] malloc failed\n");
+        return 1;
+    }
+
+    /* Poll until all n_core files are fully written (size == sizeof CoreRecord). */
+    for (;;)
+    {
+        int ready = 0;
+        for (int i = 0; i < n_core; i++)
+        {
+            char path[4096];
+            record_path(path, sizeof(path), rdir, varname, i);
+            struct stat st;
+            if (stat(path, &st) == 0 &&
+                st.st_size == (off_t)sizeof(struct CoreRecord))
+                ready++;
+        }
+        if (ready == n_core)
+            break;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        double elapsed = (ts_now.tv_sec  - ts_start.tv_sec) +
+                         (ts_now.tv_nsec - ts_start.tv_nsec) * 1e-9;
+        if (elapsed > timeout_s)
+        {
+            fprintf(stderr,
+                    "[handshake_read] timeout after %.0f s waiting for "
+                    "%d/%d core records (var=%s, dir=%s)\n",
+                    elapsed, ready, n_core, varname, rdir);
+            return 1;
+        }
+        usleep(50000); /* 50 ms */
+    }
+
+    /* Read all records. */
+    for (int i = 0; i < n_core; i++)
+    {
+        char path[4096];
+        record_path(path, sizeof(path), rdir, varname, i);
+
+        FILE *f = fopen(path, "rb");
+        if (!f)
+        {
+            fprintf(stderr, "[handshake_read] cannot open %s: ", path);
+            perror("");
+            return 1;
+        }
+
+        struct CoreRecord rec;
+        if (fread(&rec, sizeof(rec), 1, f) != 1)
+        {
+            fprintf(stderr, "[handshake_read] fread failed for %s\n", path);
+            fclose(f);
+            return 1;
+        }
+        fclose(f);
+
+        /* Insert fabric address into the address vector. */
+        int rc = fi_av_insert(fs->av,
+                              rec.fabric_address, 1,
+                              &fs->comm_partner[i], 0, NULL);
+        if (rc != 1)
+        {
+            fprintf(stderr,
+                    "[handshake_read] fi_av_insert failed for rank %d (rc=%d)\n",
+                    i, rc);
+            return 1;
+        }
+
+        fs->remote_key[i]     = rec.key;
+        fs->remote_address[i] = rec.base_address;
+        lenlist[i]            = rec.nrows;
+
+        if (i == 0)
+        {
+            if (out_disp)     *out_disp     = rec.disp;
+            if (out_itemsize) *out_itemsize = rec.itemsize;
+        }
+    }
+
+    fs->world_size = n_core;
+    (void)my_rank;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * handshake_join()
+ *
+ * Called by extra members (no MPI, no data to publish).
+ * Identical to handshake_read() except it never writes anything.
+ * Blocks until all n_core record files are present (or timeout).
+ * -------------------------------------------------------------------------- */
+int handshake_join(struct fabric_state *fs,
+                   const char *dir, const char *varname,
+                   int n_core,
+                   long *lenlist, int *out_disp, int *out_itemsize)
+{
+    return handshake_read(fs, dir, varname, n_core, -1,
+                          lenlist, out_disp, out_itemsize);
 }

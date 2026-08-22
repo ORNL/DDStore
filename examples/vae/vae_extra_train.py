@@ -1,8 +1,30 @@
+"""
+VAE example — extra (read-only) group.
+
+Trains the VAE model using data it never loads itself: every batch is read
+over RDMA from a core group (see vae_core_server.py) via DDStore method=2's
+file-based handshake. The extra ranks form their own DDP process group
+among themselves, entirely separate from the core group's communicator.
+
+Usage:
+  srun -n<n_extra> python examples/vae/vae_extra_train.py \\
+      --handshake-dir ddstore_hs --n-core 4 --epochs 10
+
+Environment (used as defaults if the matching --flag is not given):
+  DDSTORE_HANDSHAKE_DIR       shared handshake directory
+  DDSTORE_N_CORE              number of core ranks that published the data
+  DDSTORE_HANDSHAKE_TIMEOUT_S poll timeout in seconds (default: 300)
+"""
+
+from __future__ import print_function
+
+import argparse
+import os
+
 ## torch (and the RCCL/HIP shared libraries it pulls in) must finish loading
 ## before mpi4py triggers MPI_Init, or their static destructors run in the
 ## wrong order at interpreter exit and corrupt the heap.
 ## Do not reorder these imports.
-import argparse
 import torch
 import torch.utils.data
 from torch import optim
@@ -16,13 +38,11 @@ mpi4py.rc.thread_level = "serialized"
 mpi4py.rc.threads = False
 from mpi4py import MPI
 
-import distdataset
-from distdataset import DistDataset
-
 from ddp_utils import setup_ddp
+from distdataset import DistDatasetReader
 from vae_model import VAE, loss_function
 
-parser = argparse.ArgumentParser(description="VAE MNIST Example")
+parser = argparse.ArgumentParser(description="VAE MNIST Example - extra (reader) group")
 parser.add_argument(
     "--batch-size",
     type=int,
@@ -53,6 +73,18 @@ parser.add_argument(
     metavar="N",
     help="how many batches to wait before logging training status",
 )
+parser.add_argument(
+    "--handshake-dir",
+    type=str,
+    default=os.environ.get("DDSTORE_HANDSHAKE_DIR", "./ddstore_hs"),
+    help="shared directory published by vae_core_server.py",
+)
+parser.add_argument(
+    "--n-core",
+    type=int,
+    default=int(os.environ.get("DDSTORE_N_CORE", "4")),
+    help="number of core ranks that published the data",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -66,7 +98,6 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-comm = MPI.COMM_WORLD
 comm_size, rank = setup_ddp()
 print("DDP setup:", comm_size, rank, device)
 
@@ -74,17 +105,9 @@ model = VAE().to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-# kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
-# kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
 
-trainset = DistDataset(
-    datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
-    "train",
-    comm,
-)
-# trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
-comm.Barrier()
+trainset = DistDatasetReader("train", args.handshake_dir, args.n_core)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
 train_loader = torch.utils.data.DataLoader(
@@ -105,20 +128,13 @@ def train(epoch):
     train_loader.dataset.ddstore.epoch_begin()
     for batch_idx, (data, _) in enumerate(train_loader):
         train_loader.dataset.ddstore.epoch_end()
-        # print(rank, device)
         data = data.to(device)
-        # print(rank, "data")
         optimizer.zero_grad()
-        # print(rank, "optim")
         recon_batch, mu, logvar = model(data)
         loss = loss_function(recon_batch, data, mu, logvar)
-        # print(rank, "loss:", loss)
         loss.backward()
-        # print(rank, "train_loss")
         train_loss += loss.item()
-        # print(rank, "backward")
         optimizer.step()
-        # print(rank, "step")
         if batch_idx % args.log_interval == 0:
             print(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
@@ -155,7 +171,7 @@ def test(epoch):
                 )
                 save_image(
                     comparison.cpu(),
-                    "results/reconstruction_" + str(epoch) + ".png",
+                    "results/extra_reconstruction_" + str(epoch) + ".png",
                     nrow=n,
                 )
 
@@ -164,7 +180,6 @@ def test(epoch):
 
 
 if __name__ == "__main__":
-    # print("main", rank)
     for epoch in range(1, args.epochs + 1):
         train(epoch)
         test(epoch)
@@ -172,7 +187,14 @@ if __name__ == "__main__":
             sample = torch.randn(64, 20).to(device)
             sample = model.module.decode(sample).cpu()
             save_image(
-                sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
+                sample.view(64, 1, 28, 28),
+                "results/extra_sample_" + str(epoch) + ".png",
             )
+
+    if rank == 0:
+        sentinel = os.path.join(args.handshake_dir, "done_extra")
+        with open(sentinel, "w") as f:
+            f.write("done\n")
+        print("[extra] sentinel written, exiting", flush=True)
 
     dist.destroy_process_group()

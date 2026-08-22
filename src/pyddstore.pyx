@@ -37,6 +37,11 @@ cdef extern from "ddstore.hpp":
         DDStore()
         DDStore(libmpi.MPI_Comm comm)
         DDStore(int method, libmpi.MPI_Comm comm)
+        # Method 2: core member (with MPI communicator; n_core == comm size)
+        DDStore(int method, libmpi.MPI_Comm comm,
+                string handshake_dir)
+        # Method 2: extra member (no MPI communicator)
+        DDStore(int method, string handshake_dir, int n_core)
         void add[T](string name, T* buffer, long nrows, int disp) except +
         void get[T](string name, long start, long count, T* buffer) except +
         void epoch_begin()
@@ -44,6 +49,9 @@ cdef extern from "ddstore.hpp":
         void free()
         void init(string name, long nrows, int disp, int itemsize) except +
         void update[T](string name, T* buffer, long nrows, long offset) except +
+        void join(string name) except +
+        void query(string name, VarInfo &varinfo) except +
+        long size(string name) except +
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -52,12 +60,49 @@ cdef class PyDDstoreVarinfo:
         pass
 
 cdef class PyDDStore:
-    cdef DDStore c_ddstore
+    cdef DDStore *c_ddstore
 
-    def __cinit__(self, MPI.Comm comm, int method = 0):
-        # print("PyDDStore init method:", method)
-        self.c_ddstore = DDStore(method, comm.ob_mpi)
-    
+    def __cinit__(self, comm_or_none=None, int method=0,
+                  str handshake_dir="", int n_core=0):
+        """
+        Constructors:
+          PyDDStore(comm)                          — method 0, MPI
+          PyDDStore(comm, method=1)                — method 1, libfabric+MPI
+          PyDDStore(comm, method=2,                — method 2, core member
+                    handshake_dir="/path")            (n_core == comm size)
+          PyDDStore(None, method=2,                — method 2, extra member
+                    handshake_dir="/path", n_core=N)
+        """
+        cdef MPI.Comm mpi_comm
+        if method == 2:
+            if not handshake_dir:
+                raise ValueError(
+                    "method=2 requires handshake_dir (got handshake_dir=%r)"
+                    % handshake_dir)
+            if comm_or_none is None:
+                # Extra member: no MPI communicator, n_core must be given
+                if n_core <= 0:
+                    raise ValueError(
+                        "method=2 extra member requires n_core > 0 "
+                        "(got n_core=%d)" % n_core)
+                self.c_ddstore = new DDStore(method,
+                                             s2b(handshake_dir), n_core)
+            else:
+                # Core member with file-based handshake; n_core is derived
+                # from the communicator size.
+                mpi_comm = comm_or_none
+                self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi,
+                                             s2b(handshake_dir))
+        else:
+            # Methods 0 and 1: standard MPI constructor
+            mpi_comm = comm_or_none
+            self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi)
+
+    def __dealloc__(self):
+        if self.c_ddstore != NULL:
+            del self.c_ddstore
+            self.c_ddstore = NULL
+
     def add(self, str name, np.ndarray arr):
         assert arr.flags.c_contiguous
         cdef long nrows = arr.shape[0]
@@ -125,3 +170,14 @@ cdef class PyDDStore:
             self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
         else:
             raise NotImplementedError
+
+    def join(self, str name):
+        """Method 2 extra member: discover variable published by core members."""
+        self.c_ddstore.join(s2b(name))
+
+    def info(self, str name):
+        """Return (total_rows, disp, itemsize) for an added or joined variable."""
+        cdef VarInfo vi
+        self.c_ddstore.query(s2b(name), vi)
+        total_rows = self.c_ddstore.size(s2b(name))
+        return (total_rows, vi.disp, vi.itemsize)

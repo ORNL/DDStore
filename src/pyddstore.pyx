@@ -6,6 +6,8 @@ import mpi4py.MPI as MPI
 cimport mpi4py.MPI as MPI
 cimport mpi4py.libmpi as libmpi
 
+import cpu_nic_map
+
 import numpy as np
 cimport numpy as np
 
@@ -63,7 +65,7 @@ cdef class PyDDStore:
     cdef DDStore *c_ddstore
 
     def __cinit__(self, comm_or_none=None, int method=0,
-                  str handshake_dir="", int n_core=0):
+                  str handshake_dir="", int n_core=0, nic_map=None):
         """
         Constructors:
           PyDDStore(comm)                          — method 0, MPI
@@ -72,8 +74,16 @@ cdef class PyDDStore:
                     handshake_dir="/path")            (n_core == comm size)
           PyDDStore(None, method=2,                — method 2, extra member
                     handshake_dir="/path", n_core=N)
+
+        nic_map: optional precomputed CPU->NIC map string (see
+          cpu_nic_map.py --env) used to select FABRIC_IFACE for this rank's
+          CPU affinity, for method=1/2. Takes priority over the
+          DDSTORE_NIC_MAP env var. Only used if FABRIC_IFACE isn't already
+          set in the environment.
         """
         cdef MPI.Comm mpi_comm
+        if method != 0:
+            cpu_nic_map.select_fabric_iface(nic_map=nic_map)
         if method == 2:
             if not handshake_dir:
                 raise ValueError(

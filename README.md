@@ -71,7 +71,7 @@ mpirun -n 4 python my_script.py
 
 ## API Reference
 
-### `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0)`
+### `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None)`
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -79,6 +79,7 @@ mpirun -n 4 python my_script.py
 | `method` | `int` | `0` = MPI RMA (default), `1` = libfabric RDMA, `2` = file-based handshake (see [below](#file-based-handshake-method2)) |
 | `handshake_dir` | `str` | Required for `method=2`: shared-filesystem directory used to exchange RDMA addresses |
 | `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data |
+| `nic_map` | `str` or `None` | Optional, `method=1`/`2` only: a precomputed CPU→NIC map string (see [`DDSTORE_NIC_MAP`](#libfabric-rdma-method1) below) to use instead of the environment variable. Ignored if `FABRIC_IFACE` is already set |
 
 Four call shapes:
 
@@ -177,10 +178,19 @@ Uses `MPI_Win_create` and `MPI_Get` for one-sided remote reads. Works on any MPI
 
 Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband/verbs, Cray GNI, Intel PSM2). Lower latency than MPI RMA on supported hardware. `epoch_begin`/`epoch_end` are no-ops with this backend.
 
-Set `FABRIC_IFACE` to select a specific network interface when the automatic selection picks the wrong one:
-```bash
-export FABRIC_IFACE=hsn0   # e.g. Cray Slingshot
-```
+`PyDDStore` picks the network interface (`FABRIC_IFACE`) automatically for `method=1`/`2`, based on each rank's real CPU affinity (`os.sched_getaffinity`) — no changes needed in your code:
+
+- **`DDSTORE_NIC_MAP`** — a precomputed CPU→NIC map, used directly if set (no NIC discovery at construction time). Generate it once from a context with reliable NIC visibility, e.g. an `sbatch` batch step's own shell (not a nested `srun` task — NIC/PCI discovery has been observed to fail there), and export it before launching ranks so every one inherits it:
+  ```bash
+  export DDSTORE_NIC_MAP=$(python3 -m cpu_nic_map --env)
+  srun ... python train.py
+  ```
+- If `DDSTORE_NIC_MAP` isn't set, each rank falls back to a live `hwloc-calc`/`lstopo` query against its own CPU affinity (`cpu_nic_map.allocated_nics()`, also runnable standalone as `python3 cpu_nic_map.py --allocated`) to find the nearest NIC.
+- Set `FABRIC_IFACE` explicitly to override both and force a specific interface, e.g. when the automatic selection picks the wrong one:
+  ```bash
+  export FABRIC_IFACE=hsn0   # e.g. Cray Slingshot
+  ```
+- Or skip the environment entirely and pass a map straight to the constructor: `PyDDStore(comm, method=1, nic_map="hsn0=0-15,64-79;hsn1=...")`.
 
 ### File-based handshake (`method=2`)
 
@@ -210,6 +220,7 @@ Environment variables:
 |---|---|---|
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | Shared directory for handshake record files |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds to poll for core records / a join before raising a timeout |
+| `DDSTORE_NIC_MAP` | unset | CPU→NIC map for `FABRIC_IFACE` auto-selection — see [libfabric RDMA](#libfabric-rdma-method1) above |
 
 See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_extra.py](test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) for a full DDP training example using this split.
 

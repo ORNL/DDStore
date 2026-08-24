@@ -13,6 +13,10 @@ Usage:
 Environment:
   DDSTORE_HANDSHAKE_DIR       overrides handshake_dir positional arg
   DDSTORE_HANDSHAKE_TIMEOUT_S poll timeout in seconds (default: 300)
+  DDSTORE_NIC_MAP             optional precomputed CPU->NIC map (see
+                               cpu_nic_map.py --env) for FABRIC_IFACE
+                               auto-selection; falls back to a live
+                               hwloc-calc query if unset
 """
 
 import os

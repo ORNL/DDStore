@@ -33,10 +33,7 @@ class DistDataset(Dataset):
         self.ddstore_comm_size = self.ddstore_comm.Get_size()
 
         ddstore_method = int(os.getenv("DDSTORE_METHOD", "0"))
-        gpu_id = int(os.getenv("SLURM_LOCALID", "0"))
-        os.environ["FABRIC_IFACE"] = f"hsn{gpu_id//2}"
         print("DDStore method:", ddstore_method)
-        print("FABRIC_IFACE:", os.environ["FABRIC_IFACE"])
         handshake_dir = os.getenv("DDSTORE_HANDSHAKE_DIR", "./ddstore_hs")
 
         if ddstore_method == 2 and self.ddstore_width != self.comm_size:
@@ -52,6 +49,7 @@ class DistDataset(Dataset):
         self.ddstore = dds.PyDDStore(
             self.ddstore_comm, method=ddstore_method, handshake_dir=handshake_dir
         )
+        print("FABRIC_IFACE:", os.environ.get("FABRIC_IFACE", "n/a (method=0)"))
 
         ## set total before set subset
         self.total_ns = len(data)
@@ -128,6 +126,7 @@ class DistDatasetReader(Dataset):
         self.ddstore = dds.PyDDStore(
             None, method=2, handshake_dir=handshake_dir, n_core=n_core
         )
+        print("FABRIC_IFACE:", os.environ.get("FABRIC_IFACE", "n/a"))
         self.ddstore.join(f"{label}data")
         self.ddstore.join(f"{label}labels")
 

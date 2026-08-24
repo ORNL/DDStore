@@ -46,5 +46,7 @@ setup(
     name="PyDDStore",
     version="0.1",
     description="Distributed Data Store",
+    package_dir={"": "src"},
+    py_modules=["cpu_nic_map"],
     ext_modules=cythonize(extensions)
 )

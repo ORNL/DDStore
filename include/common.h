@@ -10,9 +10,11 @@
 #define COMM_FILE_WRITER_TO_READER "./writer_address.bin"
 
 /* -----------------------------------------------------------------------
- * Method 2: file-based handshake record written by each core rank.
- * One file per variable per core rank:
- *   {handshake_dir}/{varname}_rank{rank}.bin
+ * Method 2: file-based handshake record, one per core rank.
+ * All n_core records for a variable are gathered in memory (via MPI among
+ * core ranks) and published as a single combined file, written once by
+ * core rank 0:
+ *   {handshake_dir}/{varname}.bin
  * ----------------------------------------------------------------------- */
 struct CoreRecord
 {
@@ -71,23 +73,23 @@ extern "C"
      * Returns pointer to a static buffer — copy if needed across calls.     */
     const char *resolve_handshake_dir(const char *user_dir);
 
-    /* Core rank: write own CoreRecord to {dir}/{varname}_rank{rank}.bin.
-     * Uses write-to-tmp + rename for atomicity.                              */
-    int handshake_write(struct fabric_state *fs,
-                        const char *dir, const char *varname, int rank,
-                        long nrows, int disp, int itemsize);
+    /* Core rank: exchange CoreRecords with all other core ranks via
+     * MPI_Allgather over `comm` (no filesystem round-trip needed for
+     * core-to-core discovery), populate this rank's fs->comm_partner[],
+     * remote_key[], remote_address[], and fill lenlist[0..n_core-1] (raw
+     * row counts, NOT yet prefix-summed).  Rank 0 additionally publishes
+     * the combined record set to {dir}/{varname}.bin (tmp + fsync + rename)
+     * so extra members can join later.                                       */
+    int handshake_write(struct fabric_state *fs, MPI_Comm comm,
+                        const char *dir, const char *varname,
+                        int n_core, long nrows, int disp, int itemsize,
+                        long *lenlist);
 
-    /* Core rank: poll until all n_core record files are present, then read
-     * them all and populate fs->comm_partner[], remote_key[],
-     * remote_address[], and fill lenlist[0..n_core-1] (raw row counts,
-     * NOT yet prefix-summed).  Also sets *out_disp and *out_itemsize.        */
-    int handshake_read(struct fabric_state *fs,
-                       const char *dir, const char *varname,
-                       int n_core, int my_rank,
-                       long *lenlist, int *out_disp, int *out_itemsize);
-
-    /* Extra member: same as handshake_read but does NOT write anything.
-     * Blocks until all n_core files appear (with timeout).                   */
+    /* Extra member: poll for {dir}/{varname}.bin (single file holding all
+     * n_core CoreRecords), read it, and populate this process's
+     * fs->comm_partner[], remote_key[], remote_address[], and
+     * lenlist[0..n_core-1] (raw row counts, NOT yet prefix-summed).  Does
+     * NOT write anything.  Blocks until the file appears (with timeout).     */
     int handshake_join(struct fabric_state *fs,
                        const char *dir, const char *varname,
                        int n_core,

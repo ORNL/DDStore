@@ -31,6 +31,21 @@ def init_comm_size_and_rank():
     return int(world_size), int(world_rank)
 
 
+def get_local_rank(rank):
+    """
+    Determine which GPU on the local node this rank should use.
+    Falls back to rank % device_count when no launcher-provided local rank
+    is available (e.g. plain mpirun without per-rank GPU visibility).
+    """
+    if os.getenv("OMPI_COMM_WORLD_LOCAL_RANK") is not None:
+        return int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+    elif os.getenv("SLURM_LOCALID") is not None:
+        return int(os.environ["SLURM_LOCALID"])
+    elif torch.cuda.is_available() and torch.cuda.device_count() > 0:
+        return rank % torch.cuda.device_count()
+    return 0
+
+
 def find_ifname(myaddr):
     """
     Find socket ifname for a given ip adress. This is for "GLOO" ddp setup.

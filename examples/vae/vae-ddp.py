@@ -3,6 +3,7 @@
 ## wrong order at interpreter exit and corrupt the heap.
 ## Do not reorder these imports.
 import argparse
+import os
 import torch
 import torch.utils.data
 from torch import optim
@@ -19,7 +20,7 @@ from mpi4py import MPI
 import distdataset
 from distdataset import DistDataset
 
-from ddp_utils import setup_ddp
+from ddp_utils import setup_ddp, get_local_rank
 from vae_model import VAE, loss_function
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example")
@@ -59,19 +60,31 @@ use_mps = not args.no_mps and torch.backends.mps.is_available()
 
 torch.manual_seed(args.seed)
 
+comm = MPI.COMM_WORLD
+comm_size, rank = setup_ddp()
+
 if args.cuda:
-    device = torch.device("cuda")
+    local_rank = get_local_rank(rank)
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
 elif use_mps:
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
 
-comm = MPI.COMM_WORLD
-comm_size, rank = setup_ddp()
 print("DDP setup:", comm_size, rank, device)
 
+if rank == 0:
+    os.makedirs("results", exist_ok=True)
+comm.Barrier()
+
 model = VAE().to(device)
-model = torch.nn.parallel.DistributedDataParallel(model)
+if args.cuda:
+    model = torch.nn.parallel.DistributedDataParallel(
+        model, device_ids=[local_rank], output_device=local_rank
+    )
+else:
+    model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
@@ -133,11 +146,12 @@ def train(epoch):
         train_loader.dataset.ddstore.epoch_begin()
 
     train_loader.dataset.ddstore.epoch_end()
-    print(
-        "====> Epoch: {} Average loss: {:.4f}".format(
-            epoch, train_loss / len(train_loader.dataset)
+    if rank == 0:
+        print(
+            "====> Epoch: {} Average loss: {:.4f}".format(
+                epoch, train_loss / len(train_loader.dataset)
+            )
         )
-    )
 
 
 def test(epoch):
@@ -167,12 +181,13 @@ if __name__ == "__main__":
     # print("main", rank)
     for epoch in range(1, args.epochs + 1):
         train(epoch)
-        test(epoch)
-        with torch.no_grad():
-            sample = torch.randn(64, 20).to(device)
-            sample = model.module.decode(sample).cpu()
-            save_image(
-                sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
-            )
+        if rank == 0:
+            test(epoch)
+            with torch.no_grad():
+                sample = torch.randn(64, 20).to(device)
+                sample = model.module.decode(sample).cpu()
+                save_image(
+                    sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
+                )
 
     dist.destroy_process_group()

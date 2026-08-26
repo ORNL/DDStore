@@ -14,7 +14,7 @@ Three layers, one file:
 Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
 Perlmutter alike -- there is no per-system glob pattern to choose. Perlmutter
 just exposes each hsnN NIC's libfabric domain under a different name (cxiN);
-pass --provider cxi (or set DDSTORE_FABRIC=cxi) to see that
+pass --fabric cxi (or set DDSTORE_FABRIC=cxi) to see that
 translated name instead of the raw kernel one.
 
 CLI:
@@ -22,7 +22,7 @@ CLI:
   cpu_nic_map.py 42              print only the nearest HSN NIC for cpu 42
   cpu_nic_map.py --env           print the compact DDSTORE_NIC_MAP env-var value
   cpu_nic_map.py --allocated     print this process's allocated CPUs and nearest NIC(s)
-  cpu_nic_map.py --env --provider cxi   show the Perlmutter-translated (cxiN) names
+  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names
 
   export DDSTORE_NIC_MAP=$(python3 cpu_nic_map.py --env)
   srun --threads-per-core=2 -n8 -c14 python cpu_nic_map.py --allocated
@@ -260,7 +260,7 @@ def main():
             "  cpu_nic_map.py 42        print only the nearest HSN NIC for cpu 42\n"
             "  export DDSTORE_NIC_MAP=$(cpu_nic_map.py --env)   compute once, share via env\n"
             "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
-            "  cpu_nic_map.py --env --provider cxi   show the Perlmutter-translated (cxiN) names\n"
+            "  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names\n"
         ),
     )
     parser.add_argument(
@@ -270,10 +270,10 @@ def main():
         help="CPU (PU) id to look up; omit to print the full table",
     )
     parser.add_argument(
-        "--provider",
+        "--fabric",
         default=os.environ.get("DDSTORE_FABRIC", "hsn"),
         choices=["hsn", "cxi"],
-        help="translate printed NIC names to this provider's libfabric "
+        help="translate printed NIC names to this fabric's libfabric "
         "domain name (default: $DDSTORE_FABRIC, or hsn if unset) "
         "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN (Perlmutter)",
     )
@@ -291,12 +291,12 @@ def main():
     args = parser.parse_args()
 
     if args.env:
-        print(serialize_env(provider=args.provider))
+        print(serialize_env(provider=args.fabric))
         return
 
     if args.allocated:
         allocated, nics = allocated_nics()
-        nics = {translate_iface(n, args.provider) for n in nics}
+        nics = {translate_iface(n, args.fabric) for n in nics}
         print(f"allocated CPUs: {allocated}")
         print(f"nearest NIC(s): {sorted(nics)}")
         return
@@ -309,13 +309,13 @@ def main():
                 f"cpu id {args.cpu} not found (valid range: {min(all_pus)}-{max(all_pus)})"
             )
         owner, exact, numa = nearest(args.cpu)
-        print(translate_iface(owner, args.provider))
+        print(translate_iface(owner, args.fabric))
         return
 
     print(f"{'CPU':>4}  {'NUMA':>4}  {'nearest NIC':>11}  exact")
     for pu in all_pus:
         owner, exact, numa = nearest(pu)
-        owner = translate_iface(owner, args.provider)
+        owner = translate_iface(owner, args.fabric)
         print(f"{pu:>4}  {numa!s:>4}  {owner:>11}  {exact}")
 
 

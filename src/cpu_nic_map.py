@@ -109,11 +109,23 @@ def compress_ranges(values):
     return ",".join(out)
 
 
-def serialize_env(pattern="hsn*"):
+def translate_iface(name, provider="hsn"):
+    """Translate a kernel NIC name (hsnN) to the libfabric domain name for
+    `provider`. 'cxi' -> cxiN (Perlmutter exposes hsnN's libfabric domain
+    under this name); 'hsn' (default) or anything else -> unchanged."""
+    if provider == "cxi":
+        m = re.match(r"hsn(\d+)$", name)
+        if m:
+            return f"cxi{m.group(1)}"
+    return name
+
+
+def serialize_env(pattern="hsn*", provider="hsn"):
     all_pus, nearest = build_map(pattern)
     by_nic = {}
     for pu in all_pus:
-        by_nic.setdefault(nearest(pu)[0], []).append(pu)
+        nic = translate_iface(nearest(pu)[0], provider)
+        by_nic.setdefault(nic, []).append(pu)
     return ";".join(
         f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
     )
@@ -189,9 +201,9 @@ def select_fabric_iface(nic_map=None):
     if "FABRIC_IFACE" in os.environ:
         iface = os.environ["FABRIC_IFACE"]
         if use_cxi:
-            m = re.match(r"hsn(\d+)$", iface)
-            if m:
-                iface = f"cxi{m.group(1)}"
+            translated = translate_iface(iface, "cxi")
+            if translated != iface:
+                iface = translated
                 os.environ["FABRIC_IFACE"] = iface
         return iface
 
@@ -211,8 +223,7 @@ def select_fabric_iface(nic_map=None):
                 )
             local_rank = int(os.environ.get("SLURM_LOCALID", 0))
             hsn = cxi_domains[local_rank % len(cxi_domains)]
-            m = re.match(r"hsn(\d+)$", hsn)
-            iface = f"cxi{m.group(1)}" if m else hsn
+            iface = translate_iface(hsn, "cxi")
             print(f"FABRIC_IFACE: fallback (SLURM_LOCALID={local_rank}) -> {iface}")
             os.environ["FABRIC_IFACE"] = iface
             return iface
@@ -226,9 +237,7 @@ def select_fabric_iface(nic_map=None):
         print(f"FABRIC_IFACE: affinity spans {sorted(nics)}, picking {iface}")
 
     if use_cxi:
-        m = re.match(r"hsn(\d+)$", iface)
-        if m:
-            iface = f"cxi{m.group(1)}"
+        iface = translate_iface(iface, "cxi")
 
     os.environ["FABRIC_IFACE"] = iface
     return iface
@@ -246,6 +255,7 @@ def main():
             "  cpu_nic_map.py -p 'ens*' 0   match a different NIC name pattern\n"
             "  export DDSTORE_NIC_MAP=$(cpu_nic_map.py --env)   compute once, share via env\n"
             "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
+            "  cpu_nic_map.py --env --provider cxi   show the Perlmutter-translated (cxiN) names\n"
         ),
     )
     parser.add_argument(
@@ -258,7 +268,17 @@ def main():
         "-p",
         "--pattern",
         default="hsn*",
-        help="glob pattern for NIC names to consider (default: hsn*)",
+        help="glob pattern for kernel NIC names to consider (default: hsn*) "
+        "-- always hsn*, on Frontier and Perlmutter alike; see --provider "
+        "to see the libfabric domain name a given system will actually use",
+    )
+    parser.add_argument(
+        "--provider",
+        default=os.environ.get("DDSTORE_FABRIC_PROVIDER", "hsn"),
+        choices=["hsn", "cxi"],
+        help="translate printed NIC names to this provider's libfabric "
+        "domain name (default: $DDSTORE_FABRIC_PROVIDER, or hsn if unset) "
+        "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN (Perlmutter)",
     )
     parser.add_argument(
         "--env",
@@ -274,11 +294,12 @@ def main():
     args = parser.parse_args()
 
     if args.env:
-        print(serialize_env(args.pattern))
+        print(serialize_env(args.pattern, provider=args.provider))
         return
 
     if args.allocated:
         allocated, nics = allocated_nics(args.pattern)
+        nics = {translate_iface(n, args.provider) for n in nics}
         print(f"allocated CPUs: {allocated}")
         print(f"nearest NIC(s): {sorted(nics)}")
         return
@@ -291,12 +312,13 @@ def main():
                 f"cpu id {args.cpu} not found (valid range: {min(all_pus)}-{max(all_pus)})"
             )
         owner, exact, numa = nearest(args.cpu)
-        print(owner)
+        print(translate_iface(owner, args.provider))
         return
 
     print(f"{'CPU':>4}  {'NUMA':>4}  {'nearest NIC':>11}  exact")
     for pu in all_pus:
         owner, exact, numa = nearest(pu)
+        owner = translate_iface(owner, args.provider)
         print(f"{pu:>4}  {numa!s:>4}  {owner:>11}  {exact}")
 
 

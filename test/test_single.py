@@ -3,16 +3,17 @@ Single-rank tests — run with: mpirun -n 1 pytest test/test_single.py -v
 
 No remote memory access; all data is local.
 """
+
 import numpy as np
 import pytest
 from mpi4py import MPI
 
 import pyddstore as dds
 
-
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
 
 def make_store(comm, method=0):
     return dds.PyDDStore(comm, method=method)
@@ -44,9 +45,18 @@ def roundtrip(store, name, data):
 # dtype coverage
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("dtype", [
-    np.int32, np.int64, np.uint8, np.float32, np.float64, np.bool_,
-])
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.float32,
+        np.float64,
+        np.bool_,
+    ],
+)
 def test_add_get_dtypes(comm, dtype):
     store = make_store(comm)
     data = make_data(dtype)
@@ -58,6 +68,7 @@ def test_add_get_dtypes(comm, dtype):
 # ---------------------------------------------------------------------------
 # init / update / get
 # ---------------------------------------------------------------------------
+
 
 def test_init_update_get(comm):
     store = make_store(comm)
@@ -100,6 +111,7 @@ def test_update_partial(comm):
 # multiple variables
 # ---------------------------------------------------------------------------
 
+
 def test_multiple_variables(comm):
     store = make_store(comm)
     a = np.ones((4, 4), dtype=np.float32)
@@ -120,6 +132,7 @@ def test_multiple_variables(comm):
 # ---------------------------------------------------------------------------
 # error cases
 # ---------------------------------------------------------------------------
+
 
 def test_get_out_of_range(comm):
     store = make_store(comm)
@@ -176,6 +189,7 @@ def test_get_wrong_dtype(comm):
 # ---------------------------------------------------------------------------
 # double free safety
 # ---------------------------------------------------------------------------
+
 
 def test_double_free(comm):
     store = make_store(comm)

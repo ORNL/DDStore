@@ -21,6 +21,7 @@ CLI:
   export DDSTORE_NIC_MAP=$(python3 cpu_nic_map.py --env)
   srun --threads-per-core=2 -n8 -c14 python cpu_nic_map.py --allocated
 """
+
 import argparse
 import fnmatch
 import glob
@@ -38,17 +39,25 @@ def hcalc(loc, itype):
     # ids. Without it, hwloc-calc reports logical indices, which silently
     # diverge from real CPU ids whenever core specialization or other
     # exclusions shift the logical numbering (see lstopo's "P#" vs "L#").
-    out = subprocess.run(
-        ["hwloc-calc", "--disallowed", "-p", "-I", itype, loc],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    ).stdout.decode().strip()
+    out = (
+        subprocess.run(
+            ["hwloc-calc", "--disallowed", "-p", "-I", itype, loc],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        .stdout.decode()
+        .strip()
+    )
     return [int(x) for x in out.split(",")] if out else []
 
 
 def build_map(pattern):
-    nics = sorted(os.path.basename(p) for p in glob.glob("/sys/class/net/*")
-                  if os.path.exists(os.path.join(p, "device"))
-                  and fnmatch.fnmatch(os.path.basename(p), pattern))
+    nics = sorted(
+        os.path.basename(p)
+        for p in glob.glob("/sys/class/net/*")
+        if os.path.exists(os.path.join(p, "device"))
+        and fnmatch.fnmatch(os.path.basename(p), pattern)
+    )
     if not nics:
         sys.exit(f"no NICs matching '{pattern}' found under /sys/class/net")
 
@@ -104,7 +113,9 @@ def serialize_env(pattern="hsn*"):
     by_nic = {}
     for pu in all_pus:
         by_nic.setdefault(nearest(pu)[0], []).append(pu)
-    return ";".join(f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items()))
+    return ";".join(
+        f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+    )
 
 
 def parse_env(s):
@@ -182,7 +193,7 @@ def select_fabric_iface(nic_map=None):
 def main():
     parser = argparse.ArgumentParser(
         description="Find the nearest HSN (Slingshot) NIC for a given CPU (PU) id, "
-                     "based on hwloc PCI/NUMA locality.",
+        "based on hwloc PCI/NUMA locality.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
@@ -193,15 +204,29 @@ def main():
             "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
         ),
     )
-    parser.add_argument("cpu", nargs="?", type=int,
-                         help="CPU (PU) id to look up; omit to print the full table")
-    parser.add_argument("-p", "--pattern", default="hsn*",
-                         help="glob pattern for NIC names to consider (default: hsn*)")
-    parser.add_argument("--env", action="store_true",
-                         help="print only the compact DDSTORE_NIC_MAP env-var value")
-    parser.add_argument("--allocated", action="store_true",
-                         help="print this process's allocated CPUs (os.sched_getaffinity) "
-                              "and their nearest NIC(s), instead of the full table")
+    parser.add_argument(
+        "cpu",
+        nargs="?",
+        type=int,
+        help="CPU (PU) id to look up; omit to print the full table",
+    )
+    parser.add_argument(
+        "-p",
+        "--pattern",
+        default="hsn*",
+        help="glob pattern for NIC names to consider (default: hsn*)",
+    )
+    parser.add_argument(
+        "--env",
+        action="store_true",
+        help="print only the compact DDSTORE_NIC_MAP env-var value",
+    )
+    parser.add_argument(
+        "--allocated",
+        action="store_true",
+        help="print this process's allocated CPUs (os.sched_getaffinity) "
+        "and their nearest NIC(s), instead of the full table",
+    )
     args = parser.parse_args()
 
     if args.env:
@@ -218,7 +243,9 @@ def main():
 
     if args.cpu is not None:
         if args.cpu not in all_pus:
-            sys.exit(f"cpu id {args.cpu} not found (valid range: {min(all_pus)}-{max(all_pus)})")
+            sys.exit(
+                f"cpu id {args.cpu} not found (valid range: {min(all_pus)}-{max(all_pus)})"
+            )
         owner, exact, numa = nearest(args.cpu)
         print(owner)
         return

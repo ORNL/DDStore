@@ -11,12 +11,18 @@ Three layers, one file:
   - select_fabric_iface(): called automatically by PyDDStore.__cinit__
     (src/pyddstore.pyx) for method=1/2 to set FABRIC_IFACE if not already set.
 
+Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
+Perlmutter alike -- there is no per-system glob pattern to choose. Perlmutter
+just exposes each hsnN NIC's libfabric domain under a different name (cxiN);
+pass --provider cxi (or set DDSTORE_FABRIC_PROVIDER=cxi) to see that
+translated name instead of the raw kernel one.
+
 CLI:
   cpu_nic_map.py                print the full CPU -> nearest HSN NIC table
   cpu_nic_map.py 42              print only the nearest HSN NIC for cpu 42
-  cpu_nic_map.py -p 'ens*' 0     match a different NIC name pattern
   cpu_nic_map.py --env           print the compact DDSTORE_NIC_MAP env-var value
   cpu_nic_map.py --allocated     print this process's allocated CPUs and nearest NIC(s)
+  cpu_nic_map.py --env --provider cxi   show the Perlmutter-translated (cxiN) names
 
   export DDSTORE_NIC_MAP=$(python3 cpu_nic_map.py --env)
   srun --threads-per-core=2 -n8 -c14 python cpu_nic_map.py --allocated
@@ -252,7 +258,6 @@ def main():
             "examples:\n"
             "  cpu_nic_map.py           print the full CPU -> nearest HSN NIC table\n"
             "  cpu_nic_map.py 42        print only the nearest HSN NIC for cpu 42\n"
-            "  cpu_nic_map.py -p 'ens*' 0   match a different NIC name pattern\n"
             "  export DDSTORE_NIC_MAP=$(cpu_nic_map.py --env)   compute once, share via env\n"
             "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
             "  cpu_nic_map.py --env --provider cxi   show the Perlmutter-translated (cxiN) names\n"
@@ -263,14 +268,6 @@ def main():
         nargs="?",
         type=int,
         help="CPU (PU) id to look up; omit to print the full table",
-    )
-    parser.add_argument(
-        "-p",
-        "--pattern",
-        default="hsn*",
-        help="glob pattern for kernel NIC names to consider (default: hsn*) "
-        "-- always hsn*, on Frontier and Perlmutter alike; see --provider "
-        "to see the libfabric domain name a given system will actually use",
     )
     parser.add_argument(
         "--provider",
@@ -294,17 +291,17 @@ def main():
     args = parser.parse_args()
 
     if args.env:
-        print(serialize_env(args.pattern, provider=args.provider))
+        print(serialize_env(provider=args.provider))
         return
 
     if args.allocated:
-        allocated, nics = allocated_nics(args.pattern)
+        allocated, nics = allocated_nics()
         nics = {translate_iface(n, args.provider) for n in nics}
         print(f"allocated CPUs: {allocated}")
         print(f"nearest NIC(s): {sorted(nics)}")
         return
 
-    all_pus, nearest = build_map(args.pattern)
+    all_pus, nearest = build_map("hsn*")
 
     if args.cpu is not None:
         if args.cpu not in all_pus:

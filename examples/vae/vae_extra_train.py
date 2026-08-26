@@ -28,10 +28,12 @@ import sys
 
 _local_rank = int(os.environ.get("SLURM_LOCALID", 0))
 
-print(f"[startup] SLURM_PROCID={os.environ.get('SLURM_PROCID')} "
-      f"SLURM_LOCALID={_local_rank} "
-      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
-      flush=True)
+print(
+    f"[startup] SLURM_PROCID={os.environ.get('SLURM_PROCID')} "
+    f"SLURM_LOCALID={_local_rank} "
+    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+    flush=True,
+)
 
 ## torch (and the RCCL/HIP shared libraries it pulls in) must finish loading
 ## before mpi4py triggers MPI_Init, or their static destructors run in the

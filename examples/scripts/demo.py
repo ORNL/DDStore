@@ -9,7 +9,6 @@ import argparse
 import pyddstore as dds
 import sys
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -18,8 +17,12 @@ if __name__ == "__main__":
         help="num. of data (default: %(default)s)",
         default=1024 * 1024,
     )
-    parser.add_argument("--dim", type=int, help="dim (default: %(default)s)", default=64)
-    parser.add_argument("--nbatch", type=int, help="nbatch (default: %(default)s)", default=32)
+    parser.add_argument(
+        "--dim", type=int, help="dim (default: %(default)s)", default=64
+    )
+    parser.add_argument(
+        "--nbatch", type=int, help="nbatch (default: %(default)s)", default=32
+    )
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD

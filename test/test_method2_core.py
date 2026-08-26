@@ -35,6 +35,7 @@ import pyddstore as dds
 # configuration — resolve directory with same priority as the C library
 # ---------------------------------------------------------------------------
 
+
 def _resolve_dir(arg):
     if arg:
         return arg
@@ -43,12 +44,17 @@ def _resolve_dir(arg):
         return env
     return "./ddstore_hs"
 
-hs_dir = _resolve_dir(sys.argv[1] if len(sys.argv) > 1 else "")
-n_core = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("DDSTORE_N_CORE", "4"))
 
-comm  = MPI.COMM_WORLD
-rank  = comm.Get_rank()
-size  = comm.Get_size()
+hs_dir = _resolve_dir(sys.argv[1] if len(sys.argv) > 1 else "")
+n_core = (
+    int(sys.argv[2])
+    if len(sys.argv) > 2
+    else int(os.environ.get("DDSTORE_N_CORE", "4"))
+)
+
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
 
 assert size == n_core, f"Expected {n_core} core ranks, got {size}"
 
@@ -70,7 +76,7 @@ comm.Barrier()
 
 nrows = 8
 ncols = 4
-data  = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
+data = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
 
 # ---------------------------------------------------------------------------
 # create DDStore (method=2, core member)

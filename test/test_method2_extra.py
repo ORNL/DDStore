@@ -27,6 +27,7 @@ import pyddstore as dds
 # configuration — resolve directory with same priority as the C library
 # ---------------------------------------------------------------------------
 
+
 def _resolve_dir(arg):
     if arg:
         return arg
@@ -35,8 +36,13 @@ def _resolve_dir(arg):
         return env
     return "./ddstore_hs"
 
+
 hs_dir = _resolve_dir(sys.argv[1] if len(sys.argv) > 1 else "")
-n_core = int(sys.argv[2]) if len(sys.argv) > 2 else int(os.environ.get("DDSTORE_N_CORE", "4"))
+n_core = (
+    int(sys.argv[2])
+    if len(sys.argv) > 2
+    else int(os.environ.get("DDSTORE_N_CORE", "4"))
+)
 
 nrows = 8
 ncols = 4

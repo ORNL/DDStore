@@ -6,10 +6,12 @@ import os, sys
 
 _local_rank = int(os.environ.get("SLURM_LOCALID", 0))
 
-print(f"[startup] SLURM_PROCID={os.environ.get('SLURM_PROCID')} "
-      f"SLURM_LOCALID={_local_rank} "
-      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
-      flush=True)
+print(
+    f"[startup] SLURM_PROCID={os.environ.get('SLURM_PROCID')} "
+    f"SLURM_LOCALID={_local_rank} "
+    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+    flush=True,
+)
 import argparse
 import torch
 import torch.utils.data

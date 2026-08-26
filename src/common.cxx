@@ -520,7 +520,7 @@ static void init_fabric_cxi(struct fabric_state *fabric)
     if (originfo) fi_freeinfo(originfo);
 }
 
-/* Dispatch: DDSTORE_FABRIC_PROVIDER selects the fabric-open implementation.
+/* Dispatch: DDSTORE_FABRIC selects the fabric-open implementation.
  * Default (unset) is "hsn", so Frontier's behavior is unaffected unless
  * something explicitly opts into "cxi". Not runtime fi_getinfo detection —
  * an earlier attempt to unify both paths via runtime detection compiled
@@ -528,7 +528,7 @@ static void init_fabric_cxi(struct fabric_state *fabric)
  * as two independent, individually-proven implementations instead.        */
 void init_fabric(struct fabric_state *fabric)
 {
-    const char *provider = getenv("DDSTORE_FABRIC_PROVIDER");
+    const char *provider = getenv("DDSTORE_FABRIC");
     if (provider && strcmp(provider, "cxi") == 0)
         init_fabric_cxi(fabric);
     else

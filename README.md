@@ -178,7 +178,7 @@ Uses `MPI_Win_create` and `MPI_Get` for one-sided remote reads. Works on any MPI
 
 Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband/verbs, Cray GNI, Intel PSM2, Cray Slingshot). Lower latency than MPI RMA on supported hardware. `epoch_begin`/`epoch_end` are no-ops with this backend.
 
-**`DDSTORE_FABRIC_PROVIDER`** selects which libfabric provider to open, for `method=1`/`2`:
+**`DDSTORE_FABRIC`** selects which libfabric provider to open, for `method=1`/`2`:
 
 - `hsn` (default, unset) — Frontier: opens the `tcp;ofi_rxm` domain over Cray Slingshot.
 - `cxi` — Perlmutter: opens the native `cxi` domain over Cray Slingshot.
@@ -186,8 +186,8 @@ Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband
 The two are independent code paths (not runtime auto-detection), so set this explicitly per system rather than relying on a guess:
 
 ```bash
-export DDSTORE_FABRIC_PROVIDER=hsn   # Frontier (default; usually not needed)
-export DDSTORE_FABRIC_PROVIDER=cxi   # Perlmutter
+export DDSTORE_FABRIC=hsn   # Frontier (default; usually not needed)
+export DDSTORE_FABRIC=cxi   # Perlmutter
 ```
 
 `PyDDStore` picks the network interface (`FABRIC_IFACE`) automatically for `method=1`/`2`, based on each rank's real CPU affinity (`os.sched_getaffinity`) — no changes needed in your code:
@@ -233,7 +233,7 @@ Environment variables:
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | Shared directory for handshake record files |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds to poll for core records / a join before raising a timeout |
 | `DDSTORE_NIC_MAP` | unset | CPU→NIC map for `FABRIC_IFACE` auto-selection — see [libfabric RDMA](#libfabric-rdma-method1) above |
-| `DDSTORE_FABRIC_PROVIDER` | `hsn` | `hsn` (Frontier) or `cxi` (Perlmutter) — see [libfabric RDMA](#libfabric-rdma-method1) above |
+| `DDSTORE_FABRIC` | `hsn` | `hsn` (Frontier) or `cxi` (Perlmutter) — see [libfabric RDMA](#libfabric-rdma-method1) above |
 
 See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_extra.py](test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) for a full DDP training example using this split.
 

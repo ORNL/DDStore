@@ -6,7 +6,7 @@ module unload darshan
 
 export PYTHONNOUSERSITE=1
 export MPICH_GPU_SUPPORT_ENABLED=0
-export DDSTORE_FABRIC_PROVIDER=cxi
+export DDSTORE_FABRIC=cxi
 
 VENV_DIR=.venv
 python -m venv --system-site-packages "${VENV_DIR}"

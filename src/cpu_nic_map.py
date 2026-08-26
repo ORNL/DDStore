@@ -14,7 +14,7 @@ Three layers, one file:
 Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
 Perlmutter alike -- there is no per-system glob pattern to choose. Perlmutter
 just exposes each hsnN NIC's libfabric domain under a different name (cxiN);
-pass --provider cxi (or set DDSTORE_FABRIC_PROVIDER=cxi) to see that
+pass --provider cxi (or set DDSTORE_FABRIC=cxi) to see that
 translated name instead of the raw kernel one.
 
 CLI:
@@ -192,7 +192,7 @@ def select_fabric_iface(nic_map=None):
     format), for callers that already have the map from somewhere other
     than the process environment.
 
-    DDSTORE_FABRIC_PROVIDER selects hsn (default) or cxi:
+    DDSTORE_FABRIC selects hsn (default) or cxi:
       - hsn: Frontier's unchanged, already-proven behavior -- the kernel NIC
         name (hsnN) is used as-is.
       - cxi: Perlmutter's behavior, ported from dev-cxi@7cb110b. The kernel
@@ -202,7 +202,7 @@ def select_fabric_iface(nic_map=None):
         rank's CPU affinity to a NIC (common inside srun tasks with limited
         PCI visibility).
     """
-    use_cxi = os.environ.get("DDSTORE_FABRIC_PROVIDER") == "cxi"
+    use_cxi = os.environ.get("DDSTORE_FABRIC") == "cxi"
 
     if "FABRIC_IFACE" in os.environ:
         iface = os.environ["FABRIC_IFACE"]
@@ -271,10 +271,10 @@ def main():
     )
     parser.add_argument(
         "--provider",
-        default=os.environ.get("DDSTORE_FABRIC_PROVIDER", "hsn"),
+        default=os.environ.get("DDSTORE_FABRIC", "hsn"),
         choices=["hsn", "cxi"],
         help="translate printed NIC names to this provider's libfabric "
-        "domain name (default: $DDSTORE_FABRIC_PROVIDER, or hsn if unset) "
+        "domain name (default: $DDSTORE_FABRIC, or hsn if unset) "
         "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN (Perlmutter)",
     )
     parser.add_argument(

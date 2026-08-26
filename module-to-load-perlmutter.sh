@@ -4,7 +4,7 @@ module load pytorch/2.13.0
 
 export PYTHONNOUSERSITE=1
 export MPICH_GPU_SUPPORT_ENABLED=0
-export DDSTORE_FABRIC_PROVIDER=cxi
+export DDSTORE_FABRIC=cxi
 
 ## python env
 source .venv/bin/activate

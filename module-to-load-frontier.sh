@@ -8,7 +8,7 @@ module load cray-python/3.11.7
 module load rocm/7.2.0
 
 export PYTHONNOUSERSITE=1
-export DDSTORE_FABRIC_PROVIDER=hsn
+export DDSTORE_FABRIC=hsn
 
 ## python env
 source .venv/bin/activate

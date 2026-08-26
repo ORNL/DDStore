@@ -65,8 +65,11 @@ comm_size, rank = setup_ddp()
 
 if args.cuda:
     local_rank = get_local_rank(rank)
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    if torch.cuda.device_count() > 1:
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda")
 elif use_mps:
     device = torch.device("mps")
 else:
@@ -80,8 +83,9 @@ comm.Barrier()
 
 model = VAE().to(device)
 if args.cuda:
+    cur_device = torch.cuda.current_device()
     model = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[local_rank], output_device=local_rank
+        model, device_ids=[cur_device], output_device=cur_device
     )
 else:
     model = torch.nn.parallel.DistributedDataParallel(model)

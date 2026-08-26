@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 void init_fabric(struct fabric_state *fabric)
 {
@@ -397,7 +398,9 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
  * =========================================================================
  *
  * File naming convention:
- *   {dir}/{varname}_rank{rank}.bin   — one CoreRecord per core rank
+ *   {dir}/{varname}.bin   — one combined file per variable, holding all
+ *                           n_core CoreRecords, written once by core rank 0
+ *                           after an MPI_Allgather among core ranks.
  *
  * Directory resolution priority:
  *   1. user_dir argument (non-empty string)
@@ -436,11 +439,11 @@ const char *resolve_handshake_dir(const char *user_dir)
     return resolved;
 }
 
-/* Build the canonical path for rank i's record file into `buf`.             */
+/* Build the canonical path for a variable's combined record file into `buf`. */
 static void record_path(char *buf, size_t bufsz,
-                        const char *dir, const char *varname, int rank)
+                        const char *dir, const char *varname)
 {
-    snprintf(buf, bufsz, "%s/%s_rank%d.bin", dir, varname, rank);
+    snprintf(buf, bufsz, "%s/%s.bin", dir, varname);
 }
 
 /* Return the configured timeout in seconds (default 300).                   */
@@ -455,16 +458,22 @@ static int handshake_timeout_s(void)
  * handshake_write()
  *
  * Called by each core rank after init_fabric() and fi_mr_reg().
- * Writes a CoreRecord to {resolved_dir}/{varname}_rank{rank}.bin.
- * The directory is resolved via resolve_handshake_dir().
+ * Exchanges CoreRecords with all other core ranks via MPI_Allgather over
+ * `comm` — no filesystem round-trip needed, since core ranks already share
+ * a communicator.  Builds this rank's address vector / remote key / remote
+ * address arrays from the gathered records.  Rank 0 additionally publishes
+ * the combined array to {resolved_dir}/{varname}.bin (tmp + fsync + rename)
+ * so extra members can join later.
  * -------------------------------------------------------------------------- */
-int handshake_write(struct fabric_state *fs,
-                    const char *dir, const char *varname, int rank,
-                    long nrows, int disp, int itemsize)
+int handshake_write(struct fabric_state *fs, MPI_Comm comm,
+                    const char *dir, const char *varname,
+                    int n_core, long nrows, int disp, int itemsize,
+                    long *lenlist)
 {
-    const char *rdir = resolve_handshake_dir(dir);
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
 
-    /* Build the CoreRecord for this rank. */
+    /* Build this rank's CoreRecord. */
     struct CoreRecord rec;
     memset(&rec, 0, sizeof(rec));
 
@@ -484,67 +493,106 @@ int handshake_write(struct fabric_state *fs,
     rec.disp         = disp;
     rec.itemsize     = itemsize;
 
-    /* Write to a temp file first, fsync, then atomically rename into place
-     * so readers polling the final path never observe a partially-written
-     * or truncated-then-being-rewritten record.                            */
-    char bin_path[4096];
-    char tmp_path[4096 + 32];
-    record_path(bin_path, sizeof(bin_path), rdir, varname, rank);
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
+    /* Exchange records among core ranks directly over MPI. */
+    std::vector<struct CoreRecord> all_recs(n_core);
+    MPI_Allgather(&rec, sizeof(rec), MPI_BYTE,
+                 all_recs.data(), sizeof(rec), MPI_BYTE, comm);
 
-    FILE *f = fopen(tmp_path, "wb");
-    if (!f)
+    /* Build this rank's address vector / remote key / remote address
+     * arrays from the gathered records. */
+    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
     {
-        fprintf(stderr, "[handshake_write] cannot open %s: ", tmp_path);
-        perror("");
+        fprintf(stderr, "[handshake_write] malloc failed\n");
         return 1;
     }
-    if (fwrite(&rec, sizeof(rec), 1, f) != 1)
+    for (int i = 0; i < n_core; i++)
     {
-        fprintf(stderr, "[handshake_write] fwrite failed for %s\n", tmp_path);
+        int rc = fi_av_insert(fs->av, all_recs[i].fabric_address, 1,
+                              &fs->comm_partner[i], 0, NULL);
+        if (rc != 1)
+        {
+            fprintf(stderr,
+                    "[handshake_write] fi_av_insert failed for rank %d (rc=%d)\n",
+                    i, rc);
+            return 1;
+        }
+        fs->remote_key[i]     = all_recs[i].key;
+        fs->remote_address[i] = all_recs[i].base_address;
+        lenlist[i]            = all_recs[i].nrows;
+    }
+    fs->world_size = n_core;
+
+    /* Rank 0 publishes the combined record array for extra members.  Write
+     * to a temp file first, fsync, then atomically rename into place so
+     * readers polling the final path never observe a partially-written or
+     * truncated-then-being-rewritten record.                                */
+    if (rank == 0)
+    {
+        const char *rdir = resolve_handshake_dir(dir);
+        char bin_path[4096];
+        char tmp_path[4096 + 32];
+        record_path(bin_path, sizeof(bin_path), rdir, varname);
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
+
+        FILE *f = fopen(tmp_path, "wb");
+        if (!f)
+        {
+            fprintf(stderr, "[handshake_write] cannot open %s: ", tmp_path);
+            perror("");
+            return 1;
+        }
+        if (fwrite(all_recs.data(), sizeof(struct CoreRecord), n_core, f) != (size_t)n_core)
+        {
+            fprintf(stderr, "[handshake_write] fwrite failed for %s\n", tmp_path);
+            fclose(f);
+            unlink(tmp_path);
+            return 1;
+        }
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0)
+        {
+            fprintf(stderr, "[handshake_write] fsync failed for %s: ", tmp_path);
+            perror("");
+            fclose(f);
+            unlink(tmp_path);
+            return 1;
+        }
         fclose(f);
-        unlink(tmp_path);
-        return 1;
-    }
-    if (fflush(f) != 0 || fsync(fileno(f)) != 0)
-    {
-        fprintf(stderr, "[handshake_write] fsync failed for %s: ", tmp_path);
-        perror("");
-        fclose(f);
-        unlink(tmp_path);
-        return 1;
-    }
-    fclose(f);
 
-    if (rename(tmp_path, bin_path) != 0)
-    {
-        fprintf(stderr, "[handshake_write] rename %s -> %s failed: ", tmp_path, bin_path);
-        perror("");
-        unlink(tmp_path);
-        return 1;
+        if (rename(tmp_path, bin_path) != 0)
+        {
+            fprintf(stderr, "[handshake_write] rename %s -> %s failed: ", tmp_path, bin_path);
+            perror("");
+            unlink(tmp_path);
+            return 1;
+        }
+
+        fprintf(stderr, "[handshake_write] wrote %s (%d records)\n", bin_path, n_core);
     }
 
-    fprintf(stderr, "[handshake_write] rank %d wrote %s\n", rank, bin_path);
     return 0;
 }
 
 /* --------------------------------------------------------------------------
- * handshake_read()
+ * handshake_join()
  *
- * Called by each core rank after handshake_write().
- * Polls until all n_core record files are present in the resolved directory,
- * then reads them and populates:
+ * Called by extra members (no MPI communicator, no data to publish).
+ * Polls for {resolved_dir}/{varname}.bin (the combined record file written
+ * by core rank 0 in handshake_write()) to reach its expected size, reads
+ * it, and populates:
  *   fs->comm_partner[0..n_core-1]   (fi_addr_t, via fi_av_insert)
  *   fs->remote_key[0..n_core-1]
  *   fs->remote_address[0..n_core-1]
  *   lenlist[0..n_core-1]            (raw nrows, NOT prefix-summed)
- *   *out_disp, *out_itemsize        (from rank-0 record; assumed uniform)
+ *   *out_disp, *out_itemsize        (from record 0; assumed uniform)
  *
  * Returns 0 on success, non-zero on error or timeout.
  * -------------------------------------------------------------------------- */
-int handshake_read(struct fabric_state *fs,
+int handshake_join(struct fabric_state *fs,
                    const char *dir, const char *varname,
-                   int n_core, int my_rank,
+                   int n_core,
                    long *lenlist, int *out_disp, int *out_itemsize)
 {
     const char *rdir = resolve_handshake_dir(dir);
@@ -552,30 +600,15 @@ int handshake_read(struct fabric_state *fs,
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-    /* Allocate arrays sized for n_core peers. */
-    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
-    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
-    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
-    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
-    {
-        fprintf(stderr, "[handshake_read] malloc failed\n");
-        return 1;
-    }
+    char path[4096];
+    record_path(path, sizeof(path), rdir, varname);
+    size_t expected_size = (size_t)n_core * sizeof(struct CoreRecord);
 
-    /* Poll until all n_core files are fully written (size == sizeof CoreRecord). */
+    /* Poll until the combined record file is fully written. */
     for (;;)
     {
-        int ready = 0;
-        for (int i = 0; i < n_core; i++)
-        {
-            char path[4096];
-            record_path(path, sizeof(path), rdir, varname, i);
-            struct stat st;
-            if (stat(path, &st) == 0 &&
-                st.st_size == (off_t)sizeof(struct CoreRecord))
-                ready++;
-        }
-        if (ready == n_core)
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size == (off_t)expected_size)
             break;
 
         clock_gettime(CLOCK_MONOTONIC, &ts_now);
@@ -584,77 +617,58 @@ int handshake_read(struct fabric_state *fs,
         if (elapsed > timeout_s)
         {
             fprintf(stderr,
-                    "[handshake_read] timeout after %.0f s waiting for "
-                    "%d/%d core records (var=%s, dir=%s)\n",
-                    elapsed, ready, n_core, varname, rdir);
+                    "[handshake_join] timeout after %.0f s waiting for "
+                    "%s (var=%s, dir=%s)\n",
+                    elapsed, path, varname, rdir);
             return 1;
         }
         usleep(50000); /* 50 ms */
     }
 
-    /* Read all records. */
+    std::vector<struct CoreRecord> all_recs(n_core);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+    {
+        fprintf(stderr, "[handshake_join] cannot open %s: ", path);
+        perror("");
+        return 1;
+    }
+    if (fread(all_recs.data(), sizeof(struct CoreRecord), n_core, f) != (size_t)n_core)
+    {
+        fprintf(stderr, "[handshake_join] fread failed for %s\n", path);
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
+    {
+        fprintf(stderr, "[handshake_join] malloc failed\n");
+        return 1;
+    }
+
     for (int i = 0; i < n_core; i++)
     {
-        char path[4096];
-        record_path(path, sizeof(path), rdir, varname, i);
-
-        FILE *f = fopen(path, "rb");
-        if (!f)
-        {
-            fprintf(stderr, "[handshake_read] cannot open %s: ", path);
-            perror("");
-            return 1;
-        }
-
-        struct CoreRecord rec;
-        if (fread(&rec, sizeof(rec), 1, f) != 1)
-        {
-            fprintf(stderr, "[handshake_read] fread failed for %s\n", path);
-            fclose(f);
-            return 1;
-        }
-        fclose(f);
-
-        /* Insert fabric address into the address vector. */
-        int rc = fi_av_insert(fs->av,
-                              rec.fabric_address, 1,
+        int rc = fi_av_insert(fs->av, all_recs[i].fabric_address, 1,
                               &fs->comm_partner[i], 0, NULL);
         if (rc != 1)
         {
             fprintf(stderr,
-                    "[handshake_read] fi_av_insert failed for rank %d (rc=%d)\n",
+                    "[handshake_join] fi_av_insert failed for rank %d (rc=%d)\n",
                     i, rc);
             return 1;
         }
-
-        fs->remote_key[i]     = rec.key;
-        fs->remote_address[i] = rec.base_address;
-        lenlist[i]            = rec.nrows;
-
-        if (i == 0)
-        {
-            if (out_disp)     *out_disp     = rec.disp;
-            if (out_itemsize) *out_itemsize = rec.itemsize;
-        }
+        fs->remote_key[i]     = all_recs[i].key;
+        fs->remote_address[i] = all_recs[i].base_address;
+        lenlist[i]            = all_recs[i].nrows;
     }
 
-    fs->world_size = n_core;
-    (void)my_rank;
-    return 0;
-}
+    if (out_disp)     *out_disp     = all_recs[0].disp;
+    if (out_itemsize) *out_itemsize = all_recs[0].itemsize;
 
-/* --------------------------------------------------------------------------
- * handshake_join()
- *
- * Called by extra members (no MPI, no data to publish).
- * Identical to handshake_read() except it never writes anything.
- * Blocks until all n_core record files are present (or timeout).
- * -------------------------------------------------------------------------- */
-int handshake_join(struct fabric_state *fs,
-                   const char *dir, const char *varname,
-                   int n_core,
-                   long *lenlist, int *out_disp, int *out_itemsize)
-{
-    return handshake_read(fs, dir, varname, n_core, -1,
-                          lenlist, out_disp, out_itemsize);
+    fs->world_size = n_core;
+    return 0;
 }

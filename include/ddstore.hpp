@@ -125,20 +125,15 @@ public:
                 throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
             fabric_state->key = fi_mr_key(fabric_state->mr);
 
-            /* Write this rank's record to the handshake directory. */
-            if (handshake_write(fabric_state,
-                                this->handshake_dir.c_str(), name.c_str(), this->rank,
-                                nrows, disp, (int)sizeof(T)) != 0)
-                throw std::runtime_error("handshake_write failed");
-
-            /* Wait for all core ranks, then read all records. */
+            /* Exchange records with all core ranks via MPI_Allgather, and
+             * (rank 0 only) publish the combined record set for extra
+             * members to join later. */
             std::vector<long> raw_lens(this->n_core);
-            int file_disp = 0, file_itemsize = 0;
-            if (handshake_read(fabric_state,
-                               this->handshake_dir.c_str(), name.c_str(),
-                               this->n_core, this->rank,
-                               raw_lens.data(), &file_disp, &file_itemsize) != 0)
-                throw std::runtime_error("handshake_read failed");
+            if (handshake_write(fabric_state, this->comm,
+                                this->handshake_dir.c_str(), name.c_str(),
+                                this->n_core, nrows, disp, (int)sizeof(T),
+                                raw_lens.data()) != 0)
+                throw std::runtime_error("handshake_write failed");
 
             /* Build prefix-sum lenlist from the raw per-rank row counts. */
             long sum = 0;
@@ -254,18 +249,12 @@ public:
                 throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
             fabric_state->key = fi_mr_key(fabric_state->mr);
 
-            if (handshake_write(fabric_state,
-                                this->handshake_dir.c_str(), name.c_str(), this->rank,
-                                nrows, disp, itemsize) != 0)
-                throw std::runtime_error("handshake_write failed");
-
             std::vector<long> raw_lens(this->n_core);
-            int file_disp = 0, file_itemsize = 0;
-            if (handshake_read(fabric_state,
-                               this->handshake_dir.c_str(), name.c_str(),
-                               this->n_core, this->rank,
-                               raw_lens.data(), &file_disp, &file_itemsize) != 0)
-                throw std::runtime_error("handshake_read failed");
+            if (handshake_write(fabric_state, this->comm,
+                                this->handshake_dir.c_str(), name.c_str(),
+                                this->n_core, nrows, disp, itemsize,
+                                raw_lens.data()) != 0)
+                throw std::runtime_error("handshake_write failed");
 
             long sum = 0;
             std::vector<long> lenlist(this->n_core);

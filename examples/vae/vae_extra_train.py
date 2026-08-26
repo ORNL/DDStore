@@ -42,7 +42,7 @@ mpi4py.rc.thread_level = "serialized"
 mpi4py.rc.threads = False
 from mpi4py import MPI
 
-from ddp_utils import setup_ddp
+from ddp_utils import setup_ddp, get_local_rank
 from distdataset import DistDatasetReader
 from vae_model import VAE, loss_function
 
@@ -95,14 +95,20 @@ use_mps = not args.no_mps and torch.backends.mps.is_available()
 
 torch.manual_seed(args.seed)
 
+comm_size, rank = setup_ddp()
+
 if args.cuda:
-    device = torch.device("cuda")
+    if torch.cuda.device_count() > 1:
+        local_rank = get_local_rank(rank)
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda")
 elif use_mps:
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
 
-comm_size, rank = setup_ddp()
 print("DDP setup:", comm_size, rank, device)
 
 model = VAE().to(device)

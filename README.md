@@ -176,7 +176,19 @@ Uses `MPI_Win_create` and `MPI_Get` for one-sided remote reads. Works on any MPI
 
 ### libfabric RDMA (`method=1`)
 
-Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband/verbs, Cray GNI, Intel PSM2). Lower latency than MPI RMA on supported hardware. `epoch_begin`/`epoch_end` are no-ops with this backend.
+Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband/verbs, Cray GNI, Intel PSM2, Cray Slingshot). Lower latency than MPI RMA on supported hardware. `epoch_begin`/`epoch_end` are no-ops with this backend.
+
+**`DDSTORE_FABRIC_PROVIDER`** selects which libfabric provider to open, for `method=1`/`2`:
+
+- `hsn` (default, unset) — Frontier: opens the `tcp;ofi_rxm` domain over Cray Slingshot.
+- `cxi` — Perlmutter: opens the native `cxi` domain over Cray Slingshot.
+
+The two are independent code paths (not runtime auto-detection), so set this explicitly per system rather than relying on a guess:
+
+```bash
+export DDSTORE_FABRIC_PROVIDER=hsn   # Frontier (default; usually not needed)
+export DDSTORE_FABRIC_PROVIDER=cxi   # Perlmutter
+```
 
 `PyDDStore` picks the network interface (`FABRIC_IFACE`) automatically for `method=1`/`2`, based on each rank's real CPU affinity (`os.sched_getaffinity`) — no changes needed in your code:
 
@@ -196,7 +208,7 @@ Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband
 
 Splits the dataset-holding job from the training job entirely: a **core** group loads and publishes data, and a separate **extra** group reads it over RDMA (`fi_read`, same transport as `method=1`) — the two are independent MPI jobs (e.g. two separate `srun`/`mpirun` launches, possibly on different node allocations) that never share a communicator. They rendezvous only through record files written to a shared-filesystem directory (must be visible to all nodes, e.g. Lustre):
 
-- **Core member** — has an MPI communicator, publishes with `add()`/`init()`. Each rank writes a `{name}_rank{N}.bin` record (fabric address, MR key, base pointer, row count, dtype) into `handshake_dir`.
+- **Core member** — has an MPI communicator, publishes with `add()`/`init()`. Core ranks exchange records via `MPI_Allgather`, and rank 0 writes the combined set to a single `{name}.bin` file (fabric address, MR key, base pointer, row count, dtype per rank) into `handshake_dir`.
 - **Extra member** — no MPI communicator; constructed with `comm_or_none=None` and an explicit `n_core`. Calls `join(name)` to poll for and read all `n_core` core-rank records, then `get()` works exactly as on the core side, reading directly from core-rank memory over RDMA.
 
 ```python
@@ -221,6 +233,7 @@ Environment variables:
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | Shared directory for handshake record files |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds to poll for core records / a join before raising a timeout |
 | `DDSTORE_NIC_MAP` | unset | CPU→NIC map for `FABRIC_IFACE` auto-selection — see [libfabric RDMA](#libfabric-rdma-method1) above |
+| `DDSTORE_FABRIC_PROVIDER` | `hsn` | `hsn` (Frontier) or `cxi` (Perlmutter) — see [libfabric RDMA](#libfabric-rdma-method1) above |
 
 See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_extra.py](test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) for a full DDP training example using this split.
 

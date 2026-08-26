@@ -26,6 +26,7 @@ import argparse
 import fnmatch
 import glob
 import os
+import re
 import subprocess
 import sys
 
@@ -172,12 +173,49 @@ def select_fabric_iface(nic_map=None):
     nic_map: an explicit precomputed map string (serialize_env()/--env
     format), for callers that already have the map from somewhere other
     than the process environment.
+
+    DDSTORE_FABRIC_PROVIDER selects hsn (default) or cxi:
+      - hsn: Frontier's unchanged, already-proven behavior -- the kernel NIC
+        name (hsnN) is used as-is.
+      - cxi: Perlmutter's behavior, ported from dev-cxi@7cb110b. The kernel
+        NIC names are hsn0-hsn3 there too, but libfabric only exposes them
+        as cxi0-cxi3, so the result is translated hsnN -> cxiN. Also adds a
+        SLURM_LOCALID round-robin fallback for when hwloc can't map this
+        rank's CPU affinity to a NIC (common inside srun tasks with limited
+        PCI visibility).
     """
+    use_cxi = os.environ.get("DDSTORE_FABRIC_PROVIDER") == "cxi"
+
     if "FABRIC_IFACE" in os.environ:
-        return os.environ["FABRIC_IFACE"]
+        iface = os.environ["FABRIC_IFACE"]
+        if use_cxi:
+            m = re.match(r"hsn(\d+)$", iface)
+            if m:
+                iface = f"cxi{m.group(1)}"
+                os.environ["FABRIC_IFACE"] = iface
+        return iface
 
     allocated, nics = allocated_nics(nic_map=nic_map)
     if not nics:
+        if use_cxi:
+            cxi_domains = sorted(
+                os.path.basename(p)
+                for p in glob.glob("/sys/class/net/hsn*")
+                if re.match(r"hsn\d+$", os.path.basename(p))
+            )
+            if not cxi_domains:
+                raise RuntimeError(
+                    f"could not determine a nearest HSN NIC for this rank's "
+                    f"CPU affinity {allocated} and no hsn* devices found; "
+                    f"set FABRIC_IFACE explicitly to work around this"
+                )
+            local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+            hsn = cxi_domains[local_rank % len(cxi_domains)]
+            m = re.match(r"hsn(\d+)$", hsn)
+            iface = f"cxi{m.group(1)}" if m else hsn
+            print(f"FABRIC_IFACE: fallback (SLURM_LOCALID={local_rank}) -> {iface}")
+            os.environ["FABRIC_IFACE"] = iface
+            return iface
         raise RuntimeError(
             f"could not determine a nearest HSN NIC for this rank's CPU "
             f"affinity {allocated}; set FABRIC_IFACE explicitly to work "
@@ -186,6 +224,12 @@ def select_fabric_iface(nic_map=None):
     iface = sorted(nics)[0]
     if len(nics) > 1:
         print(f"FABRIC_IFACE: affinity spans {sorted(nics)}, picking {iface}")
+
+    if use_cxi:
+        m = re.match(r"hsn(\d+)$", iface)
+        if m:
+            iface = f"cxi{m.group(1)}"
+
     os.environ["FABRIC_IFACE"] = iface
     return iface
 

@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <mpi.h>
 
 #define DP_AV_DEF_SIZE 512
@@ -60,6 +61,40 @@ extern "C"
     static bool is_local_mr_req(struct fabric_state *f)
     {
         return (f->info->mode & FI_LOCAL_MR) != 0;
+    }
+
+    /* CXI (and some other providers) use FI_MR_ENDPOINT: after fi_mr_reg the
+     * MR must be bound to the endpoint and enabled before it can be used, and
+     * the key is only valid after fi_mr_enable().
+     * On Perlmutter, fi_getinfo with NULL hints returns mr_mode=0 even for
+     * CXI, so we detect by provider name instead of mr_mode flags. False
+     * (no-op) for every provider dev-file2 already supports (hsn/verbs/
+     * gni/psm2), since none of those set mr_mode & FI_MR_ENDPOINT and none
+     * are named "cxi".                                                       */
+    static bool is_mr_endpoint(struct fabric_state *f)
+    {
+        return (f->info->domain_attr->mr_mode & FI_MR_ENDPOINT) != 0 ||
+               (f->info->fabric_attr->prov_name &&
+                strcmp(f->info->fabric_attr->prov_name, "cxi") == 0);
+    }
+
+    /* With FI_MR_VIRT_ADDR the fi_read remote addr is the virtual address.
+     * CXI does NOT use virtual addresses — offset is 0-based from MR base.
+     *
+     * NOTE: this is deliberately NOT a mr_mode bit check. dev-file2's
+     * init_fabric_hsn() sets mr_mode to the legacy FI_MR_BASIC sentinel,
+     * which on this system's libfabric (2.3.1) is bit 0 (value 1) — a
+     * completely different bit than FI_MR_VIRT_ADDR (bit 4). A `mr_mode &
+     * FI_MR_VIRT_ADDR` check would therefore silently resolve to false for
+     * hsn, breaking address exchange for the already-proven path. Before
+     * this helper existed, dev-file2 unconditionally used the real pointer
+     * for every provider it supported (hsn/verbs/gni/psm2) — no virt-addr/
+     * prov-key distinction existed at all — so preserve that unconditional
+     * behavior for anything that isn't cxi.                                  */
+    static bool is_virt_addr(struct fabric_state *f)
+    {
+        return !(f->info->fabric_attr->prov_name &&
+                 strcmp(f->info->fabric_attr->prov_name, "cxi") == 0);
     }
 
     void init_fabric(struct fabric_state *fabric);

@@ -98,7 +98,8 @@ public:
             init_fabric(fabric_state);
             if (!fabric_state->info)
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            handshake(fabric_state, this->comm);
+            if (handshake(fabric_state, this->comm) != 0)
+                throw std::runtime_error("handshake failed (method=1)");
         }
         else if (this->method == 2)
         {
@@ -123,6 +124,20 @@ public:
                 NULL);
             if (mr_rc != FI_SUCCESS)
                 throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
+
+            /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before
+             * use. The provider-assigned key is only valid after
+             * fi_mr_enable() — same requirement as method=1's handshake().
+             * No-op for hsn (is_mr_endpoint() is false).                     */
+            if (is_mr_endpoint(fabric_state))
+            {
+                int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
+                if (rc != FI_SUCCESS)
+                    throw std::runtime_error(std::string("fi_mr_bind failed: ") + fi_strerror(rc));
+                rc = fi_mr_enable(fabric_state->mr);
+                if (rc != FI_SUCCESS)
+                    throw std::runtime_error(std::string("fi_mr_enable failed: ") + fi_strerror(rc));
+            }
             fabric_state->key = fi_mr_key(fabric_state->mr);
 
             /* Exchange records with all core ranks via MPI_Allgather, and
@@ -223,7 +238,8 @@ public:
             init_fabric(fabric_state);
             if (!fabric_state->info)
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            handshake(fabric_state, this->comm);
+            if (handshake(fabric_state, this->comm) != 0)
+                throw std::runtime_error("handshake failed (method=1)");
         }
         else if (this->method == 2)
         {
@@ -247,6 +263,20 @@ public:
                 NULL);
             if (mr_rc != FI_SUCCESS)
                 throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
+
+            /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before
+             * use. The provider-assigned key is only valid after
+             * fi_mr_enable() — same requirement as method=1's handshake().
+             * No-op for hsn (is_mr_endpoint() is false).                     */
+            if (is_mr_endpoint(fabric_state))
+            {
+                int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
+                if (rc != FI_SUCCESS)
+                    throw std::runtime_error(std::string("fi_mr_bind failed: ") + fi_strerror(rc));
+                rc = fi_mr_enable(fabric_state->mr);
+                if (rc != FI_SUCCESS)
+                    throw std::runtime_error(std::string("fi_mr_enable failed: ") + fi_strerror(rc));
+            }
             fabric_state->key = fi_mr_key(fabric_state->mr);
 
             std::vector<long> raw_lens(this->n_core);
@@ -369,7 +399,11 @@ public:
             /* Methods 1 and 2 both use libfabric fi_read — same path. */
             varinfo.fabric_state->recv_data = (char *)buffer;
             varinfo.fabric_state->recv_data_len = varinfo.disp * varinfo.itemsize * count;
-            read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * varinfo.itemsize);
+            int rc = read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * varinfo.itemsize);
+            if (rc != 0)
+                throw std::runtime_error(
+                    "read_from_remote failed with code " + std::to_string(rc) +
+                    " (target=" + std::to_string(target) + ")");
         }
     }
 

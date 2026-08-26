@@ -37,9 +37,9 @@ class DistDataset(Dataset):
         handshake_dir = os.getenv("DDSTORE_HANDSHAKE_DIR", "./ddstore_hs")
 
         if ddstore_method == 2 and self.ddstore_width != self.comm_size:
-            # File-based handshake: each Split group would publish under the
-            # same {varname}_rank{N}.bin filenames, so more than one group
-            # sharing a handshake_dir would silently collide.
+            # File-based handshake: each Split group would publish into the
+            # same shared {varname}.bin file, so more than one group sharing
+            # a handshake_dir would silently collide.
             raise NotImplementedError(
                 "method=2 does not yet support ddstore_width < comm_size "
                 "(multiple core groups would collide on the same "

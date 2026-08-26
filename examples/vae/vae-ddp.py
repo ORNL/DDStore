@@ -2,6 +2,14 @@
 ## before mpi4py triggers MPI_Init, or their static destructors run in the
 ## wrong order at interpreter exit and corrupt the heap.
 ## Do not reorder these imports.
+import os, sys
+
+_local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+
+print(f"[startup] SLURM_PROCID={os.environ.get('SLURM_PROCID')} "
+      f"SLURM_LOCALID={_local_rank} "
+      f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}",
+      flush=True)
 import argparse
 import torch
 import torch.utils.data
@@ -60,7 +68,8 @@ use_mps = not args.no_mps and torch.backends.mps.is_available()
 torch.manual_seed(args.seed)
 
 if args.cuda:
-    device = torch.device("cuda")
+    torch.cuda.set_device(_local_rank)
+    device = torch.device("cuda", _local_rank)
 elif use_mps:
     device = torch.device("mps")
 else:

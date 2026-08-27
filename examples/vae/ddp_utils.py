@@ -1,3 +1,6 @@
+from mpi4py import MPI
+import os, socket
+
 import os
 import re
 import socket
@@ -23,6 +26,11 @@ def init_comm_size_and_rank():
         ## CADES
         world_size = int(os.environ["SLURM_NPROCS"])
         world_rank = int(os.environ["SLURM_PROCID"])
+    else:
+        from mpi4py import MPI
+
+        world_size = MPI.COMM_WORLD.Get_size()
+        world_rank = MPI.COMM_WORLD.Get_rank()
 
     ## Fall back to default
     if world_size is None:
@@ -41,8 +49,6 @@ def get_local_rank(rank):
         return int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
     elif os.getenv("SLURM_LOCALID") is not None:
         return int(os.environ["SLURM_LOCALID"])
-    elif torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        return rank % torch.cuda.device_count()
     return 0
 
 
@@ -102,20 +108,23 @@ def parse_slurm_nodelist(nodelist):
 def setup_ddp():
     """ "Initialize DDP"""
 
-    if os.getenv("HYDRAGNN_BACKEND") is not None:
-        backend = os.environ["HYDRAGNN_BACKEND"]
+    if os.getenv("DDSTORE_BACKEND") is not None:
+        backend = os.environ["DDSTORE_BACKEND"]
     elif dist.is_nccl_available() and torch.cuda.is_available():
         backend = "nccl"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        backend = "xccl"
     elif torch.distributed.is_gloo_available():
         backend = "gloo"
     else:
         raise RuntimeError("No parallel backends available")
 
     world_size, world_rank = init_comm_size_and_rank()
+    print(f"DDP: Hi from rank {world_rank} of {world_size}.")
 
     ## Default setting
     master_addr = "127.0.0.1"
-    master_port = os.getenv("MASTER_PORT", "8889")
+    master_port = os.getenv("MASTER_PORT", "2345")
 
     if os.getenv("LSB_HOSTS") is not None:
         master_addr = os.environ["LSB_HOSTS"].split()[1]
@@ -125,11 +134,22 @@ def setup_ddp():
         master_addr = parse_slurm_nodelist(os.environ["SLURM_STEP_NODELIST"])[0]
     elif os.getenv("SLURM_NODELIST") is not None:
         master_addr = parse_slurm_nodelist(os.environ["SLURM_NODELIST"])[0]
+    elif os.getenv("PBS_O_HOST") is not None:
+        if os.environ["PBS_O_HOST"][-19:] == "aurora.alcf.anl.gov":
+            from mpi4py import MPI
+
+            RANK = MPI.COMM_WORLD.Get_rank()
+            MASTER_ADDR = socket.gethostname() if RANK == 0 else None
+            MASTER_ADDR = MPI.COMM_WORLD.bcast(MASTER_ADDR, root=0)
+            master_addr = f"{MASTER_ADDR}.hsn.cm.aurora.alcf.anl.gov"
+        else:
+            ## The following is CADES specific
+            master_addr = parse_slurm_nodelist(os.environ["PBS_O_HOST"])[0]
 
     try:
-        if backend in ["nccl", "gloo"]:
+        if backend in ["nccl", "gloo", "xccl"]:
             os.environ["MASTER_ADDR"] = master_addr
-            os.environ["MASTER_PORT"] = master_port
+            os.environ["MASTER_PORT"] = str(master_port)
             os.environ["WORLD_SIZE"] = str(world_size)
             os.environ["RANK"] = str(world_rank)
 

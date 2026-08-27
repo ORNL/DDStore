@@ -96,14 +96,20 @@ use_mps = not args.no_mps and torch.backends.mps.is_available()
 torch.manual_seed(args.seed)
 
 comm_size, rank = setup_ddp()
+local_rank = get_local_rank(rank)
 
 if args.cuda:
     if torch.cuda.device_count() > 1:
-        local_rank = get_local_rank(rank)
         torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
     else:
         device = torch.device("cuda")
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    if torch.xpu.device_count() > 1:
+        torch.xpu.set_device(localrank)
+        device = torch.device(f"xpu:{local_rank}")
+    else:
+        device = torch.device("xpu")
 elif use_mps:
     device = torch.device("mps")
 else:

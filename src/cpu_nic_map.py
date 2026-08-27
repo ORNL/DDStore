@@ -58,6 +58,34 @@ def hcalc(loc, itype):
     return [int(x) for x in out.split(",")] if out else []
 
 
+def _sysfs_cpulist(name):
+    """Parse /sys/class/net/<name>/device/local_cpulist into a set of PU ids."""
+    path = f"/sys/class/net/{name}/device/local_cpulist"
+    try:
+        text = open(path).read().strip()
+    except OSError:
+        return set()
+    pus = set()
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            pus.update(range(int(lo), int(hi) + 1))
+        elif part:
+            pus.add(int(part))
+    return pus
+
+
+def _sysfs_numa(name):
+    """Read /sys/class/net/<name>/device/numa_node; returns int or None."""
+    path = f"/sys/class/net/{name}/device/numa_node"
+    try:
+        val = int(open(path).read().strip())
+        return val if val >= 0 else None
+    except (OSError, ValueError):
+        return None
+
+
 def build_map(pattern):
     nics = sorted(
         os.path.basename(p)
@@ -68,16 +96,43 @@ def build_map(pattern):
     if not nics:
         sys.exit(f"no NICs matching '{pattern}' found under /sys/class/net")
 
-    nic_closest = {n: set(hcalc(f"os={n}", "PU")) for n in nics}
-    nic_numa = {n: (hcalc(f"os={n}", "NUMA") or [None])[0] for n in nics}
+    nic_closest = {n: _sysfs_cpulist(n) for n in nics}
+    nic_numa = {n: _sysfs_numa(n) for n in nics}
     if not any(nic_closest.values()):
         sys.exit(
-            "hwloc-calc found no PUs local to any NIC (os=<name> lookups came back "
-            "empty) -- this process's hwloc topology view has no visibility into the "
-            "NICs, so any nearest-NIC answer would be a silent guess, not real data. "
-            "This has been observed when running directly inside a plain `srun` task; "
-            "try running from the sbatch batch step's own shell instead."
+            "sysfs local_cpulist came back empty for all NICs -- "
+            "check /sys/class/net/hsn*/device/local_cpulist"
         )
+
+    # When multiple NICs share the same local_cpulist (e.g. 4 NICs per NUMA
+    # node on Aurora all report identical affinity), split the CPU set evenly
+    # so each NIC owns a unique partition and nearest() returns distinct NICs.
+    # Split each contiguous range separately so every NIC gets a share of both
+    # physical cores and hyperthreads (not just one or the other).
+    cpuset_to_nics = {}
+    for n, cpus in nic_closest.items():
+        key = frozenset(cpus)
+        cpuset_to_nics.setdefault(key, []).append(n)
+    for key, group in cpuset_to_nics.items():
+        if len(group) > 1:
+            sorted_cpus = sorted(key)
+            k = len(group)
+            # Find contiguous ranges within the shared CPU set
+            ranges, start, prev = [], sorted_cpus[0], sorted_cpus[0]
+            for c in sorted_cpus[1:]:
+                if c != prev + 1:
+                    ranges.append(list(range(start, prev + 1)))
+                    start = c
+                prev = c
+            ranges.append(list(range(start, prev + 1)))
+            # Assign each NIC a chunk from every range
+            partitions = [set() for _ in range(k)]
+            for seg in ranges:
+                chunk = (len(seg) + k - 1) // k
+                for i in range(k):
+                    partitions[i].update(seg[i * chunk : (i + 1) * chunk])
+            for nic, part in zip(sorted(group), partitions):
+                nic_closest[nic] = part
 
     # multiple NICs can share a NUMA node; pick the numerically/PCI-closest
     # NIC as the "same-NUMA fallback owner" for cores not exactly local to any NIC
@@ -176,6 +231,19 @@ def allocated_nics(pattern="hsn*", nic_map=None):
     else:
         all_pus, nearest = build_map(pattern)
         nics = {nearest(c)[0] for c in allocated if c in all_pus}
+        fabric = os.environ.get("DDSTORE_FABRIC", "hsn")
+        by_nic = {}
+        for pu in all_pus:
+            nic = translate_iface(nearest(pu)[0], fabric)
+            by_nic.setdefault(nic, []).append(pu)
+        map_str = ";".join(
+            f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+        )
+        print(
+            "Tip: cache this map for future runs to avoid recomputing it per rank:\n"
+            f"  export DDSTORE_NIC_MAP={map_str}",
+            file=sys.stderr,
+        )
     return allocated, nics
 
 
@@ -239,11 +307,13 @@ def select_fabric_iface(nic_map=None):
             f"around this"
         )
     iface = sorted(nics)[0]
-    if len(nics) > 1:
-        print(f"FABRIC_IFACE: affinity spans {sorted(nics)}, picking {iface}")
-
     if use_cxi:
         iface = translate_iface(iface, "cxi")
+    if len(nics) > 1:
+        translated = sorted(
+            translate_iface(n, "cxi" if use_cxi else "hsn") for n in nics
+        )
+        print(f"FABRIC_IFACE: affinity spans {translated}, picking {iface}")
 
     os.environ["FABRIC_IFACE"] = iface
     return iface
@@ -317,6 +387,18 @@ def main():
         owner, exact, numa = nearest(pu)
         owner = translate_iface(owner, args.fabric)
         print(f"{pu:>4}  {numa!s:>4}  {owner:>11}  {exact}")
+    by_nic = {}
+    for pu in all_pus:
+        nic = translate_iface(nearest(pu)[0], args.fabric)
+        by_nic.setdefault(nic, []).append(pu)
+    map_str = ";".join(
+        f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+    )
+    print(
+        "\nTip: cache this map for future runs:\n"
+        f"  export DDSTORE_NIC_MAP={map_str}",
+        file=sys.stderr,
+    )
 
 
 if __name__ == "__main__":

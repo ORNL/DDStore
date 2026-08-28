@@ -649,8 +649,18 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
      * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).             */
     if (is_mr_endpoint(fabric_state))
     {
-        fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
-        fi_mr_enable(fabric_state->recv_mr);
+        int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
+        if (rc_mr != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_bind (recv) failed: %s\n", fi_strerror(rc_mr));
+            return 1;
+        }
+        rc_mr = fi_mr_enable(fabric_state->recv_mr);
+        if (rc_mr != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
+            return 1;
+        }
     }
 
     void *memory_descriptor = NULL;

@@ -740,7 +740,7 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
 
 /* Resolve the handshake directory.
  * Returns a pointer to a static buffer — copy before next call.             */
-const char *resolve_handshake_dir(const char *user_dir)
+extern "C" const char *resolve_handshake_dir(const char *user_dir)
 {
     static char resolved[4096];
 
@@ -763,11 +763,23 @@ const char *resolve_handshake_dir(const char *user_dir)
     return resolved;
 }
 
-/* Build the canonical path for a variable's combined record file into `buf`. */
+/* Build the canonical path for a variable's combined record file into `buf`.
+ * varname is sanitised: any '/' or '.' characters are replaced with '_' so
+ * that a caller-supplied name cannot escape the handshake directory.          */
 static void record_path(char *buf, size_t bufsz,
                         const char *dir, const char *varname)
 {
-    snprintf(buf, bufsz, "%s/%s.bin", dir, varname);
+    /* Copy and sanitise varname into a local buffer. */
+    char safe[256];
+    size_t i;
+    for (i = 0; i < sizeof(safe) - 1 && varname[i] != '\0'; i++)
+    {
+        char c = varname[i];
+        safe[i] = (c == '/' || c == '.') ? '_' : c;
+    }
+    safe[i] = '\0';
+
+    snprintf(buf, bufsz, "%s/%s.bin", dir, safe);
 }
 
 /* Return the configured timeout in seconds (default 300).                   */
@@ -789,7 +801,7 @@ static int handshake_timeout_s(void)
  * the combined array to {resolved_dir}/{varname}.bin (tmp + fsync + rename)
  * so extra members can join later.
  * -------------------------------------------------------------------------- */
-int handshake_write(struct fabric_state *fs, MPI_Comm comm,
+extern "C" int handshake_write(struct fabric_state *fs, MPI_Comm comm,
                     const char *dir, const char *varname,
                     int n_core, long nrows, int disp, int itemsize,
                     long *lenlist)
@@ -916,7 +928,7 @@ int handshake_write(struct fabric_state *fs, MPI_Comm comm,
  *
  * Returns 0 on success, non-zero on error or timeout.
  * -------------------------------------------------------------------------- */
-int handshake_join(struct fabric_state *fs,
+extern "C" int handshake_join(struct fabric_state *fs,
                    const char *dir, const char *varname,
                    int n_core,
                    long *lenlist, int *out_disp, int *out_itemsize)

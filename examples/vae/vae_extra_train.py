@@ -106,7 +106,7 @@ if args.cuda:
         device = torch.device("cuda")
 elif hasattr(torch, "xpu") and torch.xpu.is_available():
     if torch.xpu.device_count() > 1:
-        torch.xpu.set_device(localrank)
+        torch.xpu.set_device(local_rank)
         device = torch.device(f"xpu:{local_rank}")
     else:
         device = torch.device("xpu")

@@ -144,7 +144,7 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 ### `join(name)`
 
-`method=2` extra member only. Discovers a variable published by the core group by polling the handshake directory until every core rank's record file appears (up to `DDSTORE_HANDSHAKE_TIMEOUT_S` seconds), then registers it for `get()`.
+`method=2` extra member only. Discovers a variable published by the core group by polling the handshake directory until the combined record file (`{name}.bin`) written by core rank 0 reaches its expected size (up to `DDSTORE_HANDSHAKE_TIMEOUT_S` seconds), then registers it for `get()`.
 
 | Parameter | Type | Description |
 |---|---|---|

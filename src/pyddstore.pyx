@@ -105,6 +105,10 @@ cdef class PyDDStore:
                                              s2b(handshake_dir))
         else:
             # Methods 0 and 1: standard MPI constructor
+            if comm_or_none is None:
+                raise ValueError(
+                    "method=%d requires a valid MPI communicator "
+                    "(got comm_or_none=None)" % method)
             mpi_comm = comm_or_none
             self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi)
 

@@ -1,6 +1,3 @@
-from mpi4py import MPI
-import os, socket
-
 import os
 import re
 import socket

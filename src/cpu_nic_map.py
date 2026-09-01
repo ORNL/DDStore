@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""CPU <-> nearest HSN (Slingshot) NIC topology, and FABRIC_IFACE auto-selection.
+
+Requires: module load hwloc  (or lstopo/hwloc-calc on PATH)
+
+Three layers, one file:
+  - build_map()/serialize_env()/parse_env(): pure hwloc-calc topology query,
+    independent of any particular process's CPU affinity.
+  - allocated_nics(): affinity-aware wrapper — which NIC(s) is *this
+    process*, given its actual pinning (os.sched_getaffinity), closest to.
+  - select_fabric_iface(): called automatically by PyDDStore.__cinit__
+    (src/pyddstore.pyx) for method=1/2 to set FABRIC_IFACE if not already set.
+
+Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
+Perlmutter alike -- there is no per-system glob pattern to choose. Perlmutter
+just exposes each hsnN NIC's libfabric domain under a different name (cxiN);
+pass --fabric cxi (or set DDSTORE_FABRIC=cxi) to see that
+translated name instead of the raw kernel one.
+
+CLI:
+  cpu_nic_map.py                print the full CPU -> nearest HSN NIC table
+  cpu_nic_map.py 42              print only the nearest HSN NIC for cpu 42
+  cpu_nic_map.py --env           print the compact DDSTORE_NIC_MAP env-var value
+  cpu_nic_map.py --allocated     print this process's allocated CPUs and nearest NIC(s)
+  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names
+
+  export DDSTORE_NIC_MAP=$(python3 cpu_nic_map.py --env)
+  srun --threads-per-core=2 -n8 -c14 python cpu_nic_map.py --allocated
+"""
+
+import argparse
+import fnmatch
+import glob
+import os
+import re
+import subprocess
+import sys
+
+
+def hcalc(loc, itype):
+    # --disallowed (must come first): include cores excluded by SLURM core
+    # specialization (e.g. cpu 0, 8, 16, ...) so the map covers all 128
+    # CPUs, not just the ~112 currently allocatable to jobs -- a rank's
+    # affinity mask isn't guaranteed to avoid them (e.g. -S0 jobs).
+    # -p: report physical (OS/kernel) indices, matching os.sched_getaffinity()
+    # ids. Without it, hwloc-calc reports logical indices, which silently
+    # diverge from real CPU ids whenever core specialization or other
+    # exclusions shift the logical numbering (see lstopo's "P#" vs "L#").
+    out = (
+        subprocess.run(
+            ["hwloc-calc", "--disallowed", "-p", "-I", itype, loc],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    return [int(x) for x in out.split(",")] if out else []
+
+
+def _sysfs_cpulist(name):
+    """Parse /sys/class/net/<name>/device/local_cpulist into a set of PU ids."""
+    path = f"/sys/class/net/{name}/device/local_cpulist"
+    try:
+        text = open(path).read().strip()
+    except OSError:
+        return set()
+    pus = set()
+    for part in text.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            pus.update(range(int(lo), int(hi) + 1))
+        elif part:
+            pus.add(int(part))
+    return pus
+
+
+def _sysfs_numa(name):
+    """Read /sys/class/net/<name>/device/numa_node; returns int or None."""
+    path = f"/sys/class/net/{name}/device/numa_node"
+    try:
+        val = int(open(path).read().strip())
+        return val if val >= 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def build_map(pattern):
+    nics = sorted(
+        os.path.basename(p)
+        for p in glob.glob("/sys/class/net/*")
+        if os.path.exists(os.path.join(p, "device"))
+        and fnmatch.fnmatch(os.path.basename(p), pattern)
+    )
+    if not nics:
+        sys.exit(f"no NICs matching '{pattern}' found under /sys/class/net")
+
+    nic_closest = {n: _sysfs_cpulist(n) for n in nics}
+    nic_numa = {n: _sysfs_numa(n) for n in nics}
+    if not any(nic_closest.values()):
+        sys.exit(
+            "sysfs local_cpulist came back empty for all NICs -- "
+            "check /sys/class/net/hsn*/device/local_cpulist"
+        )
+
+    # When multiple NICs share the same local_cpulist (e.g. 4 NICs per NUMA
+    # node on Aurora all report identical affinity), split the CPU set evenly
+    # so each NIC owns a unique partition and nearest() returns distinct NICs.
+    # Split each contiguous range separately so every NIC gets a share of both
+    # physical cores and hyperthreads (not just one or the other).
+    cpuset_to_nics = {}
+    for n, cpus in nic_closest.items():
+        key = frozenset(cpus)
+        cpuset_to_nics.setdefault(key, []).append(n)
+    for key, group in cpuset_to_nics.items():
+        if len(group) > 1:
+            sorted_cpus = sorted(key)
+            k = len(group)
+            # Find contiguous ranges within the shared CPU set
+            ranges, start, prev = [], sorted_cpus[0], sorted_cpus[0]
+            for c in sorted_cpus[1:]:
+                if c != prev + 1:
+                    ranges.append(list(range(start, prev + 1)))
+                    start = c
+                prev = c
+            ranges.append(list(range(start, prev + 1)))
+            # Assign each NIC a chunk from every range
+            partitions = [set() for _ in range(k)]
+            for seg in ranges:
+                chunk = (len(seg) + k - 1) // k
+                for i in range(k):
+                    partitions[i].update(seg[i * chunk : (i + 1) * chunk])
+            for nic, part in zip(sorted(group), partitions):
+                nic_closest[nic] = part
+
+    # multiple NICs can share a NUMA node; pick the numerically/PCI-closest
+    # NIC as the "same-NUMA fallback owner" for cores not exactly local to any NIC
+    numa_to_nics = {}
+    for n, numa in nic_numa.items():
+        numa_to_nics.setdefault(numa, []).append(n)
+
+    all_pus = hcalc("all", "PU")
+    pu_numa = {}
+    for numa in numa_to_nics:
+        for pu in hcalc(f"NUMA:{numa}", "PU"):
+            pu_numa[pu] = numa
+
+    def nearest(pu):
+        numa = pu_numa.get(pu)
+        exact_owner = next((n for n in nics if pu in nic_closest[n]), None)
+        if exact_owner:
+            return exact_owner, "yes", numa
+        candidates = numa_to_nics.get(numa, nics)
+        return candidates[0], "same-NUMA", numa
+
+    return all_pus, nearest
+
+
+def compress_ranges(values):
+    values = sorted(values)
+    out = []
+    i = 0
+    while i < len(values):
+        j = i
+        while j + 1 < len(values) and values[j + 1] == values[j] + 1:
+            j += 1
+        out.append(str(values[i]) if i == j else f"{values[i]}-{values[j]}")
+        i = j + 1
+    return ",".join(out)
+
+
+def translate_iface(name, provider="hsn"):
+    """Translate a kernel NIC name (hsnN) to the libfabric domain name for
+    `provider`. 'cxi' -> cxiN (Perlmutter exposes hsnN's libfabric domain
+    under this name); 'hsn' (default) or anything else -> unchanged."""
+    if provider == "cxi":
+        m = re.match(r"hsn(\d+)$", name)
+        if m:
+            return f"cxi{m.group(1)}"
+    return name
+
+
+def serialize_env(pattern="hsn*", provider="hsn"):
+    all_pus, nearest = build_map(pattern)
+    by_nic = {}
+    for pu in all_pus:
+        nic = translate_iface(nearest(pu)[0], provider)
+        by_nic.setdefault(nic, []).append(pu)
+    return ";".join(
+        f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+    )
+
+
+def parse_env(s):
+    cpu_to_nic = {}
+    for segment in s.split(";"):
+        nic, ranges = segment.split("=", 1)
+        for r in ranges.split(","):
+            if "-" in r:
+                lo, hi = r.split("-")
+                cpu_to_nic.update((cpu, nic) for cpu in range(int(lo), int(hi) + 1))
+            else:
+                cpu_to_nic[int(r)] = nic
+    return cpu_to_nic
+
+
+def allocated_nics(pattern="hsn*", nic_map=None):
+    """Which NIC(s) this process's actual CPU affinity is nearest to.
+
+    Uses os.sched_getaffinity(0) to get the real CPU set the process is
+    bound to (respects SLURM --cpus-per-task/--cpu-bind and cgroups).
+
+    nic_map: an explicit precomputed map string (see serialize_env()/--env
+    format), taking priority over the DDSTORE_NIC_MAP env var. Pass this
+    when the caller already has the map from somewhere other than the
+    process environment. Falls back to a live hwloc-calc query when neither
+    is available.
+
+    Prefer a precomputed map: hwloc-calc's NIC/PCI visibility has been
+    observed to fail silently inside some srun tasks, so computing the map
+    once (e.g. in the sbatch batch step's own shell, where NIC visibility is
+    reliable) and sharing it -- via DDSTORE_NIC_MAP or the nic_map argument
+    -- is more robust than querying hwloc fresh in every rank.
+    """
+    allocated = sorted(os.sched_getaffinity(0))
+    map_str = nic_map if nic_map is not None else os.environ.get("DDSTORE_NIC_MAP")
+    if map_str:
+        cpu_to_nic = parse_env(map_str)
+        nics = {cpu_to_nic[c] for c in allocated if c in cpu_to_nic}
+    else:
+        all_pus, nearest = build_map(pattern)
+        nics = {nearest(c)[0] for c in allocated if c in all_pus}
+        fabric = os.environ.get("DDSTORE_FABRIC", "hsn")
+        by_nic = {}
+        for pu in all_pus:
+            nic = translate_iface(nearest(pu)[0], fabric)
+            by_nic.setdefault(nic, []).append(pu)
+        map_str = ";".join(
+            f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+        )
+        print(
+            "Tip: cache this map for future runs to avoid recomputing it per rank:\n"
+            f"  export DDSTORE_NIC_MAP={map_str}",
+            file=sys.stderr,
+        )
+    return allocated, nics
+
+
+def select_fabric_iface(nic_map=None):
+    """Pick the libfabric NIC (FABRIC_IFACE) for this process, if not
+    already set. Defers to allocated_nics(), which uses nic_map when given,
+    else DDSTORE_NIC_MAP when set, or a live hwloc-calc/lstopo query
+    (build_map) against this process's real CPU affinity when neither is.
+
+    Called automatically by PyDDStore.__cinit__ (src/pyddstore.pyx) for
+    method=1/2.
+
+    nic_map: an explicit precomputed map string (serialize_env()/--env
+    format), for callers that already have the map from somewhere other
+    than the process environment.
+
+    DDSTORE_FABRIC selects hsn (default) or cxi:
+      - hsn: Frontier's unchanged, already-proven behavior -- the kernel NIC
+        name (hsnN) is used as-is.
+      - cxi: Perlmutter's behavior, ported from dev-cxi@7cb110b. The kernel
+        NIC names are hsn0-hsn3 there too, but libfabric only exposes them
+        as cxi0-cxi3, so the result is translated hsnN -> cxiN. Also adds a
+        SLURM_LOCALID round-robin fallback for when hwloc can't map this
+        rank's CPU affinity to a NIC (common inside srun tasks with limited
+        PCI visibility).
+    """
+    use_cxi = os.environ.get("DDSTORE_FABRIC") == "cxi"
+
+    if "FABRIC_IFACE" in os.environ:
+        iface = os.environ["FABRIC_IFACE"]
+        if use_cxi:
+            translated = translate_iface(iface, "cxi")
+            if translated != iface:
+                iface = translated
+                os.environ["FABRIC_IFACE"] = iface
+        return iface
+
+    allocated, nics = allocated_nics(nic_map=nic_map)
+    if not nics:
+        if use_cxi:
+            cxi_domains = sorted(
+                os.path.basename(p)
+                for p in glob.glob("/sys/class/net/hsn*")
+                if re.match(r"hsn\d+$", os.path.basename(p))
+            )
+            if not cxi_domains:
+                raise RuntimeError(
+                    f"could not determine a nearest HSN NIC for this rank's "
+                    f"CPU affinity {allocated} and no hsn* devices found; "
+                    f"set FABRIC_IFACE explicitly to work around this"
+                )
+            local_rank = int(os.environ.get("SLURM_LOCALID", 0))
+            hsn = cxi_domains[local_rank % len(cxi_domains)]
+            iface = translate_iface(hsn, "cxi")
+            print(f"FABRIC_IFACE: fallback (SLURM_LOCALID={local_rank}) -> {iface}")
+            os.environ["FABRIC_IFACE"] = iface
+            return iface
+        raise RuntimeError(
+            f"could not determine a nearest HSN NIC for this rank's CPU "
+            f"affinity {allocated}; set FABRIC_IFACE explicitly to work "
+            f"around this"
+        )
+    iface = sorted(nics)[0]
+    if use_cxi:
+        iface = translate_iface(iface, "cxi")
+    if len(nics) > 1:
+        translated = sorted(
+            translate_iface(n, "cxi" if use_cxi else "hsn") for n in nics
+        )
+        print(f"FABRIC_IFACE: affinity spans {translated}, picking {iface}")
+
+    os.environ["FABRIC_IFACE"] = iface
+    return iface
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find the nearest HSN (Slingshot) NIC for a given CPU (PU) id, "
+        "based on hwloc PCI/NUMA locality.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  cpu_nic_map.py           print the full CPU -> nearest HSN NIC table\n"
+            "  cpu_nic_map.py 42        print only the nearest HSN NIC for cpu 42\n"
+            "  export DDSTORE_NIC_MAP=$(cpu_nic_map.py --env)   compute once, share via env\n"
+            "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
+            "  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names\n"
+        ),
+    )
+    parser.add_argument(
+        "cpu",
+        nargs="?",
+        type=int,
+        help="CPU (PU) id to look up; omit to print the full table",
+    )
+    parser.add_argument(
+        "--fabric",
+        default=os.environ.get("DDSTORE_FABRIC", "hsn"),
+        choices=["hsn", "cxi"],
+        help="translate printed NIC names to this fabric's libfabric "
+        "domain name (default: $DDSTORE_FABRIC, or hsn if unset) "
+        "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN (Perlmutter)",
+    )
+    parser.add_argument(
+        "--env",
+        action="store_true",
+        help="print only the compact DDSTORE_NIC_MAP env-var value",
+    )
+    parser.add_argument(
+        "--allocated",
+        action="store_true",
+        help="print this process's allocated CPUs (os.sched_getaffinity) "
+        "and their nearest NIC(s), instead of the full table",
+    )
+    args = parser.parse_args()
+
+    if args.env:
+        print(serialize_env(provider=args.fabric))
+        return
+
+    if args.allocated:
+        allocated, nics = allocated_nics()
+        nics = {translate_iface(n, args.fabric) for n in nics}
+        print(f"allocated CPUs: {allocated}")
+        print(f"nearest NIC(s): {sorted(nics)}")
+        return
+
+    all_pus, nearest = build_map("hsn*")
+
+    if args.cpu is not None:
+        if args.cpu not in all_pus:
+            sys.exit(
+                f"cpu id {args.cpu} not found (valid range: {min(all_pus)}-{max(all_pus)})"
+            )
+        owner, exact, numa = nearest(args.cpu)
+        print(translate_iface(owner, args.fabric))
+        return
+
+    print(f"{'CPU':>4}  {'NUMA':>4}  {'nearest NIC':>11}  exact")
+    for pu in all_pus:
+        owner, exact, numa = nearest(pu)
+        owner = translate_iface(owner, args.fabric)
+        print(f"{pu:>4}  {numa!s:>4}  {owner:>11}  {exact}")
+    by_nic = {}
+    for pu in all_pus:
+        nic = translate_iface(nearest(pu)[0], args.fabric)
+        by_nic.setdefault(nic, []).append(pu)
+    map_str = ";".join(
+        f"{nic}={compress_ranges(pus)}" for nic, pus in sorted(by_nic.items())
+    )
+    print(
+        "\nTip: cache this map for future runs:\n"
+        f"  export DDSTORE_NIC_MAP={map_str}",
+        file=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -9,8 +9,15 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include <vector>
 
-void init_fabric(struct fabric_state *fabric)
+/* hsn (tcp;ofi_rxm over Slingshot) path — Frontier. Unchanged from the
+ * already-proven dev-file2 implementation; only renamed (was init_fabric). */
+static void init_fabric_hsn(struct fabric_state *fabric)
 {
     struct fi_info *hints, *info, *originfo, *useinfo;
     struct fi_av_attr av_attr = {FI_AV_UNSPEC};
@@ -250,6 +257,284 @@ void init_fabric(struct fabric_state *fabric)
     fi_freeinfo(originfo);
 }
 
+/* cxi path — Perlmutter. Ported from dev-cxi@7cb110b (confirmed working on
+ * Perlmutter). Kept structurally separate from init_fabric_hsn() above
+ * rather than unified, so cxi support cannot change hsn's behavior. */
+static void init_fabric_cxi(struct fabric_state *fabric)
+{
+    struct fi_info *info, *originfo, *useinfo;
+    struct fi_av_attr av_attr = {FI_AV_UNSPEC};
+    struct fi_cq_attr cq_attr = {0};
+    char *ifname;
+    int result;
+
+    ifname = getenv("FABRIC_IFACE");
+    fabric->info = NULL;
+
+    int version = fi_version();
+
+    /* IMPORTANT: fi_getinfo() must be called with a literal NULL hints
+     * pointer.  Passing ANY hints struct (even one with only ep_attr->type
+     * set) causes fi_getinfo to return NULL inside this process (torch +
+     * NCCL + mpi4py all loaded) on Perlmutter compute nodes, even though a
+     * plain MPI-only C program does not exhibit this.  With a literal NULL
+     * hints pointer, fi_getinfo returns fully-populated fi_info entries
+     * (mr_mode, max_msg_size, tx_attr, rx_attr all correctly set) — verified
+     * on Perlmutter via a standalone test binary run under the same srun
+     * job. Do NOT "improve" this by adding hints back without re-verifying
+     * against a real running job (not just fi_info on the login node).      */
+    fi_getinfo(version, NULL, NULL, 0, NULL, &info);
+    if (!info)
+    {
+        fprintf(stderr, "no fabrics detected.\n");
+        return;
+    }
+
+    originfo = info;
+    useinfo = NULL;
+    while (info)
+    {
+        char *prov_name = info->fabric_attr->prov_name;
+        char *domain_name = info->domain_attr->name;
+
+        /* If FABRIC_IFACE is set, match by domain name against cxi or tcp;ofi_rxm. */
+        if (ifname && domain_name && (strcmp(ifname, domain_name) == 0) &&
+            (strcmp(prov_name, "cxi") == 0 || strcmp(prov_name, "tcp;ofi_rxm") == 0))
+        {
+            fprintf(stderr, "using interface set by FABRIC_IFACE: %s (%s).\n",
+                    domain_name, prov_name);
+            useinfo = info;
+            break;
+        }
+        if ((strcmp(prov_name, "cxi") == 0 ||
+             (strcmp(prov_name, "verbs") == 0 && info->src_addr) ||
+             strcmp(prov_name, "gni") == 0 ||
+             strcmp(prov_name, "psm2") == 0) &&
+            (!useinfo || (ifname && domain_name &&
+                          strcmp(useinfo->domain_attr->name, ifname) != 0)))
+        {
+            useinfo = info;
+        }
+        info = info->next;
+    }
+
+    info = useinfo;
+
+    if (!info)
+    {
+        fprintf(
+            stderr,
+            "none of the usable system fabrics are supported high speed "
+            "interfaces (cxi, verbs, gni, psm2.) To use a compatible fabric "
+            "that is being ignored (probably sockets), set the environment "
+            "variable FABRIC_IFACE to the interface name. Check the output "
+            "of fi_info to troubleshoot this message.\n");
+        fi_freeinfo(originfo);
+        return;
+    }
+
+    if (info->mode & FI_CONTEXT2)
+    {
+        fabric->ctx = (fi_context*) calloc(2, sizeof(*fabric->ctx));
+    }
+    else if (info->mode & FI_CONTEXT)
+    {
+        fabric->ctx = (fi_context*) calloc(1, sizeof(*fabric->ctx));
+    }
+    else
+    {
+        fabric->ctx = NULL;
+    }
+
+    /* For non-CXI providers, clear FI_MR_BASIC (legacy flag).  For CXI, the
+     * real fi_info from NULL-hints fi_getinfo already has the correct
+     * mr_mode/max_msg_size/tx_attr/rx_attr — do NOT override them.        */
+    if (!info->fabric_attr->prov_name ||
+        strcmp(info->fabric_attr->prov_name, "cxi") != 0)
+    {
+        info->domain_attr->mr_mode = 0;
+    }
+#ifdef SST_HAVE_CRAY_DRC
+    if (strstr(info->fabric_attr->prov_name, "gni") && fabric->auth_key)
+    {
+        info->domain_attr->auth_key = (uint8_t *)fabric->auth_key;
+        info->domain_attr->auth_key_size = sizeof(struct fi_gni_raw_auth_key);
+    }
+#endif /* SST_HAVE_CRAY_DRC */
+
+    fabric->info = fi_dupinfo(info);
+    if (!fabric->info)
+    {
+        fprintf(stderr, "copying the fabric info failed.\n");
+        fi_freeinfo(originfo);
+        return;
+    }
+    info = fabric->info;
+
+    result = fi_fabric(info->fabric_attr, &fabric->fabric, fabric->ctx);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "opening fabric access failed with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+    result = fi_domain(fabric->fabric, info, &fabric->domain, fabric->ctx);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "accessing domain failed with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fprintf(
+            stderr,
+            "fi_domain() has failed, which may mean that libfabric is "
+            "defaulting to the wrong interface, or that no CXI service is "
+            "available to this user on this node.  Check your FABRIC_IFACE "
+            "environment variable (or specify one).\n");
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    /* CRITICAL: the fi_info returned by fi_getinfo has tx_attr->op_flags /
+     * rx_attr->op_flags with FI_INJECT set by default for CXI.  libfabric's
+     * simple (non-msg) calls like fi_read()/fi_write() implicitly use the
+     * endpoint's default op_flags, so leaving FI_INJECT set causes CXI to
+     * treat every fi_read/fi_write as an inject operation, capping transfer
+     * size at tx_attr->inject_size (192 bytes on this system) and failing
+     * larger transfers with EMSGSIZE ("Message too long").  Clear op_flags
+     * before fi_endpoint() so normal-sized RMA reads/writes work.          */
+    info->tx_attr->op_flags = 0;
+    info->rx_attr->op_flags = 0;
+    /* Do NOT override ep_attr->type here — the fi_info already has the
+     * correct type from fi_getinfo and changing it after fi_domain causes
+     * fi_endpoint to fail with EINVAL (CXI). */
+
+    result = fi_endpoint(fabric->domain, info, &fabric->signal, fabric->ctx);
+    if (result != FI_SUCCESS || !fabric->signal)
+    {
+        fprintf(
+            stderr,
+            "opening endpoint failed with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    /* Query real max_msg_size from the created endpoint — necessary for CXI
+     * where fi_getinfo with NULL hints returns max_msg_size=0.               */
+    {
+        size_t max_msg_size = 0;
+        size_t optlen = sizeof(max_msg_size);
+        if (fi_getopt(&fabric->signal->fid, FI_OPT_ENDPOINT,
+                      FI_OPT_MAX_MSG_SIZE, &max_msg_size, &optlen) == FI_SUCCESS
+            && max_msg_size > 0)
+        {
+            info->ep_attr->max_msg_size = max_msg_size;
+            fprintf(stderr, "endpoint max_msg_size=%zu\n", max_msg_size);
+        }
+    }
+
+    av_attr.type = FI_AV_MAP;
+    av_attr.count = DP_AV_DEF_SIZE;
+    av_attr.ep_per_node = 0;
+    result = fi_av_open(fabric->domain, &av_attr, &fabric->av, fabric->ctx);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "could not initialize address vector, failed with %d "
+            "(%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+    result = fi_ep_bind(fabric->signal, &fabric->av->fid, 0);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "could not bind endpoint to address vector, failed with "
+            "%d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    cq_attr.size = 0;
+    cq_attr.format = FI_CQ_FORMAT_DATA;
+    result =
+        fi_cq_open(fabric->domain, &cq_attr, &fabric->cq_signal, fabric->ctx);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "opening completion queue failed with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    result = fi_ep_bind(
+        fabric->signal, &fabric->cq_signal->fid, FI_TRANSMIT | FI_RECV);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "could not bind endpoint to completion queue, failed "
+            "with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    result = fi_enable(fabric->signal);
+    if (result != FI_SUCCESS)
+    {
+        fprintf(
+            stderr,
+            "enable endpoint, failed with %d (%s). This is fatal.\n",
+            result,
+            fi_strerror(result));
+        fi_freeinfo(originfo);
+        fabric->info = NULL;
+        return;
+    }
+
+    if (originfo) fi_freeinfo(originfo);
+}
+
+/* Dispatch: DDSTORE_FABRIC selects the fabric-open implementation.
+ * Default (unset) is "hsn", so Frontier's behavior is unaffected unless
+ * something explicitly opts into "cxi". Not runtime fi_getinfo detection —
+ * an earlier attempt to unify both paths via runtime detection compiled
+ * cleanly but crashed hsn on Frontier at runtime, so hsn and cxi are kept
+ * as two independent, individually-proven implementations instead.        */
+void init_fabric(struct fabric_state *fabric)
+{
+    const char *provider = getenv("DDSTORE_FABRIC");
+    if (provider && strcmp(provider, "cxi") == 0)
+        init_fabric_cxi(fabric);
+    else
+        init_fabric_hsn(fabric);
+}
+
 int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
 {
     char address[DP_AV_DEF_SIZE];
@@ -271,6 +556,25 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     {
         fprintf(stderr, "fi_mr_reg failed: %s\n", fi_strerror(mr_rc));
         return 1;
+    }
+
+    /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before use.
+     * The provider-assigned key is only valid after fi_mr_enable(). No-op
+     * for hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).        */
+    if (is_mr_endpoint(fabric_state))
+    {
+        int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
+        if (rc != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_bind (send) failed: %s\n", fi_strerror(rc));
+            return 1;
+        }
+        rc = fi_mr_enable(fabric_state->mr);
+        if (rc != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_enable (send) failed: %s\n", fi_strerror(rc));
+            return 1;
+        }
     }
     fabric_state->key = fi_mr_key(fabric_state->mr);
 
@@ -305,7 +609,13 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     }
 
     size_t *pointer_addr_data = (size_t *)malloc(world_size * sizeof(size_t));
-    pointer_addr_data[rank] = (size_t)fabric_state->send_data;
+    /* With FI_MR_VIRT_ADDR the remote offset in fi_read is the virtual
+     * address; without it (e.g. CXI with FI_MR_PROV_KEY) it is 0-based
+     * from the MR registration base, so exchange 0. Always true (the real
+     * pointer) for hsn/verbs/gni/psm2.                                       */
+    pointer_addr_data[rank] = is_virt_addr(fabric_state)
+                                  ? (size_t)fabric_state->send_data
+                                  : 0;
 
     MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, pointer_addr_data, 1, MPI_UNSIGNED_LONG, comm);
     for (int i = 0; i < world_size; i++)
@@ -334,6 +644,25 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         0,
         &fabric_state->recv_mr,
         NULL);
+
+    /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
+     * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).             */
+    if (is_mr_endpoint(fabric_state))
+    {
+        int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
+        if (rc_mr != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_bind (recv) failed: %s\n", fi_strerror(rc_mr));
+            return 1;
+        }
+        rc_mr = fi_mr_enable(fabric_state->recv_mr);
+        if (rc_mr != FI_SUCCESS)
+        {
+            fprintf(stderr, "fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
+            return 1;
+        }
+    }
+
     void *memory_descriptor = NULL;
     if (is_local_mr_req(fabric_state))
     {
@@ -379,11 +708,315 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         {
             struct fi_cq_err_entry ee = {0};
             fi_cq_readerr(fabric_state->cq_signal, &ee, 0);
-            fprintf(stderr, "fi_cq_read failed with error: prov_errno=%d (%s)\n",
-                    ee.prov_errno, fi_strerror(ee.prov_errno));
+            /* prov_errno is provider-specific; fi_strerror() is only valid
+             * for generic fi_errno values. Use fi_cq_strerror() to get the
+             * correct provider-aware error string (provider-agnostic fix,
+             * applies to every provider, not just cxi).                      */
+            char errbuf[256];
+            const char *errstr = fi_cq_strerror(fabric_state->cq_signal,
+                                                 ee.prov_errno, ee.err_data,
+                                                 errbuf, sizeof(errbuf));
+            fprintf(stderr,
+                    "fi_cq_read failed: err=%d (%s) prov_errno=%d (%s)\n",
+                    ee.err, fi_strerror(ee.err), ee.prov_errno,
+                    errstr ? errstr : "(unknown)");
             return 1;
         }
     }
 
+    return 0;
+}
+
+/* =========================================================================
+ * Method 2: file-based handshake helpers
+ * =========================================================================
+ *
+ * File naming convention:
+ *   {dir}/{varname}.bin   — one combined file per variable, holding all
+ *                           n_core CoreRecords, written once by core rank 0
+ *                           after an MPI_Allgather among core ranks.
+ *
+ * Directory resolution priority:
+ *   1. user_dir argument (non-empty string)
+ *   2. DDSTORE_HANDSHAKE_DIR environment variable
+ *   3. "./ddstore_hs" (current working directory fallback)
+ *
+ * The resolved directory must be on a shared filesystem (e.g. Lustre)
+ * visible to all nodes.  It is created automatically if it does not exist.
+ *
+ * Default poll timeout: DDSTORE_HANDSHAKE_TIMEOUT_S env var, default 300 s.
+ * Poll interval: 50 ms.
+ * ========================================================================= */
+
+/* Resolve the handshake directory.
+ * Returns a pointer to a static buffer — copy before next call.             */
+extern "C" const char *resolve_handshake_dir(const char *user_dir)
+{
+    static char resolved[4096];
+
+    if (user_dir && user_dir[0] != '\0')
+    {
+        snprintf(resolved, sizeof(resolved), "%s", user_dir);
+    }
+    else
+    {
+        const char *env = getenv("DDSTORE_HANDSHAKE_DIR");
+        if (env && env[0] != '\0')
+            snprintf(resolved, sizeof(resolved), "%s", env);
+        else
+            snprintf(resolved, sizeof(resolved), "./ddstore_hs");
+    }
+
+    /* Create the directory if it does not exist (best-effort; ignore EEXIST). */
+    mkdir(resolved, 0755);
+
+    return resolved;
+}
+
+/* Build the canonical path for a variable's combined record file into `buf`.
+ * varname is sanitised: any '/' or '.' characters are replaced with '_' so
+ * that a caller-supplied name cannot escape the handshake directory.          */
+static void record_path(char *buf, size_t bufsz,
+                        const char *dir, const char *varname)
+{
+    /* Copy and sanitise varname into a local buffer. */
+    char safe[256];
+    size_t i;
+    for (i = 0; i < sizeof(safe) - 1 && varname[i] != '\0'; i++)
+    {
+        char c = varname[i];
+        safe[i] = (c == '/' || c == '.') ? '_' : c;
+    }
+    safe[i] = '\0';
+
+    snprintf(buf, bufsz, "%s/%s.bin", dir, safe);
+}
+
+/* Return the configured timeout in seconds (default 300).                   */
+static int handshake_timeout_s(void)
+{
+    const char *env = getenv("DDSTORE_HANDSHAKE_TIMEOUT_S");
+    if (env) return atoi(env);
+    return 300;
+}
+
+/* --------------------------------------------------------------------------
+ * handshake_write()
+ *
+ * Called by each core rank after init_fabric() and fi_mr_reg().
+ * Exchanges CoreRecords with all other core ranks via MPI_Allgather over
+ * `comm` — no filesystem round-trip needed, since core ranks already share
+ * a communicator.  Builds this rank's address vector / remote key / remote
+ * address arrays from the gathered records.  Rank 0 additionally publishes
+ * the combined array to {resolved_dir}/{varname}.bin (tmp + fsync + rename)
+ * so extra members can join later.
+ * -------------------------------------------------------------------------- */
+extern "C" int handshake_write(struct fabric_state *fs, MPI_Comm comm,
+                    const char *dir, const char *varname,
+                    int n_core, long nrows, int disp, int itemsize,
+                    long *lenlist)
+{
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+
+    /* Build this rank's CoreRecord. */
+    struct CoreRecord rec;
+    memset(&rec, 0, sizeof(rec));
+
+    rec.fabric_address_len = DP_AV_DEF_SIZE;
+    int status = fi_getname((fid_t)fs->signal,
+                            rec.fabric_address, &rec.fabric_address_len);
+    if (status != FI_SUCCESS)
+    {
+        fprintf(stderr, "[handshake_write] fi_getname failed: %s\n",
+                fi_strerror(status));
+        return 1;
+    }
+
+    rec.key          = fs->key;
+    /* Same rule as handshake(): 0 for CXI's provider-key mode, the real
+     * pointer otherwise (always true for hsn/verbs/gni/psm2).               */
+    rec.base_address = is_virt_addr(fs) ? (uint64_t)(uintptr_t)fs->send_data : 0;
+    rec.nrows        = nrows;
+    rec.disp         = disp;
+    rec.itemsize     = itemsize;
+
+    /* Exchange records among core ranks directly over MPI. */
+    std::vector<struct CoreRecord> all_recs(n_core);
+    MPI_Allgather(&rec, sizeof(rec), MPI_BYTE,
+                 all_recs.data(), sizeof(rec), MPI_BYTE, comm);
+
+    /* Build this rank's address vector / remote key / remote address
+     * arrays from the gathered records. */
+    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
+    {
+        fprintf(stderr, "[handshake_write] malloc failed\n");
+        return 1;
+    }
+    for (int i = 0; i < n_core; i++)
+    {
+        int rc = fi_av_insert(fs->av, all_recs[i].fabric_address, 1,
+                              &fs->comm_partner[i], 0, NULL);
+        if (rc != 1)
+        {
+            fprintf(stderr,
+                    "[handshake_write] fi_av_insert failed for rank %d (rc=%d)\n",
+                    i, rc);
+            return 1;
+        }
+        fs->remote_key[i]     = all_recs[i].key;
+        fs->remote_address[i] = all_recs[i].base_address;
+        lenlist[i]            = all_recs[i].nrows;
+    }
+    fs->world_size = n_core;
+
+    /* Rank 0 publishes the combined record array for extra members.  Write
+     * to a temp file first, fsync, then atomically rename into place so
+     * readers polling the final path never observe a partially-written or
+     * truncated-then-being-rewritten record.                                */
+    if (rank == 0)
+    {
+        const char *rdir = resolve_handshake_dir(dir);
+        char bin_path[4096];
+        char tmp_path[4096 + 32];
+        record_path(bin_path, sizeof(bin_path), rdir, varname);
+        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
+
+        FILE *f = fopen(tmp_path, "wb");
+        if (!f)
+        {
+            fprintf(stderr, "[handshake_write] cannot open %s: ", tmp_path);
+            perror("");
+            return 1;
+        }
+        if (fwrite(all_recs.data(), sizeof(struct CoreRecord), n_core, f) != (size_t)n_core)
+        {
+            fprintf(stderr, "[handshake_write] fwrite failed for %s\n", tmp_path);
+            fclose(f);
+            unlink(tmp_path);
+            return 1;
+        }
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0)
+        {
+            fprintf(stderr, "[handshake_write] fsync failed for %s: ", tmp_path);
+            perror("");
+            fclose(f);
+            unlink(tmp_path);
+            return 1;
+        }
+        fclose(f);
+
+        if (rename(tmp_path, bin_path) != 0)
+        {
+            fprintf(stderr, "[handshake_write] rename %s -> %s failed: ", tmp_path, bin_path);
+            perror("");
+            unlink(tmp_path);
+            return 1;
+        }
+
+        fprintf(stderr, "[handshake_write] wrote %s (%d records)\n", bin_path, n_core);
+    }
+
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * handshake_join()
+ *
+ * Called by extra members (no MPI communicator, no data to publish).
+ * Polls for {resolved_dir}/{varname}.bin (the combined record file written
+ * by core rank 0 in handshake_write()) to reach its expected size, reads
+ * it, and populates:
+ *   fs->comm_partner[0..n_core-1]   (fi_addr_t, via fi_av_insert)
+ *   fs->remote_key[0..n_core-1]
+ *   fs->remote_address[0..n_core-1]
+ *   lenlist[0..n_core-1]            (raw nrows, NOT prefix-summed)
+ *   *out_disp, *out_itemsize        (from record 0; assumed uniform)
+ *
+ * Returns 0 on success, non-zero on error or timeout.
+ * -------------------------------------------------------------------------- */
+extern "C" int handshake_join(struct fabric_state *fs,
+                   const char *dir, const char *varname,
+                   int n_core,
+                   long *lenlist, int *out_disp, int *out_itemsize)
+{
+    const char *rdir = resolve_handshake_dir(dir);
+    int timeout_s = handshake_timeout_s();
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+    char path[4096];
+    record_path(path, sizeof(path), rdir, varname);
+    size_t expected_size = (size_t)n_core * sizeof(struct CoreRecord);
+
+    /* Poll until the combined record file is fully written. */
+    for (;;)
+    {
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size == (off_t)expected_size)
+            break;
+
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        double elapsed = (ts_now.tv_sec  - ts_start.tv_sec) +
+                         (ts_now.tv_nsec - ts_start.tv_nsec) * 1e-9;
+        if (elapsed > timeout_s)
+        {
+            fprintf(stderr,
+                    "[handshake_join] timeout after %.0f s waiting for "
+                    "%s (var=%s, dir=%s)\n",
+                    elapsed, path, varname, rdir);
+            return 1;
+        }
+        usleep(50000); /* 50 ms */
+    }
+
+    std::vector<struct CoreRecord> all_recs(n_core);
+    FILE *f = fopen(path, "rb");
+    if (!f)
+    {
+        fprintf(stderr, "[handshake_join] cannot open %s: ", path);
+        perror("");
+        return 1;
+    }
+    if (fread(all_recs.data(), sizeof(struct CoreRecord), n_core, f) != (size_t)n_core)
+    {
+        fprintf(stderr, "[handshake_join] fread failed for %s\n", path);
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+
+    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
+    {
+        fprintf(stderr, "[handshake_join] malloc failed\n");
+        return 1;
+    }
+
+    for (int i = 0; i < n_core; i++)
+    {
+        int rc = fi_av_insert(fs->av, all_recs[i].fabric_address, 1,
+                              &fs->comm_partner[i], 0, NULL);
+        if (rc != 1)
+        {
+            fprintf(stderr,
+                    "[handshake_join] fi_av_insert failed for rank %d (rc=%d)\n",
+                    i, rc);
+            return 1;
+        }
+        fs->remote_key[i]     = all_recs[i].key;
+        fs->remote_address[i] = all_recs[i].base_address;
+        lenlist[i]            = all_recs[i].nrows;
+    }
+
+    if (out_disp)     *out_disp     = all_recs[0].disp;
+    if (out_itemsize) *out_itemsize = all_recs[0].itemsize;
+
+    fs->world_size = n_core;
     return 0;
 }

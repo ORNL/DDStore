@@ -9,7 +9,7 @@ from setuptools.extension import Extension
 import os
 import subprocess
 
-defs = [('NPY_NO_DEPRECATED_API', 0)]
+defs = [("NPY_NO_DEPRECATED_API", 0)]
 include_dirs = list()
 library_dirs = list()
 libraries = list()
@@ -31,20 +31,25 @@ libraries.append("fabric")
 include_dirs.append(np.get_include())
 include_dirs.append("include")
 
-extending = Extension("pyddstore",
-                      sources=["src/pyddstore.pyx", "src/ddstore.cxx", "src/common.cxx"],
-                      include_dirs=include_dirs,
-                      extra_compile_args=["-std=c++11"],
-                      define_macros=defs,
-                      library_dirs=library_dirs,
-                      libraries=libraries,
-                      )
+extending = Extension(
+    "pyddstore",
+    sources=["src/pyddstore.pyx", "src/ddstore.cxx", "src/common.cxx"],
+    include_dirs=include_dirs,
+    extra_compile_args=["-std=c++11"],
+    define_macros=defs,
+    library_dirs=library_dirs,
+    libraries=libraries,
+)
 
-extensions = [extending,]
+extensions = [
+    extending,
+]
 
 setup(
     name="PyDDStore",
     version="0.1",
     description="Distributed Data Store",
-    ext_modules=cythonize(extensions)
+    package_dir={"": "src"},
+    py_modules=["cpu_nic_map"],
+    ext_modules=cythonize(extensions),
 )

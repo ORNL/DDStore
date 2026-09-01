@@ -4,6 +4,7 @@ Multi-rank tests — run with: mpirun -n 4 pytest test/test_multirank.py -v
 Each rank stores a distinct value; tests verify cross-rank remote reads.
 Requires at least 2 ranks; some tests require exactly 4.
 """
+
 import numpy as np
 import pytest
 from mpi4py import MPI
@@ -18,6 +19,7 @@ def all_passed(comm, local_ok):
 # ---------------------------------------------------------------------------
 # remote get: each rank reads from every other rank
 # ---------------------------------------------------------------------------
+
 
 def test_remote_get_all_ranks(comm):
     rank = comm.Get_rank()
@@ -47,6 +49,7 @@ def test_remote_get_all_ranks(comm):
 # boundary: last row of each rank's shard
 # ---------------------------------------------------------------------------
 
+
 def test_remote_get_last_row(comm):
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -65,8 +68,10 @@ def test_remote_get_last_row(comm):
         store.get("x", out, start=last_global_idx)
         expected = data[nrows - 1] + (target_rank - rank) * 1000
         # recompute expected from target rank's perspective
-        expected = np.arange((nrows - 1) * ncols, nrows * ncols,
-                              dtype=np.float32) + target_rank * 1000
+        expected = (
+            np.arange((nrows - 1) * ncols, nrows * ncols, dtype=np.float32)
+            + target_rank * 1000
+        )
         if not np.allclose(out[0], expected):
             local_ok = False
     store.epoch_end()
@@ -78,6 +83,7 @@ def test_remote_get_last_row(comm):
 # ---------------------------------------------------------------------------
 # init + update on each rank, then remote get
 # ---------------------------------------------------------------------------
+
 
 def test_init_update_remote_get(comm):
     rank = comm.Get_rank()
@@ -107,6 +113,7 @@ def test_init_update_remote_get(comm):
 # ---------------------------------------------------------------------------
 # multiple variables — independent correctness
 # ---------------------------------------------------------------------------
+
 
 def test_multiple_variables_remote(comm):
     rank = comm.Get_rank()
@@ -139,6 +146,7 @@ def test_multiple_variables_remote(comm):
 # ---------------------------------------------------------------------------
 # ddstore_width: sub-communicator grouping (requires size >= 4)
 # ---------------------------------------------------------------------------
+
 
 def test_ddstore_width(comm):
     size = comm.Get_size()

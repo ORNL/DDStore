@@ -4,6 +4,7 @@
 ## Do not reorder these imports.
 import argparse
 import os
+import time
 import torch
 import torch.utils.data
 from torch import optim
@@ -145,11 +146,31 @@ test_loader = torch.utils.data.DataLoader(
 )
 
 
+# VAE_PROFILE=1 splits each epoch's wall time into "fetch" (time spent
+# inside the DataLoader producing a batch -- __getitem__/get()/collate) vs
+# "compute" (forward/backward/optimizer.step()), to see whether a data-
+# loading change (e.g. --gpu-dest/--gpu-source) is actually moving the
+# needle relative to the rest of the step, rather than guessing from total
+# wall time alone. Off by default -- adds one time.perf_counter() pair per
+# batch, negligible but not zero.
+PROFILE = os.environ.get("VAE_PROFILE") == "1"
+
+
 def train(epoch):
     model.train()
     train_loss = 0
+    fetch_time = 0.0
+    compute_time = 0.0
     train_loader.dataset.ddstore.epoch_begin()
-    for batch_idx, (data, _) in enumerate(train_loader):
+    data_iter = iter(train_loader)
+    batch_idx = 0
+    while True:
+        t0 = time.perf_counter()
+        try:
+            data, _ = next(data_iter)
+        except StopIteration:
+            break
+        t1 = time.perf_counter()
         train_loader.dataset.ddstore.epoch_end()
         # print(rank, device)
         data = data.to(device)
@@ -165,6 +186,14 @@ def train(epoch):
         # print(rank, "backward")
         optimizer.step()
         # print(rank, "step")
+        # Skip epoch 1: CUDA/HIP kernel compilation, MIOpen/cuDNN algo
+        # selection, and allocator warmup make it dominated by one-time
+        # costs unrelated to steady-state fetch/compute timing.
+        if PROFILE and epoch > 1:
+            torch.cuda.synchronize(device=device)
+            t2 = time.perf_counter()
+            fetch_time += t1 - t0
+            compute_time += t2 - t1
         if batch_idx % args.log_interval == 0:
             print(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
@@ -177,6 +206,7 @@ def train(epoch):
             )
 
         train_loader.dataset.ddstore.epoch_begin()
+        batch_idx += 1
 
     train_loader.dataset.ddstore.epoch_end()
     if rank == 0:
@@ -185,6 +215,13 @@ def train(epoch):
                 epoch, train_loss / len(train_loader.dataset)
             )
         )
+        if PROFILE and epoch > 1:
+            print(
+                "[profile] epoch {}: fetch={:.3f}s compute={:.3f}s".format(
+                    epoch, fetch_time, compute_time
+                ),
+                flush=True,
+            )
 
 
 def test(epoch):

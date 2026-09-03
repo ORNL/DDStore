@@ -58,6 +58,40 @@ def _hmem_iface_for(tensor):
     import torch
     return _FI_HMEM_ROCR if torch.version.hip is not None else _FI_HMEM_CUDA
 
+def _should_sync_before_rdma(tensor):
+    """Whether to torch.cuda.synchronize() a GPU buffer before handing it
+    to RDMA (see the sync call sites in add()/get() for what this guards
+    against). Controlled by DDSTORE_GPU_SYNC (case-insensitive):
+      "always" -- always sync.
+      "never"  -- never sync (only override this if you've independently
+                  confirmed your workload is safe without it -- see below).
+      "auto" (default, or any other/unset value) -- sync on ROCm/HIP
+                  builds of torch, skip on CUDA builds.
+
+    Rationale for the auto default: confirmed by direct testing that
+    ROCm's HMEM-over-CXI path needs this sync -- without it, a GPU
+    buffer's RDMA transfer can be silently masked by stale GPU cache
+    content from a preceding, not-yet-retired compute-kernel write to the
+    same memory (observed as both silent data corruption in small tests
+    and HSA_STATUS_ERROR_EXCEPTION hardware faults in a real, sustained
+    training loop). CUDA has not shown this failure in either an
+    equivalent poison-value test or one real training run, plausibly
+    because NVIDIA's decade-hardened GPUDirect RDMA stack already
+    enforces this coherence transparently -- but that evidence is narrower
+    than what exposed the ROCm bug (a real training loop, not just
+    isolated tests), so this is treated as "no evidence of the problem on
+    CUDA yet" rather than "proven unnecessary on CUDA". DDSTORE_GPU_SYNC
+    exists specifically so this default can be overridden the moment
+    either direction needs it, without a code change.
+    """
+    import torch
+    override = os.environ.get("DDSTORE_GPU_SYNC", "auto").strip().lower()
+    if override == "always":
+        return True
+    if override == "never":
+        return False
+    return torch.version.hip is not None
+
 def _check_gpu_fabric_preconditions(int method, str what):
     """Shared method=1/2 + DDSTORE_FABRIC=cxi precondition check for a GPU
     (CUDA/HIP) buffer passed to add() or get(). `what` customizes the error
@@ -188,6 +222,11 @@ cdef class PyDDStore:
                     "active in C++ while its Python keepalive reference is "
                     "replaced here, risking a dangling pointer)" % name)
             import torch
+            # Flush any pending/async GPU compute-kernel writes to `arr`
+            # before handing it to RDMA -- see _should_sync_before_rdma()
+            # for what this guards against and why it's conditional.
+            if _should_sync_before_rdma(arr):
+                torch.cuda.synchronize(device=arr.device)
             iface = _hmem_iface_for(arr)
             ptr = arr.data_ptr()
             nrows = arr.shape[0]
@@ -240,6 +279,10 @@ cdef class PyDDStore:
             _check_gpu_fabric_preconditions(self.method, "GPU destination buffer")
             assert arr.is_contiguous()
             import torch
+            # See _should_sync_before_rdma() / the matching comment in
+            # add() for what this guards against and why it's conditional.
+            if _should_sync_before_rdma(arr):
+                torch.cuda.synchronize(device=arr.device)
             iface = _hmem_iface_for(arr)
             ptr = arr.data_ptr()
             if arr.dtype == torch.int32:

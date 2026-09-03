@@ -114,7 +114,7 @@ Register a NumPy array as a named variable. Each rank contributes its local shar
 | Parameter | Type | Description |
 |---|---|---|
 | `name` | `str` | Variable identifier |
-| `arr` | `np.ndarray` | C-contiguous 2-D (or 1-D) array. Supported dtypes: `int32`, `int64`, `uint8`, `float32`, `float64`, `bool_` |
+| `arr` | `np.ndarray` or `torch.Tensor` | C-contiguous 2-D (or 1-D) array/tensor. Supported dtypes: `int32`, `int64`, `uint8`, `float32`, `float64`, `bool_`/`bool`. A CUDA/HIP tensor registers GPU memory directly — see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers) below |
 
 ---
 
@@ -137,7 +137,7 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 | Parameter | Type | Description |
 |---|---|---|
 | `name` | `str` | Variable identifier |
-| `arr` | `np.ndarray` | Pre-allocated, C-contiguous output buffer |
+| `arr` | `np.ndarray` or `torch.Tensor` | Pre-allocated, C-contiguous output buffer. A CUDA/HIP tensor writes the RDMA transfer directly into GPU memory — see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers) below |
 | `start` | `int` | Global row index |
 
 ---
@@ -239,6 +239,42 @@ See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_
 
 `ddstore_width` grouping (below) is not currently supported with `method=2` — every core rank in `comm` is treated as one group.
 
+## GPUDirect RDMA (GPU-resident buffers)
+
+`add()` and `get()` accept a CUDA/HIP `torch.Tensor` in place of a NumPy array, letting RDMA read from or write directly into GPU memory — no host staging buffer, no `.cpu()`/`.to(device)` copy. Requires `method=1` or `2`, `DDSTORE_FABRIC=cxi` (the `hsn` provider does not support this), and a CUDA- or ROCm/HIP-enabled PyTorch build.
+
+```python
+import torch
+data = torch.rand(1024, 64, dtype=torch.float32, device="cuda")
+store.add("features", data)                      # GPU source -- no host copy
+
+out = torch.empty((1, 64), dtype=torch.float32, device="cuda")
+store.get("features", out, start=2048)            # GPU destination -- no host copy
+```
+
+Passing a GPU tensor to `add()` registers a **raw pointer into your tensor's own storage — no copy is made.** You must keep that tensor alive (not garbage-collected, not reused) for as long as the variable stays registered, i.e. until `free()`. `PyDDStore` holds its own reference internally as a safety net, but calling `add()` again for the same variable name with a GPU tensor is rejected outright rather than silently dropping the earlier reference. This differs from the NumPy path, where `add()` always makes a private copy and the caller's array can be freed or reused immediately after the call returns. `get()`'s destination buffer has no such caveat — it's yours as usual.
+
+Not supported: `init()`/`update()` (the incremental-fill path) remain host-only; `method=0` (MPI RMA) does not support GPU buffers on either `add()` or `get()`. Both raise a clear error naming the actual requirement if you try.
+
+See [test/test_gpu_rdma.py](test/test_gpu_rdma.py) for runnable examples covering both directions, both libfabric methods, and the negative/error cases, and the `--gpu-dest`/`--gpu-source` flags on [examples/vae/vae-ddp.py](examples/vae/vae-ddp.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) / [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) for a full DDP training example using it.
+
+### `DDSTORE_GPU_SYNC`
+
+GPU kernels execute asynchronously: a compute kernel that just wrote to (or is about to read) a buffer may not have fully retired by the time that buffer is handed to RDMA. On at least one ROCm+CXI build, this produced a real, confirmed bug: the RDMA transfer reported success, but the destination buffer could still show stale, pre-transfer content, because the GPU's cache hadn't been reconciled with the external NIC write. Under sustained, real-workload conditions (not just short unit tests) this showed up as hard GPU faults, not just wrong data. To guard against this, `PyDDStore` synchronizes the GPU device before registering a buffer for RDMA whenever needed:
+
+| Value | Behavior |
+|---|---|
+| `auto` (default) | Synchronize on ROCm/HIP builds of PyTorch, skip on CUDA builds |
+| `always` | Always synchronize, on any platform |
+| `never` | Never synchronize — only set this once you've independently verified your workload is safe without it |
+
+The `auto` default reflects what's actually been observed, not a platform guarantee: NVIDIA's long-hardened GPUDirect RDMA stack has shown no evidence of this race so far, but that evidence comes from lighter testing than what exposed it on ROCm (a real, sustained training loop, not just short unit tests) — so treat it as "no evidence of a problem on CUDA," not "proven safe on CUDA." Synchronizing has a real performance cost: it's a blocking, whole-device sync before every GPU-buffer `add()`/`get()` call, which can serialize GPU compute against RDMA transfers when called at high frequency (e.g. once per sample in a data loader). Set `DDSTORE_GPU_SYNC=always` for extra safety on CUDA too; set `never` only after confirming it's unnecessary for your specific workload and platform.
+
+```bash
+export DDSTORE_GPU_SYNC=always   # force the safety margin everywhere
+export DDSTORE_GPU_SYNC=never    # disable it (only if you've verified it's safe)
+```
+
 ## Partitioned / Sub-communicator Usage
 
 `PyDDStore` itself always spans the full communicator you pass it — there is no built-in "ranks per group" option. To run several independent stores side by side (e.g. one per node), split `comm` yourself before constructing `PyDDStore`, giving each group its own sub-communicator. Each group then holds a full replica of the dataset, partitioned across its own members.
@@ -269,6 +305,12 @@ See [examples/vae/distdataset.py](examples/vae/distdataset.py) for a `torch.util
 mpirun -n 4 python examples/vae/vae-ddp.py
 ```
 
+`vae-ddp.py` and `vae_extra_train.py`/`vae_core_server.py` (the [method=2 split](#file-based-handshake-method2) variant) also accept `--gpu-dest`/`--gpu-source` to exercise [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers) end-to-end in a real training loop — `--gpu-dest` allocates the fetched batch directly on the training device, `--gpu-source` stores the local shard GPU-resident too:
+
+```bash
+DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --gpu-dest --gpu-source
+```
+
 ## Testing
 
 ### Unit tests (pytest)
@@ -291,10 +333,17 @@ mpirun -n 1 python -m pytest test/test_single.py -v
 mpirun -n 4 python -m pytest test/test_multirank.py -v
 ```
 
+**GPUDirect RDMA** — requires a live `cxi` fabric and a CUDA/HIP GPU per rank (skipped automatically otherwise); see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers):
+
+```bash
+DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
+```
+
 | Test file | Min ranks | What is tested |
 |---|---|---|
 | `test/test_single.py` | 1 | All dtypes, `add`/`get`, `init`/`update`/`get`, error handling, double `free()` |
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
+| `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
 
 ### Integration scripts
 

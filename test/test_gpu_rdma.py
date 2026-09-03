@@ -61,6 +61,158 @@ def test_get_into_gpu_tensor_cxi(comm, monkeypatch):
 
 
 @gpu_required
+def test_get_into_gpu_tensor_cxi_compute_kernel_read(comm, monkeypatch):
+    """Diagnostic: does reading the RDMA destination via a GPU COMPUTE
+    KERNEL (not a .cpu() DMA-engine copy) crash/fault, unlike every other
+    test in this file which always reads back via .cpu()? A real training
+    loop (examples/vae/vae-ddp.py --gpu-dest) feeds the destination tensor
+    directly into model(data) -- a compute-kernel read -- and hit
+    HSA_STATUS_ERROR_EXCEPTION hardware faults at real batch-loop scale,
+    something none of the .cpu()-based tests in this file have ever
+    reproduced. Hypothesis: the NIC's P2P write into GPU memory isn't
+    visible/coherent to compute cores (cache/TLB gap) the way it is to the
+    DMA engine .cpu() uses -- untested by every other test here. Also loops
+    many iterations back-to-back (no pauses) to mirror DataLoader's rapid
+    per-sample get() calls, in case repeated register/deregister at a
+    reused address (PyTorch's allocator likely returns the same block each
+    time for same-shape torch.empty() in a tight loop) is a contributing
+    factor rather than the compute-kernel read alone.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+    n_iters = 200
+
+    store = dds.PyDDStore(comm, method=1)
+    data = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
+    store.add("x", data)
+
+    store.epoch_begin()
+    target_rank = (rank + 1) % size
+    expected = float(target_rank + 1)
+    for i in range(n_iters):
+        # torch.empty (not full/poisoned): mirrors DistDataset.get()'s real
+        # allocation exactly, and a fresh, uninitialized block is what a
+        # compute kernel would actually read if the transfer no-op'd --
+        # closer to the real crash scenario than a poisoned buffer.
+        out = torch.empty((1, ncols), dtype=torch.float32, device="cuda")
+        store.get("x", out, start=target_rank * nrows)
+        # GPU compute-kernel read (not .cpu()): elementwise op launches a
+        # real kernel touching `out`'s memory from the compute cores.
+        diff = (out - expected).abs().sum()
+        # Forces the host to wait for the kernel and surfaces any async
+        # HIP error at this point (torch raises a RuntimeError mentioning
+        # the HIP error, or the process aborts, same as the real crash).
+        torch.cuda.synchronize()
+        if i % 50 == 0:
+            print(f"[rank {rank}] iter={i} diff={diff.item()}", flush=True)
+    store.epoch_end()
+    print(f"[rank {rank}] completed {n_iters} iterations without a HIP error", flush=True)
+    store.free()
+
+
+@gpu_required
+def test_get_into_gpu_tensor_cxi_matrix(comm, monkeypatch):
+    """Isolates which factor actually determines pass/fail: buffer
+    allocation method (torch.empty, uninitialized vs torch.full, poisoned
+    via a GPU compute-kernel write) crossed with readback method (.cpu()
+    DMA copy vs GPU compute-kernel read + torch.cuda.synchronize()).
+    test_get_into_gpu_tensor_cxi (poison + .cpu()) reliably fails on
+    Frontier; test_get_into_gpu_tensor_cxi_compute_kernel_read (empty +
+    compute-kernel read) just passed cleanly, 200/200 iterations, diff=0.0.
+    This runs all 4 combinations back-to-back in one job to find out which
+    axis (allocation vs readback) actually matters, rather than guessing.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+    POISON = -999.0
+
+    store = dds.PyDDStore(comm, method=1)
+    data = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
+    store.add("x", data)
+    store.epoch_begin()
+
+    target_rank = (rank + 1) % size
+    expected = float(target_rank + 1)
+    results = {}
+    for alloc in ("empty", "poison"):
+        for readback in ("cpu", "kernel"):
+            if alloc == "empty":
+                out = torch.empty((1, ncols), dtype=torch.float32, device="cuda")
+            else:
+                out = torch.full((1, ncols), POISON, dtype=torch.float32, device="cuda")
+            store.get("x", out, start=target_rank * nrows)
+            if readback == "cpu":
+                snapshot = out.cpu()
+                ok = bool(torch.all(snapshot == expected))
+                detail = snapshot.tolist()
+            else:
+                diff = (out - expected).abs().sum()
+                torch.cuda.synchronize()
+                ok = bool(diff.item() == 0.0)
+                detail = f"diff={diff.item()}"
+            key = f"alloc={alloc},readback={readback}"
+            results[key] = ok
+            print(f"[rank {rank}] {key} ok={ok} detail={detail}", flush=True)
+
+    store.epoch_end()
+    gathered = comm.gather(results, root=0)
+    if rank == 0:
+        print(f"[rank 0] ALL RESULTS: {gathered}", flush=True)
+    store.free()
+    # Fail loudly with the full matrix visible in the log even if only one
+    # combination is wrong -- this test is diagnostic, not a pass/fail gate.
+    assert all(results.values()), f"[rank {rank}] matrix results: {results}"
+
+
+@gpu_required
+def test_get_into_gpu_tensor_cxi_sync_before_get(comm, monkeypatch):
+    """Follow-up to test_get_into_gpu_tensor_cxi_matrix's finding: RDMA into
+    a torch.full()-poisoned (GPU-kernel-written) buffer fails, but into a
+    torch.empty() (untouched) buffer works -- readback method is
+    irrelevant. Hypothesis: a cache-coherency gap where the NIC's RDMA
+    write doesn't invalidate whatever the GPU cache still holds from the
+    prior compute-kernel write. Tests whether an explicit
+    torch.cuda.synchronize() between the poisoning kernel and the RDMA
+    get() call (forcing the kernel write to fully retire/flush first) is
+    enough to fix it.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+    POISON = -999.0
+
+    store = dds.PyDDStore(comm, method=1)
+    data = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
+    store.add("x", data)
+    store.epoch_begin()
+
+    target_rank = (rank + 1) % size
+    expected = float(target_rank + 1)
+
+    out = torch.full((1, ncols), POISON, dtype=torch.float32, device="cuda")
+    torch.cuda.synchronize()  # <-- the fix under test: flush the poison write first
+    store.get("x", out, start=target_rank * nrows)
+    snapshot = out.cpu()
+    ok = bool(torch.all(snapshot == expected))
+    print(f"[rank {rank}] sync-before-get: ok={ok} got={snapshot.tolist()}", flush=True)
+
+    store.epoch_end()
+    store.free()
+    assert all_passed(comm, ok)
+
+
+@gpu_required
 def test_get_into_gpu_tensor_cxi_large(comm, monkeypatch):
     """Diagnostic: same as test_get_into_gpu_tensor_cxi but with a transfer
     well over FI_CXI_SAFE_DEVMEM_COPY_THRESHOLD (default 4096 bytes), to

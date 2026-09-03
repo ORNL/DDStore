@@ -16,12 +16,18 @@ def nsplit(a, n):
 class DistDataset(Dataset):
     """Distributed dataset class"""
 
-    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None):
+    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, device=None):
         super().__init__()
 
         self.dataset = list()
         self.label = label
         self.comm = comm
+        # None -> get() allocates host buffers (default, unchanged).
+        # torch.device/"cuda"/"cuda:N" -> get() allocates its destination
+        # buffer directly on that device (GPUDirect RDMA, Phase 1); requires
+        # DDSTORE_METHOD in (1, 2) and DDSTORE_FABRIC=cxi (pyddstore raises
+        # a clear error otherwise).
+        self.device = device
         self.rank = self.comm.Get_rank()
         self.comm_size = self.comm.Get_size()
         print("init", self.rank, self.comm_size)
@@ -92,22 +98,33 @@ class DistDataset(Dataset):
     def __len__(self):
         return self.len()
 
-    def get(self, idx):
+    def get(self, idx, device=None):
         ## first dim must be the row count (1), not the flattened feature
         ## width, since ddstore.get() infers count from arr.shape[0]
-        val = np.zeros((1, 28 * 28), dtype=np.float32)
+        # Label stays host-only regardless of `device` -- both training
+        # loops discard it, so a GPU-resident label buffer would add
+        # complexity for no benefit.
         label = np.zeros(1, dtype=np.int32)
-        val = np.ascontiguousarray(val)
-        assert val.data.contiguous
+        if device is not None:
+            # RDMA fully overwrites this buffer, so torch.empty (not
+            # zeros): for MNIST's mostly-zero background pixels, an
+            # all-zeros buffer would look deceptively plausible even if the
+            # read silently no-op'd.
+            val = torch.empty((1, 28 * 28), dtype=torch.float32, device=device)
+        else:
+            val = np.zeros((1, 28 * 28), dtype=np.float32)
+            val = np.ascontiguousarray(val)
+            assert val.data.contiguous
         self.ddstore.get(f"{self.label}data", val, idx)
         self.ddstore.get(f"{self.label}labels", label, idx)
         # print("rank", self.rank, "fetching idx", idx)
-        val = torch.tensor(val)
+        if device is None:
+            val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))
         return (val, label[0])
 
     def __getitem__(self, idx):
-        return self.get(idx)
+        return self.get(idx, device=self.device)
 
 
 class DistDatasetReader(Dataset):
@@ -119,9 +136,11 @@ class DistDatasetReader(Dataset):
     core rank's memory.
     """
 
-    def __init__(self, label, handshake_dir, n_core):
+    def __init__(self, label, handshake_dir, n_core, device=None):
         super().__init__()
         self.label = label
+        # See DistDataset.__init__ for what `device` does.
+        self.device = device
 
         self.ddstore = dds.PyDDStore(
             None, method=2, handshake_dir=handshake_dir, n_core=n_core
@@ -146,18 +165,24 @@ class DistDatasetReader(Dataset):
     def __len__(self):
         return self.len()
 
-    def get(self, idx):
+    def get(self, idx, device=None):
         ## first dim must be the row count (1), not the flattened feature
         ## width, since ddstore.get() infers count from arr.shape[0]
-        val = np.zeros((1, self.data_disp), dtype=np.float32)
+        # Label stays host-only regardless of `device` -- see DistDataset.get().
         label = np.zeros(1, dtype=np.int32)
-        val = np.ascontiguousarray(val)
-        assert val.data.contiguous
+        if device is not None:
+            # torch.empty, not zeros -- see DistDataset.get() for why.
+            val = torch.empty((1, self.data_disp), dtype=torch.float32, device=device)
+        else:
+            val = np.zeros((1, self.data_disp), dtype=np.float32)
+            val = np.ascontiguousarray(val)
+            assert val.data.contiguous
         self.ddstore.get(f"{self.label}data", val, idx)
         self.ddstore.get(f"{self.label}labels", label, idx)
-        val = torch.tensor(val)
+        if device is None:
+            val = torch.tensor(val)
         val = torch.reshape(val, (1, self.side, self.side))
         return (val, label[0])
 
     def __getitem__(self, idx):
-        return self.get(idx)
+        return self.get(idx, device=self.device)

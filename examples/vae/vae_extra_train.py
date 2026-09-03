@@ -89,6 +89,15 @@ parser.add_argument(
     default=int(os.environ.get("DDSTORE_N_CORE", "4")),
     help="number of core ranks that published the data",
 )
+parser.add_argument(
+    "--gpu-dest",
+    action="store_true",
+    default=False,
+    help="Allocate the DDStore get() destination buffer directly on the "
+         "training device (GPUDirect RDMA, Phase 1), skipping the "
+         "host->device copy. Requires DDSTORE_FABRIC=cxi and a "
+         "libfabric-backed method (already the case for this script).",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -115,15 +124,24 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-print("DDP setup:", comm_size, rank, device)
+print("DDP setup:", comm_size, rank, device, "gpu_dest:", args.gpu_dest)
 
 model = VAE().to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 kwargs = {}
+# --gpu-dest returns CUDA/HIP tensors from __getitem__; DataLoader worker
+# processes can't safely own GPU state across a fork, so this only works
+# with num_workers=0 (today's default). Don't add num_workers>0 here
+# without redesigning the buffer/collate strategy.
+if args.gpu_dest:
+    assert kwargs.get("num_workers", 0) == 0
 
-trainset = DistDatasetReader("train", args.handshake_dir, args.n_core)
+trainset = DistDatasetReader(
+    "train", args.handshake_dir, args.n_core,
+    device=device if args.gpu_dest else None,
+)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
 train_loader = torch.utils.data.DataLoader(

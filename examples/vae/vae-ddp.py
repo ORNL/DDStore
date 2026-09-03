@@ -54,6 +54,15 @@ parser.add_argument(
     metavar="N",
     help="how many batches to wait before logging training status",
 )
+parser.add_argument(
+    "--gpu-dest",
+    action="store_true",
+    default=False,
+    help="Allocate the DDStore get() destination buffer directly on the "
+         "training device (GPUDirect RDMA, Phase 1), skipping the "
+         "host->device copy. Requires DDSTORE_METHOD in (1, 2) and "
+         "DDSTORE_FABRIC=cxi (e.g. DDSTORE_METHOD=2 as in run-vae.sh).",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -82,7 +91,7 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-print("DDP setup:", comm_size, rank, device)
+print("DDP setup:", comm_size, rank, device, "gpu_dest:", args.gpu_dest)
 
 if rank == 0:
     os.makedirs("results", exist_ok=True)
@@ -95,11 +104,18 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 # kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 # kwargs = {'pin_memory': True} if args.cuda else {}
 kwargs = {}
+# --gpu-dest returns CUDA/HIP tensors from __getitem__; DataLoader worker
+# processes can't safely own GPU state across a fork, so this only works
+# with num_workers=0 (today's default). Don't add num_workers>0 here
+# without redesigning the buffer/collate strategy.
+if args.gpu_dest:
+    assert kwargs.get("num_workers", 0) == 0
 
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
     "train",
     comm,
+    device=device if args.gpu_dest else None,
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 comm.Barrier()

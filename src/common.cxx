@@ -752,17 +752,13 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
         if (rc == 1)
         {
-            if (recv_is_hmem)
-                fprintf(stderr,
-                        "[hmem debug] cq entry: len=%zu flags=0x%llx "
-                        "recv_data=%p recv_data_len=%zu remote_addr=%llu "
-                        "remote_key=%llu src_offset=%llu\n",
-                        CQEntry.len, (unsigned long long)CQEntry.flags,
-                        (void *)fabric_state->recv_data,
-                        fabric_state->recv_data_len,
-                        (unsigned long long)(fabric_state->remote_address[src] + offset),
-                        (unsigned long long)fabric_state->remote_key[src],
-                        (unsigned long long)offset);
+            /* NOTE: CQEntry.len is NOT a reliable success signal on this
+             * provider/CQ format — it reads 0 even for host-to-host
+             * transfers independently verified to deliver correct data, so
+             * it can't be used to distinguish a real silent-no-op (observed
+             * once, for an HMEM/ROCr destination) from a normal completion.
+             * A hard check on it was tried and reverted: it false-positived
+             * on the working host path. Left unchecked deliberately.        */
             break;
         }
         if (rc == -FI_EAVAIL)

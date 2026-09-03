@@ -9,4 +9,13 @@ from mpi4py import MPI
 
 @pytest.fixture(scope="function")
 def comm():
-    return MPI.COMM_WORLD
+    """Provide MPI.COMM_WORLD and barrier after each test.
+
+    The barrier ensures all ranks finish the current test (including
+    store.free() and any fabric endpoint teardown) before any rank
+    begins the next test's handshake/MPI_Allgather.  Without this,
+    CXI endpoint cleanup on a fast rank can desynchronize the ranks
+    enough to deadlock the next test's collective in add().
+    """
+    yield MPI.COMM_WORLD
+    MPI.COMM_WORLD.Barrier()

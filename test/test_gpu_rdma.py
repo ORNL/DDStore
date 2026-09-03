@@ -138,11 +138,17 @@ def test_get_host_to_host_cxi(comm, monkeypatch):
 
 @gpu_required
 def test_gpu_buffer_rejected_on_hsn(comm, monkeypatch):
-    monkeypatch.setenv("DDSTORE_FABRIC", "hsn")
+    # Set up with cxi so that add() and init_fabric succeed (hsn is not
+    # available on all machines, e.g. Perlmutter which is CXI-only).
+    # Then switch DDSTORE_FABRIC to hsn before get() — the Python-level check
+    # in pyddstore.pyx reads the env var at get() time and rejects GPU buffers
+    # with a clear error before touching the fabric.
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
     store = dds.PyDDStore(comm, method=1)
     data = np.ones((4, 4), dtype=np.float32)
     store.add("x", data)
 
+    monkeypatch.setenv("DDSTORE_FABRIC", "hsn")
     out = torch.zeros((1, 4), dtype=torch.float32, device="cuda")
     with pytest.raises(RuntimeError, match="cxi"):
         store.get("x", out, start=0)

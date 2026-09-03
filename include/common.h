@@ -66,6 +66,20 @@ extern "C"
         int recv_hmem_iface;
         struct fid_mr *mr;
         struct fid_mr *recv_mr;
+        /* Cached recv-side MR region: the registered range is
+         * [recv_mr_base, recv_mr_base + recv_mr_reg_len).  Any recv_data
+         * pointer that falls within this range with recv_data_len bytes
+         * fitting inside it can reuse recv_mr without re-registration.
+         *
+         * This covers both the single-buffer case (recv_data == recv_mr_base,
+         * recv_data_len == recv_mr_reg_len) and the pool-slice case, where
+         * Python pre-allocates a (POOL, disp) tensor and hands get() a
+         * different row-slice each call.  All slices share one MR because
+         * they all lie within the same allocation.
+         *
+         * Initialised to NULL/0 so the first call always registers.          */
+        char  *recv_mr_base;
+        size_t recv_mr_reg_len;
         uint64_t key;
         uint64_t *remote_key;
         uint64_t *remote_address;

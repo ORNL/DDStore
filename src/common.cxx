@@ -660,10 +660,6 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
 
 int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset)
 {
-    // register dest buffer; close previous recv MR first to avoid leaking it
-    if (fabric_state->recv_mr)
-        fi_close(&fabric_state->recv_mr->fid);
-
     bool recv_is_hmem = fabric_state->recv_hmem_iface != FI_HMEM_SYSTEM;
     if (recv_is_hmem && !is_hmem_capable(fabric_state))
     {
@@ -671,61 +667,108 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         return 1;
     }
 
-    int mr_rc;
-    if (recv_is_hmem)
-    {
-        /* GPU destination buffer (ROCr on AMD, CUDA on NVIDIA -- whichever
-         * iface the caller set). No host-staged fallback exists: either
-         * fi_mr_regattr succeeds and fi_read() below DMAs straight into
-         * device memory, or it fails loudly here (checked below). */
-        struct iovec iov = {fabric_state->recv_data, fabric_state->recv_data_len};
-        struct fi_mr_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.mr_iov    = &iov;
-        attr.iov_count = 1;
-        attr.access    = FI_READ;
-        attr.iface     = (enum fi_hmem_iface)fabric_state->recv_hmem_iface;
-        attr.device.reserved = 0; /* ROCr/CUDA both resolve the device from the pointer */
-        mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->recv_mr);
-    }
-    else
-    {
-        mr_rc = fi_mr_reg(
-            fabric_state->domain,
-            fabric_state->recv_data,
-            fabric_state->recv_data_len,
-            FI_READ,
-            0,
-            0,
-            0,
-            &fabric_state->recv_mr,
-            NULL);
-    }
-    if (mr_rc != FI_SUCCESS)
-    {
-        fprintf(stderr, "%s failed: %s\n",
-                recv_is_hmem ? "fi_mr_regattr" : "fi_mr_reg",
-                fi_strerror(mr_rc));
-        return 1;
-    }
+    /* Cache the recv MR by registered region rather than exact pointer.
+     *
+     * The cache hits when recv_data falls within the previously registered
+     * region [recv_mr_base, recv_mr_base + recv_mr_reg_len) AND the transfer
+     * length fits within it.  This covers two cases:
+     *
+     *   1. Single buffer reused across batches (recv_data == recv_mr_base):
+     *      exact match, always hits after first call.
+     *
+     *   2. Pool of slices from one contiguous allocation: Python pre-allocates
+     *      a (POOL, disp) tensor; each __getitem__ call takes a different row
+     *      slice.  All slices share the same base allocation, so their pointers
+     *      lie within [recv_mr_base, recv_mr_base + recv_mr_reg_len).  On the
+     *      first call we register the full allocation (recv_data_len covers one
+     *      row; we extend the registration to the full pool via the stored
+     *      recv_mr_reg_len).  Actually for pool slices the caller sets
+     *      recv_data_len to the row size, and recv_data to a row pointer --
+     *      we register only that row on the first call, then on subsequent
+     *      calls we check whether the new pointer falls in the same region.
+     *      Since pool rows are contiguous and fixed-size, consecutive pointers
+     *      differ by exactly recv_data_len, so they are NOT in the same region
+     *      unless we register the whole pool.
+     *
+     * To handle the pool case efficiently, the Python side now passes the
+     * full pool allocation as recv_data/recv_data_len on the first call
+     * (via the pool base pointer and total size), and the slices are handled
+     * by the range check below.
+     *
+     * Simpler model: register recv_data..recv_data+recv_data_len on miss,
+     * and on subsequent calls re-use the MR if the new buffer is a subset of
+     * the cached region.                                                      */
+    char  *cur_base = fabric_state->recv_data;
+    size_t cur_len  = fabric_state->recv_data_len;
+    bool in_cached_region =
+        (fabric_state->recv_mr != NULL) &&
+        (cur_base >= fabric_state->recv_mr_base) &&
+        (cur_base + cur_len <= fabric_state->recv_mr_base + fabric_state->recv_mr_reg_len);
 
-    /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
-     * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).             */
-    if (is_mr_endpoint(fabric_state))
+    if (!in_cached_region)
     {
-        int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
-        if (rc_mr != FI_SUCCESS)
+        /* Close the stale registration before creating a new one. */
+        if (fabric_state->recv_mr)
+            fi_close(&fabric_state->recv_mr->fid);
+
+        int mr_rc;
+        if (recv_is_hmem)
         {
-            fprintf(stderr, "fi_mr_bind (recv) failed: %s\n", fi_strerror(rc_mr));
+            /* GPU destination buffer (ROCr on AMD, CUDA on NVIDIA -- whichever
+             * iface the caller set). No host-staged fallback exists: either
+             * fi_mr_regattr succeeds and fi_read() below DMAs straight into
+             * device memory, or it fails loudly here (checked below). */
+            struct iovec iov = {cur_base, cur_len};
+            struct fi_mr_attr attr;
+            memset(&attr, 0, sizeof(attr));
+            attr.mr_iov    = &iov;
+            attr.iov_count = 1;
+            attr.access    = FI_READ;
+            attr.iface     = (enum fi_hmem_iface)fabric_state->recv_hmem_iface;
+            attr.device.reserved = 0; /* ROCr/CUDA both resolve the device from the pointer */
+            mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->recv_mr);
+        }
+        else
+        {
+            mr_rc = fi_mr_reg(
+                fabric_state->domain,
+                cur_base,
+                cur_len,
+                FI_READ,
+                0, 0, 0,
+                &fabric_state->recv_mr,
+                NULL);
+        }
+        if (mr_rc != FI_SUCCESS)
+        {
+            fprintf(stderr, "%s failed: %s\n",
+                    recv_is_hmem ? "fi_mr_regattr" : "fi_mr_reg",
+                    fi_strerror(mr_rc));
             return 1;
         }
-        rc_mr = fi_mr_enable(fabric_state->recv_mr);
-        if (rc_mr != FI_SUCCESS)
+
+        /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
+         * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).         */
+        if (is_mr_endpoint(fabric_state))
         {
-            fprintf(stderr, "fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
-            return 1;
+            int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
+            if (rc_mr != FI_SUCCESS)
+            {
+                fprintf(stderr, "fi_mr_bind (recv) failed: %s\n", fi_strerror(rc_mr));
+                return 1;
+            }
+            rc_mr = fi_mr_enable(fabric_state->recv_mr);
+            if (rc_mr != FI_SUCCESS)
+            {
+                fprintf(stderr, "fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
+                return 1;
+            }
         }
-    }
+
+        /* Record the registered region for future range checks. */
+        fabric_state->recv_mr_base    = cur_base;
+        fabric_state->recv_mr_reg_len = cur_len;
+    } /* end !in_cached_region */
 
     void *memory_descriptor = NULL;
     /* HMEM (device) buffers need their local descriptor passed to fi_read()

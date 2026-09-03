@@ -112,6 +112,35 @@ class DistDataset(Dataset):
         self.ddstore.add(f"{self.label}data", self.data)
         self.ddstore.add(f"{self.label}labels", self.labels)
 
+        # Pre-allocate a pool of GPU destination buffers for get() calls.
+        #
+        # Problem: DataLoader (num_workers=0) calls __getitem__ batch_size times
+        # sequentially and keeps all returned tensors alive until collate runs.
+        # If get() allocates a fresh torch.empty() each call, PyTorch's caching
+        # allocator gives batch_size distinct pointers.  Each distinct pointer
+        # triggers fi_mr_regattr+fi_mr_bind+fi_mr_enable (expensive on GPU/HSA),
+        # defeating the recv_mr cache in common.cxx.
+        #
+        # Solution: pre-allocate a contiguous (POOL, 784) tensor so all slices
+        # share one MR registration.  Slices are handed out round-robin so
+        # all batch_size concurrent live tensors have distinct pointers (no
+        # aliasing) while staying inside the single registered region.
+        # POOL must be >= the DataLoader's batch_size; 256 covers the default
+        # 128 with headroom.  Only used when device is not None (GPU path).
+        # Only safe with num_workers=0 (single-threaded DataLoader).
+        _POOL = 256
+        if device is not None:
+            self._val_pool = torch.empty(
+                (_POOL, 28 * 28), dtype=torch.float32, device=device
+            )
+            self._val_pool_idx = 0
+            # Pre-register the full pool as a single MR so all row-slices
+            # share one fi_mr_regattr instead of one per __getitem__ call.
+            self.ddstore.prefetch_recv_mr(f"{self.label}data", self._val_pool)
+        else:
+            self._val_pool = None
+            self._val_pool_idx = 0
+
     def len(self):
         return self.total_ns
 
@@ -126,18 +155,19 @@ class DistDataset(Dataset):
         # complexity for no benefit.
         label = np.zeros(1, dtype=np.int32)
         if device is not None:
-            # RDMA fully overwrites this buffer, so torch.empty (not
-            # zeros): for MNIST's mostly-zero background pixels, an
-            # all-zeros buffer would look deceptively plausible even if the
-            # read silently no-op'd.
-            val = torch.empty((1, 28 * 28), dtype=torch.float32, device=device)
+            # Take the next slice from the pool (round-robin).  All slices
+            # share one MR registration → recv_mr cache always hits after the
+            # first call.  No clone() needed: each slice is a distinct pointer
+            # so the DataLoader can hold all batch_size results simultaneously
+            # without aliasing.
+            val = self._val_pool[self._val_pool_idx : self._val_pool_idx + 1]
+            self._val_pool_idx = (self._val_pool_idx + 1) % self._val_pool.shape[0]
         else:
             val = np.zeros((1, 28 * 28), dtype=np.float32)
             val = np.ascontiguousarray(val)
             assert val.data.contiguous
         self.ddstore.get(f"{self.label}data", val, idx)
         self.ddstore.get(f"{self.label}labels", label, idx)
-        # print("rank", self.rank, "fetching idx", idx)
         if device is None:
             val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))
@@ -179,6 +209,17 @@ class DistDatasetReader(Dataset):
                 "which is not a perfect square (expected a flattened square image)"
             )
 
+        _POOL = 256
+        if device is not None:
+            self._val_pool = torch.empty(
+                (_POOL, self.data_disp), dtype=torch.float32, device=device
+            )
+            self._val_pool_idx = 0
+            self.ddstore.prefetch_recv_mr(f"{self.label}data", self._val_pool)
+        else:
+            self._val_pool = None
+            self._val_pool_idx = 0
+
     def len(self):
         return self.total_ns
 
@@ -191,8 +232,8 @@ class DistDatasetReader(Dataset):
         # Label stays host-only regardless of `device` -- see DistDataset.get().
         label = np.zeros(1, dtype=np.int32)
         if device is not None:
-            # torch.empty, not zeros -- see DistDataset.get() for why.
-            val = torch.empty((1, self.data_disp), dtype=torch.float32, device=device)
+            val = self._val_pool[self._val_pool_idx : self._val_pool_idx + 1]
+            self._val_pool_idx = (self._val_pool_idx + 1) % self._val_pool.shape[0]
         else:
             val = np.zeros((1, self.data_disp), dtype=np.float32)
             val = np.ascontiguousarray(val)

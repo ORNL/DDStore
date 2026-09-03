@@ -126,6 +126,7 @@ cdef extern from "ddstore.hpp":
         DDStore(int method, string handshake_dir, int n_core)
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except +
+        void prefetch_recv_mr[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void epoch_begin()
         void epoch_end()
         void free()
@@ -328,6 +329,35 @@ cdef class PyDDStore:
     def free(self):
         self.c_ddstore.free()
         self._gpu_owned_buffers.clear()
+
+    def prefetch_recv_mr(self, str name, arr):
+        """Pre-register a GPU tensor as the recv MR for variable `name`.
+
+        Call once with the full pool tensor (e.g. shape [POOL, disp]) before
+        the first get() call.  read_from_remote() will reuse this registration
+        for any buffer pointer that falls within the registered region, so all
+        pool slices share one fi_mr_regattr call instead of one per slice.
+        No-op for host (non-CUDA) tensors.
+        """
+        if not _is_cuda_tensor(arr):
+            return  # host path: no pre-registration needed
+        _check_gpu_fabric_preconditions(self.method, "GPU recv pool")
+        assert arr.is_contiguous()
+        import torch
+        cdef size_t ptr = arr.data_ptr()
+        cdef long nrows = arr.shape[0]
+        cdef int disp   = arr.numel() // arr.shape[0]
+        cdef int iface  = _hmem_iface_for(arr)
+        if arr.dtype == torch.float32:
+            self.c_ddstore.prefetch_recv_mr(s2b(name), <float *> ptr, nrows, disp, iface)
+        elif arr.dtype == torch.float64:
+            self.c_ddstore.prefetch_recv_mr(s2b(name), <double *> ptr, nrows, disp, iface)
+        elif arr.dtype == torch.int32:
+            self.c_ddstore.prefetch_recv_mr(s2b(name), <int *> ptr, nrows, disp, iface)
+        elif arr.dtype == torch.int64:
+            self.c_ddstore.prefetch_recv_mr(s2b(name), <long *> ptr, nrows, disp, iface)
+        else:
+            raise NotImplementedError("prefetch_recv_mr: unsupported dtype %s" % arr.dtype)
 
     def init(self, str name, long nrows, int disp, int itemsize=1):
         self.c_ddstore.init(s2b(name), nrows, disp, itemsize)

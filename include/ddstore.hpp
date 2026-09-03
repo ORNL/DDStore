@@ -479,6 +479,69 @@ public:
         }
     }
 
+    /* Pre-register a GPU buffer as the recv MR for variable `name`.
+     *
+     * Call once with the full pool tensor before the first get() call.
+     * read_from_remote() reuses this registration for any recv_data pointer
+     * that falls within [buffer, buffer + nrows*disp*sizeof(T)), so all
+     * pool slices share one fi_mr_regattr call instead of one per slice.
+     * No-op for hmem_iface==0 (host path — MR registration is cheap there). */
+    template <typename T>
+    void prefetch_recv_mr(std::string name, T *buffer, long nrows, int disp,
+                          int hmem_iface)
+    {
+        if (hmem_iface == 0)
+            return; /* host path: no pre-registration needed */
+
+        if (this->method != 1 && this->method != 2)
+            return; /* MPI_Win path has no fabric MR */
+
+        const VarInfo_t& varinfo = this->varlist.at(name);
+        struct fabric_state *fs = varinfo.fabric_state;
+        if (!fs)
+            return;
+
+        /* Close any existing recv MR before registering the new region. */
+        if (fs->recv_mr)
+        {
+            fi_close(&fs->recv_mr->fid);
+            fs->recv_mr = NULL;
+        }
+
+        size_t reg_len = (size_t)nrows * disp * sizeof(T);
+        struct iovec iov = {(void *)buffer, reg_len};
+        struct fi_mr_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.mr_iov    = &iov;
+        attr.iov_count = 1;
+        attr.access    = FI_READ;
+        attr.iface     = (enum fi_hmem_iface)hmem_iface;
+        attr.device.reserved = 0;
+        int mr_rc = fi_mr_regattr(fs->domain, &attr, 0, &fs->recv_mr);
+        if (mr_rc != FI_SUCCESS)
+            throw std::runtime_error(
+                std::string("prefetch_recv_mr fi_mr_regattr failed: ") +
+                fi_strerror(mr_rc));
+
+        if (is_mr_endpoint(fs))
+        {
+            int rc = fi_mr_bind(fs->recv_mr, &fs->signal->fid, 0);
+            if (rc != FI_SUCCESS)
+                throw std::runtime_error(
+                    std::string("prefetch_recv_mr fi_mr_bind failed: ") +
+                    fi_strerror(rc));
+            rc = fi_mr_enable(fs->recv_mr);
+            if (rc != FI_SUCCESS)
+                throw std::runtime_error(
+                    std::string("prefetch_recv_mr fi_mr_enable failed: ") +
+                    fi_strerror(rc));
+        }
+
+        /* Record the registered region so read_from_remote()'s range check hits. */
+        fs->recv_mr_base    = (char *)buffer;
+        fs->recv_mr_reg_len = reg_len;
+    }
+
 private:
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)
 

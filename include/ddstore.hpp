@@ -63,17 +63,43 @@ public:
     /* Method 2 extra member: discover variable published by core members.   */
     void join(std::string name);
 
+    /* hmem_iface: 0 (FI_HMEM_SYSTEM) for a host buffer, or an fi_hmem_iface
+     * value (FI_HMEM_CUDA, FI_HMEM_ROCR, ...) identifying what kind of GPU
+     * memory `buffer` is. Mirrors get()'s hmem_iface parameter.
+     *
+     * LIFETIME CONTRACT: for hmem_iface == 0 (host), DDStore makes its own
+     * private copy of `buffer` (as it always has) -- the caller's buffer
+     * may be freed/reused immediately after add() returns. For
+     * hmem_iface != 0 (GPU), DDStore does NOT copy -- it registers the
+     * caller's own device pointer directly. The caller must keep that GPU
+     * allocation alive (not garbage-collected, not reused) for as long as
+     * this variable stays registered, i.e. until free() or this DDStore's
+     * destruction. pyddstore.pyx enforces this for Python callers via a
+     * keepalive dict; direct C++ callers must manage it themselves.         */
     template <typename T>
-    void add(std::string name, T *buffer, long nrows, int disp)
+    void add(std::string name, T *buffer, long nrows, int disp, int hmem_iface = 0)
     {
+        if (this->method == 0 && hmem_iface != 0)
+            throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
+
         void *base = NULL;
-        // (2025/03) jyc: necessary to avoid memory error
-        int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
-        if (err)
+        if (hmem_iface == 0)
         {
-            exit(1);
+            // (2025/03) jyc: necessary to avoid memory error
+            int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
+            if (err)
+            {
+                exit(1);
+            }
+            memcpy(base, buffer, nrows * disp * sizeof(T));
         }
-        memcpy(base, buffer, nrows * disp * sizeof(T));
+        else
+        {
+            /* GPU source buffer: register the caller's own pointer
+             * directly. No MPI_Alloc_mem, no copy -- see lifetime
+             * contract above.                                              */
+            base = (void *)buffer;
+        }
 
         MPI_Win win = MPI_WIN_NULL;
         struct fabric_state *fabric_state = NULL;
@@ -90,40 +116,72 @@ public:
         else if (this->method == 1)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            fabric_state->send_data = (char *)base;
-            fabric_state->send_data_len = nrows * disp * sizeof(T);
-            fabric_state->world_size = this->comm_size;
-            fabric_state->rank = this->rank;
+            fabric_state->send_data       = (char *)base;
+            fabric_state->send_data_len   = nrows * disp * sizeof(T);
+            fabric_state->send_hmem_iface = hmem_iface;
+            fabric_state->world_size      = this->comm_size;
+            fabric_state->rank            = this->rank;
 
             init_fabric(fabric_state);
             if (!fabric_state->info)
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
+            if (hmem_iface != 0 && !is_hmem_capable(fabric_state))
+                throw std::runtime_error(
+                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
+                    "(current fabric does not support FI_HMEM)");
             if (handshake(fabric_state, this->comm) != 0)
                 throw std::runtime_error("handshake failed (method=1)");
         }
         else if (this->method == 2)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            fabric_state->send_data     = (char *)base;
-            fabric_state->send_data_len = nrows * disp * sizeof(T);
-            fabric_state->world_size    = this->n_core;
-            fabric_state->rank          = this->rank;
+            fabric_state->send_data       = (char *)base;
+            fabric_state->send_data_len   = nrows * disp * sizeof(T);
+            fabric_state->send_hmem_iface = hmem_iface;
+            fabric_state->world_size      = this->n_core;
+            fabric_state->rank            = this->rank;
 
             init_fabric(fabric_state);
             if (!fabric_state->info)
                 throw std::runtime_error("init_fabric failed: no suitable fabric found");
+            if (hmem_iface != 0 && !is_hmem_capable(fabric_state))
+                throw std::runtime_error(
+                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
+                    "(current fabric does not support FI_HMEM)");
 
-            /* Register the send buffer as an MR before writing the record. */
-            int mr_rc = fi_mr_reg(
-                fabric_state->domain,
-                fabric_state->send_data,
-                fabric_state->send_data_len,
-                FI_WRITE | FI_REMOTE_READ,
-                0, 0, 0,
-                &fabric_state->mr,
-                NULL);
+            /* Register the send buffer as an MR before writing the record --
+             * same fi_mr_reg-vs-fi_mr_regattr branch as handshake(),
+             * duplicated here the same way the host-only version already
+             * is (method=2 registers inline instead of via handshake()). */
+            bool send_is_hmem = hmem_iface != 0;
+            int mr_rc;
+            if (send_is_hmem)
+            {
+                struct iovec iov = {fabric_state->send_data, fabric_state->send_data_len};
+                struct fi_mr_attr attr;
+                memset(&attr, 0, sizeof(attr));
+                attr.mr_iov    = &iov;
+                attr.iov_count = 1;
+                attr.access    = FI_WRITE | FI_REMOTE_READ;
+                attr.iface     = (enum fi_hmem_iface)hmem_iface;
+                attr.device.reserved = 0;
+                mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->mr);
+            }
+            else
+            {
+                mr_rc = fi_mr_reg(
+                    fabric_state->domain,
+                    fabric_state->send_data,
+                    fabric_state->send_data_len,
+                    FI_WRITE | FI_REMOTE_READ,
+                    0, 0, 0,
+                    &fabric_state->mr,
+                    NULL);
+            }
             if (mr_rc != FI_SUCCESS)
-                throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
+                throw std::runtime_error(
+                    std::string(send_is_hmem ? "fi_mr_regattr failed: " : "fi_mr_reg failed: ")
+                    + fi_strerror(mr_rc));
 
             /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before
              * use. The provider-assigned key is only valid after

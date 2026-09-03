@@ -46,6 +46,16 @@ extern "C"
         fi_addr_t *comm_partner;
         char *send_data;
         size_t send_data_len;
+        /* FI_HMEM_SYSTEM (0) if send_data is host memory; otherwise the
+         * fi_hmem_iface value identifying what kind of GPU memory it is.
+         * Set by the caller (see ddstore.hpp's add()) and forwarded into
+         * fi_mr_regattr()'s attr.iface in handshake() (method=1) / add()'s
+         * inline registration (method=2). A separate field from
+         * recv_hmem_iface: one fabric_state can be simultaneously the send
+         * side (registered once at add() time) and the recv side
+         * (re-registered per get() call, including self-reads) -- these
+         * are independent MRs with independent lifetimes.                    */
+        int send_hmem_iface;
         char *recv_data;
         size_t recv_data_len;
         /* FI_HMEM_SYSTEM (0) if recv_data is host memory; otherwise the

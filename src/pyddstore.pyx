@@ -58,6 +58,22 @@ def _hmem_iface_for(tensor):
     import torch
     return _FI_HMEM_ROCR if torch.version.hip is not None else _FI_HMEM_CUDA
 
+def _check_gpu_fabric_preconditions(int method, str what):
+    """Shared method=1/2 + DDSTORE_FABRIC=cxi precondition check for a GPU
+    (CUDA/HIP) buffer passed to add() or get(). `what` customizes the error
+    wording ("GPU source buffer" / "GPU destination buffer").
+    """
+    if method not in (1, 2):
+        raise RuntimeError(
+            "%s requires method=1 or 2 (libfabric), got method=%d" % (what, method))
+    provider = os.environ.get("DDSTORE_FABRIC", "hsn")
+    if provider != "cxi":
+        raise RuntimeError(
+            "%s requires DDSTORE_FABRIC=cxi (current DDSTORE_FABRIC=%r); "
+            "the hsn (tcp;ofi_rxm) path does not support FI_HMEM. Set "
+            "DDSTORE_FABRIC=cxi or pass a host (CPU) numpy array instead."
+            % (what, provider))
+
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
         string name
@@ -74,7 +90,7 @@ cdef extern from "ddstore.hpp":
                 string handshake_dir)
         # Method 2: extra member (no MPI communicator)
         DDStore(int method, string handshake_dir, int n_core)
-        void add[T](string name, T* buffer, long nrows, int disp) except +
+        void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except +
         void epoch_begin()
         void epoch_end()
@@ -94,6 +110,11 @@ cdef class PyDDstoreVarinfo:
 cdef class PyDDStore:
     cdef DDStore *c_ddstore
     cdef int method
+    # Keepalive for GPU tensors passed to add(): C++ holds a raw pointer
+    # into them with no copy and no refcounting (see ddstore.hpp add()'s
+    # lifetime-contract comment) -- this dict keeps the Python reference
+    # alive for as long as the variable stays registered.
+    cdef dict _gpu_owned_buffers
 
     def __cinit__(self, comm_or_none=None, int method=0,
                   str handshake_dir="", int n_core=0, nic_map=None):
@@ -114,6 +135,7 @@ cdef class PyDDStore:
         """
         cdef MPI.Comm mpi_comm
         self.method = method
+        self._gpu_owned_buffers = {}
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
         if method == 2:
@@ -148,28 +170,65 @@ cdef class PyDDStore:
         if self.c_ddstore != NULL:
             del self.c_ddstore
             self.c_ddstore = NULL
+        self._gpu_owned_buffers.clear()
 
     def add(self, str name, arr):
+        cdef size_t ptr
+        cdef int iface
+        cdef long nrows
+        cdef int disp
         if _is_cuda_tensor(arr):
-            raise NotImplementedError(
-                "GPU source buffers are not yet supported by add() "
-                "(GPU-to-GPU is a future phase); pass arr.cpu().numpy() instead")
+            _check_gpu_fabric_preconditions(self.method, "GPU source buffer")
+            assert arr.is_contiguous()
+            if name in self._gpu_owned_buffers:
+                raise RuntimeError(
+                    "add() called again for variable '%s' with a GPU source "
+                    "buffer; re-adding an existing variable name is not "
+                    "supported (the original registration would remain "
+                    "active in C++ while its Python keepalive reference is "
+                    "replaced here, risking a dangling pointer)" % name)
+            import torch
+            iface = _hmem_iface_for(arr)
+            ptr = arr.data_ptr()
+            nrows = arr.shape[0]
+            disp = arr.numel() // arr.shape[0]
+            if arr.dtype == torch.int32:
+                self.c_ddstore.add(s2b(name), <int *> ptr, nrows, disp, iface)
+            elif arr.dtype == torch.int64:
+                self.c_ddstore.add(s2b(name), <long *> ptr, nrows, disp, iface)
+            elif arr.dtype == torch.uint8:
+                self.c_ddstore.add(s2b(name), <char *> ptr, nrows, disp, iface)
+            elif arr.dtype == torch.float32:
+                self.c_ddstore.add(s2b(name), <float *> ptr, nrows, disp, iface)
+            elif arr.dtype == torch.float64:
+                self.c_ddstore.add(s2b(name), <double *> ptr, nrows, disp, iface)
+            elif arr.dtype == torch.bool:
+                self.c_ddstore.add(s2b(name), <char *> ptr, nrows, disp, iface)
+            else:
+                raise NotImplementedError
+            # Keepalive: DDStore now holds a raw pointer into arr's storage
+            # with no copy and no C++-level refcounting -- see ddstore.hpp
+            # add()'s lifetime-contract doc comment. Must outlive this
+            # variable's registration; cleared in free()/__dealloc__.
+            self._gpu_owned_buffers[name] = arr
+            return
+
         cdef np.ndarray np_arr = arr
         assert np_arr.flags.c_contiguous
-        cdef long nrows = np_arr.shape[0]
-        cdef int disp = np_arr.size // np_arr.shape[0]
+        nrows = np_arr.shape[0]
+        disp = np_arr.size // np_arr.shape[0]
         if np_arr.dtype == np.int32:
-            self.c_ddstore.add(s2b(name), <int *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <int *> np_arr.data, nrows, disp, 0)
         elif np_arr.dtype == np.int64:
-            self.c_ddstore.add(s2b(name), <long *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <long *> np_arr.data, nrows, disp, 0)
         elif np_arr.dtype == np.uint8:
-            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp, 0)
         elif np_arr.dtype == np.float32:
-            self.c_ddstore.add(s2b(name), <float *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <float *> np_arr.data, nrows, disp, 0)
         elif np_arr.dtype == np.float64:
-            self.c_ddstore.add(s2b(name), <double *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <double *> np_arr.data, nrows, disp, 0)
         elif np_arr.dtype == np.bool_:
-            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp)
+            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp, 0)
         else:
             raise NotImplementedError
 
@@ -178,17 +237,7 @@ cdef class PyDDStore:
         cdef size_t ptr
         cdef int iface
         if _is_cuda_tensor(arr):
-            if self.method not in (1, 2):
-                raise RuntimeError(
-                    "GPU destination buffer requires method=1 or 2 (libfabric), "
-                    "got method=%d" % self.method)
-            provider = os.environ.get("DDSTORE_FABRIC", "hsn")
-            if provider != "cxi":
-                raise RuntimeError(
-                    "GPU destination buffer requires DDSTORE_FABRIC=cxi "
-                    "(current DDSTORE_FABRIC=%r); the hsn (tcp;ofi_rxm) path "
-                    "does not support FI_HMEM. Set DDSTORE_FABRIC=cxi or pass "
-                    "a host (CPU) numpy array instead." % provider)
+            _check_gpu_fabric_preconditions(self.method, "GPU destination buffer")
             assert arr.is_contiguous()
             import torch
             iface = _hmem_iface_for(arr)
@@ -235,7 +284,8 @@ cdef class PyDDStore:
 
     def free(self):
         self.c_ddstore.free()
-    
+        self._gpu_owned_buffers.clear()
+
     def init(self, str name, long nrows, int disp, int itemsize=1):
         self.c_ddstore.init(s2b(name), nrows, disp, itemsize)
 

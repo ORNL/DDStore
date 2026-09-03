@@ -168,8 +168,134 @@ def test_gpu_buffer_rejected_on_method0(comm):
 
 
 @gpu_required
-def test_gpu_source_rejected_by_add(comm):
+def test_gpu_source_rejected_on_method0(comm):
+    store = dds.PyDDStore(comm, method=0)
+    data = torch.ones((4, 4), dtype=torch.float32, device="cuda")
+    with pytest.raises(RuntimeError, match="method"):
+        store.add("x", data)
+
+
+@gpu_required
+def test_gpu_source_rejected_on_hsn(comm, monkeypatch):
+    monkeypatch.setenv("DDSTORE_FABRIC", "hsn")
     store = dds.PyDDStore(comm, method=1)
     data = torch.ones((4, 4), dtype=torch.float32, device="cuda")
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="cxi"):
         store.add("x", data)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: GPU-resident producer (add()) -- host/GPU destination, over cxi
+# ---------------------------------------------------------------------------
+#
+# Frontier will still fail these (the open, unrelated OLCF ROCm+CXI driver
+# issue affects get(), which every one of these tests also exercises to
+# check correctness) -- validation target is Perlmutter, same as Phase 1.
+
+
+@gpu_required
+def test_add_from_gpu_tensor_host_dest_cxi(comm, monkeypatch):
+    """GPU source -> host (poisoned) destination. Isolates that the SEND
+    side specifically works, independent of Phase 1's already-proven
+    receive side.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+
+    store = dds.PyDDStore(comm, method=1)
+    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    store.add("x", data)  # GPU source -- Phase 2
+
+    store.epoch_begin()
+    local_ok = True
+    for target_rank in range(size):
+        out = np.full((1, ncols), -999.0, dtype=np.float32)
+        store.get("x", out, start=target_rank * nrows)
+        ok = bool(np.all(out == float(target_rank + 1)))
+        if not ok:
+            local_ok = False
+    store.epoch_end()
+
+    assert all_passed(comm, local_ok)
+    store.free()
+
+
+@gpu_required
+def test_add_from_gpu_tensor_gpu_dest_cxi(comm, monkeypatch):
+    """Full Phase 2 scenario: both ends device memory, method=1."""
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+
+    store = dds.PyDDStore(comm, method=1)
+    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    store.add("x", data)
+
+    store.epoch_begin()
+    local_ok = True
+    for target_rank in range(size):
+        out = torch.full((1, ncols), -999.0, dtype=torch.float32, device="cuda")
+        store.get("x", out, start=target_rank * nrows)
+        expected = float(target_rank + 1)
+        ok = bool(torch.all(out.cpu() == expected))
+        if not ok:
+            local_ok = False
+    store.epoch_end()
+
+    assert all_passed(comm, local_ok)
+    store.free()
+
+
+@gpu_required
+def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
+    """Same as test_add_from_gpu_tensor_gpu_dest_cxi but method=2
+    (file-based handshake, core+extra split) -- the transport
+    examples/vae/distdataset.py's DistDatasetReader actually uses. Includes
+    a self-read check (core rank both add()s and get()s its own data,
+    mirroring test_method2_core.py's self-check pattern) to verify the
+    independent send_hmem_iface/mr vs recv_hmem_iface/recv_mr fields don't
+    interfere with each other.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+
+    hs_dir = comm.bcast(str(tmp_path / "ddstore_hs_add_method2") if rank == 0 else None, root=0)
+
+    core_store = dds.PyDDStore(comm, method=2, handshake_dir=hs_dir)
+    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    core_store.add("x", data)  # GPU source -- Phase 2
+    comm.Barrier()
+
+    # Self-read: every core rank reads its own just-added shard back.
+    local_ok = True
+    out_self = torch.full((1, ncols), -999.0, dtype=torch.float32, device="cuda")
+    core_store.get("x", out_self, start=rank * nrows)
+    if not bool(torch.all(out_self.cpu() == float(rank + 1))):
+        local_ok = False
+
+    # Extra member: a separate instance joins and reads every rank's shard.
+    if rank == 0:
+        extra_store = dds.PyDDStore(None, method=2, handshake_dir=hs_dir, n_core=size)
+        extra_store.join("x")
+        for target_rank in range(size):
+            out = torch.full((1, ncols), -999.0, dtype=torch.float32, device="cuda")
+            extra_store.get("x", out, start=target_rank * nrows)
+            expected = float(target_rank + 1)
+            if not bool(torch.all(out.cpu() == expected)):
+                local_ok = False
+        extra_store.free()
+
+    comm.Barrier()
+    assert all_passed(comm, local_ok)
+    core_store.free()

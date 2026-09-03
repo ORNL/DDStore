@@ -542,19 +542,48 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     int world_size = fabric_state->world_size;
     int rank = fabric_state->rank;
 
-    int mr_rc = fi_mr_reg(
-        fabric_state->domain,
-        fabric_state->send_data,
-        fabric_state->send_data_len,
-        FI_WRITE | FI_REMOTE_READ,
-        0,
-        0,
-        0,
-        &fabric_state->mr,
-        NULL);
+    bool send_is_hmem = fabric_state->send_hmem_iface != FI_HMEM_SYSTEM;
+    if (send_is_hmem && !is_hmem_capable(fabric_state))
+    {
+        fprintf(stderr, "GPU (HMEM) send buffer requested but fabric is not cxi\n");
+        return 1;
+    }
+
+    int mr_rc;
+    if (send_is_hmem)
+    {
+        /* GPU source buffer. This MR is only ever the passive TARGET of
+         * other ranks' fi_read() (via remote_key/remote_address, exchanged
+         * below) -- never the local operand of a local fi_read/fi_write on
+         * this rank -- so unlike recv_mr in read_from_remote(), no
+         * fi_mr_desc()/local descriptor is needed here at all.              */
+        struct iovec iov = {fabric_state->send_data, fabric_state->send_data_len};
+        struct fi_mr_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.mr_iov    = &iov;
+        attr.iov_count = 1;
+        attr.access    = FI_WRITE | FI_REMOTE_READ;
+        attr.iface     = (enum fi_hmem_iface)fabric_state->send_hmem_iface;
+        attr.device.reserved = 0;
+        mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->mr);
+    }
+    else
+    {
+        mr_rc = fi_mr_reg(
+            fabric_state->domain,
+            fabric_state->send_data,
+            fabric_state->send_data_len,
+            FI_WRITE | FI_REMOTE_READ,
+            0,
+            0,
+            0,
+            &fabric_state->mr,
+            NULL);
+    }
     if (mr_rc != FI_SUCCESS)
     {
-        fprintf(stderr, "fi_mr_reg failed: %s\n", fi_strerror(mr_rc));
+        fprintf(stderr, "%s (send) failed: %s\n",
+                send_is_hmem ? "fi_mr_regattr" : "fi_mr_reg", fi_strerror(mr_rc));
         return 1;
     }
 

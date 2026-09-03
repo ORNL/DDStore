@@ -352,8 +352,13 @@ public:
         memcpy((char*)base + offset * disp * itemsize, buffer, nrows * disp * itemsize);
     }
 
+    /* hmem_iface: 0 (FI_HMEM_SYSTEM) for a host buffer, or an fi_hmem_iface
+     * value (FI_HMEM_CUDA, FI_HMEM_ROCR, ...) identifying what kind of GPU
+     * memory `buffer` is. Left as a plain int (not the enum) so the Cython
+     * binding (pyddstore.pyx) can pass it without cimporting the enum;
+     * read_from_remote() in common.cxx casts it back before use.               */
     template <typename T>
-    void get(std::string name, long start, long count, T *buffer)
+    void get(std::string name, long start, long count, T *buffer, int hmem_iface = 0)
     {
         const VarInfo_t& varinfo = this->varlist.at(name);
 
@@ -374,7 +379,11 @@ public:
         // std::cout << "target,offset,start,count: " << target << "," << offset << "," << start << "," << count <<
         // std::endl;
 
-        if (this->method == 0)
+        if (this->method == 0 && hmem_iface != 0)
+        {
+            throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
+        }
+        else if (this->method == 0)
         {
             MPI_Win win = varinfo.win;
             MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
@@ -397,8 +406,13 @@ public:
         else if (this->method == 1 || this->method == 2)
         {
             /* Methods 1 and 2 both use libfabric fi_read — same path. */
+            if (hmem_iface != 0 && !is_hmem_capable(varinfo.fabric_state))
+                throw std::runtime_error(
+                    "GPU destination buffer requires DDSTORE_FABRIC=cxi "
+                    "(current fabric does not support FI_HMEM)");
             varinfo.fabric_state->recv_data = (char *)buffer;
             varinfo.fabric_state->recv_data_len = varinfo.disp * varinfo.itemsize * count;
+            varinfo.fabric_state->recv_hmem_iface = hmem_iface;
             int rc = read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * varinfo.itemsize);
             if (rc != 0)
                 throw std::runtime_error(

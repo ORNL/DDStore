@@ -2,6 +2,8 @@
 # cython: language_level=3
 # cython: language=c++
 
+import os
+
 import mpi4py.MPI as MPI
 cimport mpi4py.MPI as MPI
 cimport mpi4py.libmpi as libmpi
@@ -28,6 +30,34 @@ cpdef bytes s2b(str x):
     else:
         return x.encode()
 
+def _is_cuda_tensor(obj):
+    """True if obj is a torch.Tensor on a CUDA/HIP device.
+
+    Torch is optional — imported lazily so DDStore2 has no hard dependency
+    on it. If unimportable, no object is ever considered a CUDA tensor.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    return isinstance(obj, torch.Tensor) and obj.is_cuda
+
+# Mirrors libfabric's enum fi_hmem_iface (rdma/fi_domain.h): FI_HMEM_SYSTEM=0,
+# FI_HMEM_CUDA=1, FI_HMEM_ROCR=2. Kept as plain ints here (rather than
+# cimporting the C enum) since only these two values are ever produced by
+# _hmem_iface_for() below -- torch itself is either a CUDA or a ROCm build,
+# never both.
+_FI_HMEM_CUDA = 1
+_FI_HMEM_ROCR = 2
+
+def _hmem_iface_for(tensor):
+    """fi_hmem_iface value for a CUDA tensor: ROCr on a ROCm/HIP build of
+    torch (AMD), CUDA otherwise (NVIDIA). Only call when _is_cuda_tensor()
+    is already True.
+    """
+    import torch
+    return _FI_HMEM_ROCR if torch.version.hip is not None else _FI_HMEM_CUDA
+
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
         string name
@@ -45,7 +75,7 @@ cdef extern from "ddstore.hpp":
         # Method 2: extra member (no MPI communicator)
         DDStore(int method, string handshake_dir, int n_core)
         void add[T](string name, T* buffer, long nrows, int disp) except +
-        void get[T](string name, long start, long count, T* buffer) except +
+        void get[T](string name, long start, long count, T* buffer, int hmem_iface) except +
         void epoch_begin()
         void epoch_end()
         void free()
@@ -63,6 +93,7 @@ cdef class PyDDstoreVarinfo:
 
 cdef class PyDDStore:
     cdef DDStore *c_ddstore
+    cdef int method
 
     def __cinit__(self, comm_or_none=None, int method=0,
                   str handshake_dir="", int n_core=0, nic_map=None):
@@ -82,6 +113,7 @@ cdef class PyDDStore:
           set in the environment.
         """
         cdef MPI.Comm mpi_comm
+        self.method = method
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
         if method == 2:
@@ -117,41 +149,81 @@ cdef class PyDDStore:
             del self.c_ddstore
             self.c_ddstore = NULL
 
-    def add(self, str name, np.ndarray arr):
-        assert arr.flags.c_contiguous
-        cdef long nrows = arr.shape[0]
-        cdef int disp = arr.size // arr.shape[0]
-        if arr.dtype == np.int32:
-            self.c_ddstore.add(s2b(name), <int *> arr.data, nrows, disp)
-        elif arr.dtype == np.int64:
-            self.c_ddstore.add(s2b(name), <long *> arr.data, nrows, disp)
-        elif arr.dtype == np.uint8:
-            self.c_ddstore.add(s2b(name), <char *> arr.data, nrows, disp)
-        elif arr.dtype == np.float32:
-            self.c_ddstore.add(s2b(name), <float *> arr.data, nrows, disp)
-        elif arr.dtype == np.float64:
-            self.c_ddstore.add(s2b(name), <double *> arr.data, nrows, disp)
-        elif arr.dtype == np.bool_:
-            self.c_ddstore.add(s2b(name), <char *> arr.data, nrows, disp)
+    def add(self, str name, arr):
+        if _is_cuda_tensor(arr):
+            raise NotImplementedError(
+                "GPU source buffers are not yet supported by add() "
+                "(GPU-to-GPU is a future phase); pass arr.cpu().numpy() instead")
+        cdef np.ndarray np_arr = arr
+        assert np_arr.flags.c_contiguous
+        cdef long nrows = np_arr.shape[0]
+        cdef int disp = np_arr.size // np_arr.shape[0]
+        if np_arr.dtype == np.int32:
+            self.c_ddstore.add(s2b(name), <int *> np_arr.data, nrows, disp)
+        elif np_arr.dtype == np.int64:
+            self.c_ddstore.add(s2b(name), <long *> np_arr.data, nrows, disp)
+        elif np_arr.dtype == np.uint8:
+            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp)
+        elif np_arr.dtype == np.float32:
+            self.c_ddstore.add(s2b(name), <float *> np_arr.data, nrows, disp)
+        elif np_arr.dtype == np.float64:
+            self.c_ddstore.add(s2b(name), <double *> np_arr.data, nrows, disp)
+        elif np_arr.dtype == np.bool_:
+            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp)
         else:
             raise NotImplementedError
 
-    def get(self, str name, np.ndarray arr, long start=0):
-        assert arr.flags.c_contiguous
+    def get(self, str name, arr, long start=0):
         cdef long count = arr.shape[0]
-        assert arr.shape[0] >= count
-        if arr.dtype == np.int32:
-            self.c_ddstore.get(s2b(name), start, count, <int *> arr.data)
-        elif arr.dtype == np.int64:
-            self.c_ddstore.get(s2b(name), start, count, <long *> arr.data)
-        elif arr.dtype == np.uint8:
-            self.c_ddstore.get(s2b(name), start, count, <char *> arr.data)
-        elif arr.dtype == np.float32:
-            self.c_ddstore.get(s2b(name), start, count, <float *> arr.data)
-        elif arr.dtype == np.float64:
-            self.c_ddstore.get(s2b(name), start, count, <double *> arr.data)
-        elif arr.dtype == np.bool_:
-            self.c_ddstore.get(s2b(name), start, count, <char *> arr.data)
+        cdef size_t ptr
+        cdef int iface
+        if _is_cuda_tensor(arr):
+            if self.method not in (1, 2):
+                raise RuntimeError(
+                    "GPU destination buffer requires method=1 or 2 (libfabric), "
+                    "got method=%d" % self.method)
+            provider = os.environ.get("DDSTORE_FABRIC", "hsn")
+            if provider != "cxi":
+                raise RuntimeError(
+                    "GPU destination buffer requires DDSTORE_FABRIC=cxi "
+                    "(current DDSTORE_FABRIC=%r); the hsn (tcp;ofi_rxm) path "
+                    "does not support FI_HMEM. Set DDSTORE_FABRIC=cxi or pass "
+                    "a host (CPU) numpy array instead." % provider)
+            assert arr.is_contiguous()
+            import torch
+            iface = _hmem_iface_for(arr)
+            ptr = arr.data_ptr()
+            if arr.dtype == torch.int32:
+                self.c_ddstore.get(s2b(name), start, count, <int *> ptr, iface)
+            elif arr.dtype == torch.int64:
+                self.c_ddstore.get(s2b(name), start, count, <long *> ptr, iface)
+            elif arr.dtype == torch.uint8:
+                self.c_ddstore.get(s2b(name), start, count, <char *> ptr, iface)
+            elif arr.dtype == torch.float32:
+                self.c_ddstore.get(s2b(name), start, count, <float *> ptr, iface)
+            elif arr.dtype == torch.float64:
+                self.c_ddstore.get(s2b(name), start, count, <double *> ptr, iface)
+            elif arr.dtype == torch.bool:
+                self.c_ddstore.get(s2b(name), start, count, <char *> ptr, iface)
+            else:
+                raise NotImplementedError
+            return
+
+        cdef np.ndarray np_arr = arr
+        assert np_arr.flags.c_contiguous
+        assert np_arr.shape[0] >= count
+        if np_arr.dtype == np.int32:
+            self.c_ddstore.get(s2b(name), start, count, <int *> np_arr.data, 0)
+        elif np_arr.dtype == np.int64:
+            self.c_ddstore.get(s2b(name), start, count, <long *> np_arr.data, 0)
+        elif np_arr.dtype == np.uint8:
+            self.c_ddstore.get(s2b(name), start, count, <char *> np_arr.data, 0)
+        elif np_arr.dtype == np.float32:
+            self.c_ddstore.get(s2b(name), start, count, <float *> np_arr.data, 0)
+        elif np_arr.dtype == np.float64:
+            self.c_ddstore.get(s2b(name), start, count, <double *> np_arr.data, 0)
+        elif np_arr.dtype == np.bool_:
+            self.c_ddstore.get(s2b(name), start, count, <char *> np_arr.data, 0)
         else:
             raise NotImplementedError
     
@@ -167,21 +239,26 @@ cdef class PyDDStore:
     def init(self, str name, long nrows, int disp, int itemsize=1):
         self.c_ddstore.init(s2b(name), nrows, disp, itemsize)
 
-    def update(self, str name, np.ndarray arr, long offset):
-        assert arr.flags.c_contiguous
-        cdef long nrows = arr.shape[0]
-        if arr.dtype == np.int32:
-            self.c_ddstore.update(s2b(name), <int *> arr.data, nrows, offset)
-        elif arr.dtype == np.int64:
-            self.c_ddstore.update(s2b(name), <long *> arr.data, nrows, offset)
-        elif arr.dtype == np.uint8:
-            self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
-        elif arr.dtype == np.float32:
-            self.c_ddstore.update(s2b(name), <float *> arr.data, nrows, offset)
-        elif arr.dtype == np.float64:
-            self.c_ddstore.update(s2b(name), <double *> arr.data, nrows, offset)
-        elif arr.dtype == np.bool_:
-            self.c_ddstore.update(s2b(name), <char *> arr.data, nrows, offset)
+    def update(self, str name, arr, long offset):
+        if _is_cuda_tensor(arr):
+            raise NotImplementedError(
+                "GPU source buffers are not yet supported by update() "
+                "(GPU-to-GPU is a future phase); pass arr.cpu().numpy() instead")
+        cdef np.ndarray np_arr = arr
+        assert np_arr.flags.c_contiguous
+        cdef long nrows = np_arr.shape[0]
+        if np_arr.dtype == np.int32:
+            self.c_ddstore.update(s2b(name), <int *> np_arr.data, nrows, offset)
+        elif np_arr.dtype == np.int64:
+            self.c_ddstore.update(s2b(name), <long *> np_arr.data, nrows, offset)
+        elif np_arr.dtype == np.uint8:
+            self.c_ddstore.update(s2b(name), <char *> np_arr.data, nrows, offset)
+        elif np_arr.dtype == np.float32:
+            self.c_ddstore.update(s2b(name), <float *> np_arr.data, nrows, offset)
+        elif np_arr.dtype == np.float64:
+            self.c_ddstore.update(s2b(name), <double *> np_arr.data, nrows, offset)
+        elif np_arr.dtype == np.bool_:
+            self.c_ddstore.update(s2b(name), <char *> np_arr.data, nrows, offset)
         else:
             raise NotImplementedError
 

@@ -48,6 +48,12 @@ extern "C"
         size_t send_data_len;
         char *recv_data;
         size_t recv_data_len;
+        /* FI_HMEM_SYSTEM (0) if recv_data is host memory; otherwise the
+         * fi_hmem_iface value (FI_HMEM_CUDA, FI_HMEM_ROCR, ...) identifying
+         * what kind of GPU memory it is. Set by the caller (see
+         * ddstore.hpp's get()); the value is opaque here, just forwarded
+         * into fi_mr_regattr()'s attr.iface in read_from_remote().           */
+        int recv_hmem_iface;
         struct fid_mr *mr;
         struct fid_mr *recv_mr;
         uint64_t key;
@@ -95,6 +101,18 @@ extern "C"
     {
         return !(f->info->fabric_attr->prov_name &&
                  strcmp(f->info->fabric_attr->prov_name, "cxi") == 0);
+    }
+
+    /* True only for the cxi provider (the real Slingshot/HW path). GPU
+     * (ROCr HMEM) buffer registration is only attempted when this is true —
+     * verified empirically that cxi's NULL-hints fi_getinfo() already
+     * reports FI_HMEM in caps by default on Frontier; hsn (tcp;ofi_rxm)
+     * has no such support and would otherwise fail with a confusing
+     * low-level libfabric error instead of a clear one.                      */
+    static bool is_hmem_capable(struct fabric_state *f)
+    {
+        return f->info && f->info->fabric_attr->prov_name &&
+               strcmp(f->info->fabric_attr->prov_name, "cxi") == 0;
     }
 
     void init_fabric(struct fabric_state *fabric);

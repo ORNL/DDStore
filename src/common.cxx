@@ -634,16 +634,51 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     // register dest buffer; close previous recv MR first to avoid leaking it
     if (fabric_state->recv_mr)
         fi_close(&fabric_state->recv_mr->fid);
-    fi_mr_reg(
-        fabric_state->domain,
-        fabric_state->recv_data,
-        fabric_state->recv_data_len,
-        FI_READ,
-        0,
-        0,
-        0,
-        &fabric_state->recv_mr,
-        NULL);
+
+    bool recv_is_hmem = fabric_state->recv_hmem_iface != FI_HMEM_SYSTEM;
+    if (recv_is_hmem && !is_hmem_capable(fabric_state))
+    {
+        fprintf(stderr, "GPU (HMEM) recv buffer requested but fabric is not cxi\n");
+        return 1;
+    }
+
+    int mr_rc;
+    if (recv_is_hmem)
+    {
+        /* GPU destination buffer (ROCr on AMD, CUDA on NVIDIA -- whichever
+         * iface the caller set). No host-staged fallback exists: either
+         * fi_mr_regattr succeeds and fi_read() below DMAs straight into
+         * device memory, or it fails loudly here (checked below). */
+        struct iovec iov = {fabric_state->recv_data, fabric_state->recv_data_len};
+        struct fi_mr_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.mr_iov    = &iov;
+        attr.iov_count = 1;
+        attr.access    = FI_READ;
+        attr.iface     = (enum fi_hmem_iface)fabric_state->recv_hmem_iface;
+        attr.device.reserved = 0; /* ROCr/CUDA both resolve the device from the pointer */
+        mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->recv_mr);
+    }
+    else
+    {
+        mr_rc = fi_mr_reg(
+            fabric_state->domain,
+            fabric_state->recv_data,
+            fabric_state->recv_data_len,
+            FI_READ,
+            0,
+            0,
+            0,
+            &fabric_state->recv_mr,
+            NULL);
+    }
+    if (mr_rc != FI_SUCCESS)
+    {
+        fprintf(stderr, "%s failed: %s\n",
+                recv_is_hmem ? "fi_mr_regattr" : "fi_mr_reg",
+                fi_strerror(mr_rc));
+        return 1;
+    }
 
     /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
      * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).             */
@@ -664,7 +699,13 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     }
 
     void *memory_descriptor = NULL;
-    if (is_local_mr_req(fabric_state))
+    /* HMEM (device) buffers need their local descriptor passed to fi_read()
+     * regardless of FI_LOCAL_MR: CXI uses it to route the transfer into
+     * device memory. FI_LOCAL_MR is deprecated and unset on this libfabric
+     * build (is_local_mr_req() is always false here), so without this the
+     * descriptor stayed NULL for HMEM too and fi_read() silently no-op'd
+     * instead of DMAing into the GPU buffer.                                  */
+    if (is_local_mr_req(fabric_state) || recv_is_hmem)
     {
         memory_descriptor = fi_mr_desc(fabric_state->recv_mr);
     }
@@ -698,12 +739,32 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     //     return 1;
     // }
 
+    /* This loop blocks until the transfer completes — read_from_remote() does
+     * not return until it does. For a GPU (recv_hmem_iface != FI_HMEM_SYSTEM)
+     * destination, this is load-bearing: it's what keeps the caller's device
+     * buffer alive (still
+     * referenced on the Python stack, so PyTorch's caching allocator cannot
+     * reuse its storage) for the entire in-flight RDMA window. If this call
+     * is ever made asynchronous, GPU buffer safety must be re-examined.       */
     for (;;)
     {
         struct fi_cq_data_entry CQEntry = {0};
         rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
         if (rc == 1)
+        {
+            if (recv_is_hmem)
+                fprintf(stderr,
+                        "[hmem debug] cq entry: len=%zu flags=0x%llx "
+                        "recv_data=%p recv_data_len=%zu remote_addr=%llu "
+                        "remote_key=%llu src_offset=%llu\n",
+                        CQEntry.len, (unsigned long long)CQEntry.flags,
+                        (void *)fabric_state->recv_data,
+                        fabric_state->recv_data_len,
+                        (unsigned long long)(fabric_state->remote_address[src] + offset),
+                        (unsigned long long)fabric_state->remote_key[src],
+                        (unsigned long long)offset);
             break;
+        }
         if (rc == -FI_EAVAIL)
         {
             struct fi_cq_err_entry ee = {0};

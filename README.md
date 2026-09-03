@@ -275,6 +275,16 @@ export DDSTORE_GPU_SYNC=always   # force the safety margin everywhere
 export DDSTORE_GPU_SYNC=never    # disable it (only if you've verified it's safe)
 ```
 
+## Known Limitations
+
+### Multiple `srun` steps in one job (`method=2`, `cxi`)
+
+On Frontier, `cxi` requires `#SBATCH --network=job_vni` (or `single_node_vni`) for `method=2`'s separate core/extra `srun` steps to reach each other. Even with that set, a later step in a job with several sequential steps can occasionally fail to start; the cause isn't fully understood. If you hit this, use fewer sequential steps per job, or use `method=1` (single job step).
+
+### GPU-to-GPU RDMA performance on AMD/ROCm
+
+On Frontier, the synchronization `DDSTORE_GPU_SYNC` performs before each RDMA call (needed for correctness) can outweigh the benefit of skipping the host copy for small, per-sample transfers — GPU-to-GPU has not shown a speed advantage there yet, though results are correct either way. Larger, batched transfers should benefit more; that usage pattern isn't built yet. Perlmutter skips this sync by default and hasn't shown the same slowdown, but has been tested less.
+
 ## Partitioned / Sub-communicator Usage
 
 `PyDDStore` itself always spans the full communicator you pass it — there is no built-in "ranks per group" option. To run several independent stores side by side (e.g. one per node), split `comm` yourself before constructing `PyDDStore`, giving each group its own sub-communicator. Each group then holds a full replica of the dataset, partitioned across its own members.

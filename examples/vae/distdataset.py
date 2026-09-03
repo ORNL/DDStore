@@ -16,7 +16,8 @@ def nsplit(a, n):
 class DistDataset(Dataset):
     """Distributed dataset class"""
 
-    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None, device=None):
+    def __init__(self, data, label, comm=MPI.COMM_WORLD, ddstore_width=None,
+                 device=None, add_device=None):
         super().__init__()
 
         self.dataset = list()
@@ -28,6 +29,15 @@ class DistDataset(Dataset):
         # DDSTORE_METHOD in (1, 2) and DDSTORE_FABRIC=cxi (pyddstore raises
         # a clear error otherwise).
         self.device = device
+        # None -> add() makes a private host copy of this rank's shard
+        # (default, unchanged). torch.device/"cuda"/"cuda:N" -> the shard is
+        # stacked directly on that device and add() registers it in place,
+        # no host copy (GPUDirect RDMA, Phase 2) -- same DDSTORE_METHOD/
+        # DDSTORE_FABRIC requirements as `device` above. Independent of
+        # `device`: this controls the SOURCE side, `device` controls the
+        # DESTINATION side, so source and destination can be tested
+        # separately or together.
+        self.add_device = add_device
         self.rank = self.comm.Get_rank()
         self.comm_size = self.comm.Get_size()
         print("init", self.rank, self.comm_size)
@@ -70,24 +80,34 @@ class DistDataset(Dataset):
             self.dataset.append(data[i])
 
         print(self.rank, len(self.dataset))
-        self.data = list()
-        self.labels = list()
 
-        nbytes = 0
-        for data, label in self.dataset:
-            val = data.cpu().numpy()
-            val = val.flatten()
-            self.data.append(val)
-            self.labels.append(label)
-
-        # np.stack (not concatenate) keeps one row per image (nrows, 784) so
-        # ddstore.add() infers disp=784 instead of flattening into a single
-        # (nrows*784,) vector, which it would read back as disp=1.
-        self.data = np.stack(self.data)
-        self.data = np.ascontiguousarray(self.data)
-
+        # Label stays host-only regardless of add_device -- see get()'s
+        # matching comment; a GPU-resident int32 label buffer buys nothing.
+        self.labels = [label for _, label in self.dataset]
         self.labels = np.array(self.labels, dtype=np.int32)
         self.labels = np.ascontiguousarray(self.labels)
+
+        if self.add_device is not None:
+            # GPUDirect RDMA source (Phase 2): stack directly on device, no
+            # host round-trip. torch.stack (not cat) keeps one row per image
+            # (nrows, 784) -- see the np.stack comment below for why that
+            # shape matters to ddstore.add()'s disp inference.
+            self.data = torch.stack(
+                [d.reshape(-1) for d, _ in self.dataset]
+            ).to(self.add_device)
+            self.data = self.data.contiguous()
+        else:
+            data_list = list()
+            for data, _ in self.dataset:
+                val = data.cpu().numpy()
+                val = val.flatten()
+                data_list.append(val)
+
+            # np.stack (not concatenate) keeps one row per image (nrows, 784)
+            # so ddstore.add() infers disp=784 instead of flattening into a
+            # single (nrows*784,) vector, which it would read back as disp=1.
+            self.data = np.stack(data_list)
+            self.data = np.ascontiguousarray(self.data)
 
         self.ddstore.add(f"{self.label}data", self.data)
         self.ddstore.add(f"{self.label}labels", self.labels)

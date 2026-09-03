@@ -63,6 +63,16 @@ parser.add_argument(
          "host->device copy. Requires DDSTORE_METHOD in (1, 2) and "
          "DDSTORE_FABRIC=cxi (e.g. DDSTORE_METHOD=2 as in run-vae.sh).",
 )
+parser.add_argument(
+    "--gpu-source",
+    action="store_true",
+    default=False,
+    help="Stack this rank's local shard directly on the training device "
+         "and add() it in place (GPUDirect RDMA source, Phase 2), skipping "
+         "the host round-trip. Same DDSTORE_METHOD/DDSTORE_FABRIC "
+         "requirements as --gpu-dest; independent of it -- use either or "
+         "both.",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -91,7 +101,8 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-print("DDP setup:", comm_size, rank, device, "gpu_dest:", args.gpu_dest)
+print("DDP setup:", comm_size, rank, device,
+      "gpu_dest:", args.gpu_dest, "gpu_source:", args.gpu_source)
 
 if rank == 0:
     os.makedirs("results", exist_ok=True)
@@ -116,6 +127,7 @@ trainset = DistDataset(
     "train",
     comm,
     device=device if args.gpu_dest else None,
+    add_device=device if args.gpu_source else None,
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 comm.Barrier()

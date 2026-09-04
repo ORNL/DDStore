@@ -1,5 +1,7 @@
 # DDStore
 
+<img src="images/DDStore-logo.png" alt="DDStore logo" width="200" />
+
 Efficient distributed data loading for distributed data-parallel (DDP) training.
 
 Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a global index space so any rank can read any sample via one-sided remote memory access — either MPI RMA (default) or libfabric RDMA — without coordinator synchronization.

@@ -1,6 +1,6 @@
 # DDStore
 
-<img src="images/DDStore-logo.png" alt="DDStore logo" width="200" />
+<img src="images/DDStore-logo.png" alt="DDStore logo" />
 
 Efficient distributed data loading for distributed data-parallel (DDP) training.
 

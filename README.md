@@ -243,7 +243,9 @@ See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_
 
 ## GPUDirect RDMA (GPU-resident buffers)
 
-`add()` and `get()` accept a CUDA/HIP `torch.Tensor` in place of a NumPy array, letting RDMA read from or write directly into GPU memory — no host staging buffer, no `.cpu()`/`.to(device)` copy. Requires `method=1` or `2`, `DDSTORE_FABRIC=cxi` (the `hsn` provider does not support this), and a CUDA- or ROCm/HIP-enabled PyTorch build.
+`add()` and `get()` accept a CUDA/HIP `torch.Tensor` in place of a NumPy array, letting RDMA read from or write directly into GPU memory — no host staging buffer, no `.cpu()`/`.to(device)` copy. Requires `method=1` or `2` and a CUDA- or ROCm/HIP-enabled PyTorch build.
+
+**Requires `DDSTORE_FABRIC=cxi`. The `hsn` provider does not support GPUDirect RDMA at all** — passing a GPU tensor to `add()`/`get()` while `DDSTORE_FABRIC=hsn` (the default) raises a clear error rather than silently falling back to a host copy.
 
 ```python
 import torch
@@ -260,32 +262,21 @@ Not supported: `init()`/`update()` (the incremental-fill path) remain host-only;
 
 See [test/test_gpu_rdma.py](test/test_gpu_rdma.py) for runnable examples covering both directions, both libfabric methods, and the negative/error cases, and the `--gpu-dest`/`--gpu-source` flags on [examples/vae/vae-ddp.py](examples/vae/vae-ddp.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) / [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) for a full DDP training example using it.
 
-### `DDSTORE_GPU_SYNC`
-
-GPU kernels execute asynchronously: a compute kernel that just wrote to (or is about to read) a buffer may not have fully retired by the time that buffer is handed to RDMA. On at least one ROCm+CXI build, this produced a real, confirmed bug: the RDMA transfer reported success, but the destination buffer could still show stale, pre-transfer content, because the GPU's cache hadn't been reconciled with the external NIC write. Under sustained, real-workload conditions (not just short unit tests) this showed up as hard GPU faults, not just wrong data. To guard against this, `PyDDStore` synchronizes the GPU device before registering a buffer for RDMA whenever needed:
-
-| Value | Behavior |
-|---|---|
-| `auto` (default) | Synchronize on ROCm/HIP builds of PyTorch, skip on CUDA builds |
-| `always` | Always synchronize, on any platform |
-| `never` | Never synchronize — only set this once you've independently verified your workload is safe without it |
-
-The `auto` default reflects what's actually been observed, not a platform guarantee: NVIDIA's long-hardened GPUDirect RDMA stack has shown no evidence of this race so far, but that evidence comes from lighter testing than what exposed it on ROCm (a real, sustained training loop, not just short unit tests) — so treat it as "no evidence of a problem on CUDA," not "proven safe on CUDA." Synchronizing has a real performance cost: it's a blocking, whole-device sync before every GPU-buffer `add()`/`get()` call, which can serialize GPU compute against RDMA transfers when called at high frequency (e.g. once per sample in a data loader). Set `DDSTORE_GPU_SYNC=always` for extra safety on CUDA too; set `never` only after confirming it's unnecessary for your specific workload and platform.
-
-```bash
-export DDSTORE_GPU_SYNC=always   # force the safety margin everywhere
-export DDSTORE_GPU_SYNC=never    # disable it (only if you've verified it's safe)
-```
+GPU kernels execute asynchronously: a compute kernel that just wrote to (or is about to read) a buffer may not have fully retired by the time that buffer is handed to RDMA. On at least one ROCm+CXI build, this produced a real, confirmed bug: the RDMA transfer reported success, but the destination buffer could still show stale, pre-transfer content, because the GPU's cache hadn't been reconciled with the external NIC write. Under sustained, real-workload conditions (not just short unit tests) this showed up as hard GPU faults, not just wrong data. To guard against this, `PyDDStore` always synchronizes the GPU device (`torch.cuda.synchronize()`) before registering a buffer for RDMA in `add()`/`get()`. This is a blocking, whole-device sync, which can serialize GPU compute against RDMA transfers when called at high frequency (e.g. once per sample in a data loader) — see the performance note below.
 
 ## Known Limitations
 
 ### Multiple `srun` steps in one job (`method=2`, `cxi`)
 
-On Frontier, `cxi` requires `#SBATCH --network=job_vni` (or `single_node_vni`) for `method=2`'s separate core/extra `srun` steps to reach each other. Even with that set, a later step in a job with several sequential steps can occasionally fail to start; the cause isn't fully understood. If you hit this, use fewer sequential steps per job, or use `method=1` (single job step).
+On Frontier, `method=2`'s separate core/extra `srun` steps within one job have shown intermittent RDMA connectivity issues between steps, and a later step in a job with several sequential steps can occasionally fail to start. The `--network=job_vni`/`single_node_vni` `sbatch` options have not reliably fixed this. The cause isn't fully understood. If you hit this, use fewer sequential steps per job, or use `method=1` (single job step), which doesn't have this issue.
 
 ### GPU-to-GPU RDMA performance on AMD/ROCm
 
-On Frontier, the synchronization `DDSTORE_GPU_SYNC` performs before each RDMA call (needed for correctness) can outweigh the benefit of skipping the host copy for small, per-sample transfers — GPU-to-GPU has not shown a speed advantage there yet, though results are correct either way. Larger, batched transfers should benefit more; that usage pattern isn't built yet. Perlmutter skips this sync by default and hasn't shown the same slowdown, but has been tested less.
+On Frontier, the GPU synchronization performed before each RDMA call (needed for correctness) can outweigh the benefit of skipping the host copy for small, per-sample transfers — GPU-to-GPU has not shown a speed advantage there yet, though results are correct either way. Larger, batched transfers should benefit more; that usage pattern isn't built yet.
+
+### Troubleshooting: RDMA fails to connect (`cxi`, Frontier)
+
+If a `cxi` job fails to connect over RDMA, try adding `#SBATCH --network=single_node_vni` — this has been needed specifically for **single-node** (`-N 1`) jobs on Frontier. For jobs spanning multiple nodes, or multiple `srun` steps in one job, this hasn't reliably helped (see above); if you hit connection issues there, reducing the number of sequential steps or using `method=1` is more likely to help.
 
 ## Partitioned / Sub-communicator Usage
 
@@ -322,6 +313,19 @@ mpirun -n 4 python examples/vae/vae-ddp.py
 ```bash
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --gpu-dest --gpu-source
 ```
+
+### Slurm job scripts (Frontier)
+
+[examples/vae/script/job-vae-single.sh](examples/vae/script/job-vae-single.sh) and [examples/vae/script/job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh) wrap the same VAE example for `sbatch` on Frontier — `job-vae-single.sh` runs plain DDP (one `srun` step), `job-vae-core-extra.sh` runs the [method=2 core/extra split](#file-based-handshake-method2) (two independent `srun` steps). Both take the same independent options — each has its own fixed default and none implicitly changes another:
+
+```bash
+sbatch examples/vae/script/job-vae-single.sh                       # method=0, cxi
+sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect
+sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, cxi, colocate layout
+sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node --core-nnodes=2
+```
+
+Run `--help` on either script for the full option list (`--method`, `--fabric`, `--gpudirect`; `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`). Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
 ## Testing
 

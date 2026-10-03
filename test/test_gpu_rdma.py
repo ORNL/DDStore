@@ -6,6 +6,8 @@ requires a live cxi/Slingshot fabric and at least one visible GPU per rank
 (see run-test-gpu.sh). Negative-path tests need neither and always run.
 """
 
+import threading
+
 import numpy as np
 import pytest
 from mpi4py import MPI
@@ -50,8 +52,11 @@ def test_get_into_gpu_tensor_cxi(comm, monkeypatch):
         store.get("x", out, start=target_rank * nrows)
         expected = float(target_rank + 1)
         ok = bool(torch.all(out.cpu() == expected))
-        print(f"[rank {rank}] target_rank={target_rank} expected={expected} "
-              f"got={out.cpu().tolist()} ok={ok}", flush=True)
+        print(
+            f"[rank {rank}] target_rank={target_rank} expected={expected} "
+            f"got={out.cpu().tolist()} ok={ok}",
+            flush=True,
+        )
         if not ok:
             local_ok = False
     store.epoch_end()
@@ -110,7 +115,9 @@ def test_get_into_gpu_tensor_cxi_compute_kernel_read(comm, monkeypatch):
         if i % 50 == 0:
             print(f"[rank {rank}] iter={i} diff={diff.item()}", flush=True)
     store.epoch_end()
-    print(f"[rank {rank}] completed {n_iters} iterations without a HIP error", flush=True)
+    print(
+        f"[rank {rank}] completed {n_iters} iterations without a HIP error", flush=True
+    )
     store.free()
 
 
@@ -238,9 +245,12 @@ def test_get_into_gpu_tensor_cxi_large(comm, monkeypatch):
         expected = float(target_rank + 1)
         ok = bool(torch.all(out.cpu() == expected))
         nonpoison = int((out.cpu() != -999.0).sum())
-        print(f"[rank {rank}] target_rank={target_rank} expected={expected} "
-              f"ok={ok} nonpoison_count={nonpoison}/{ncols} "
-              f"sample={out.cpu().flatten()[:8].tolist()}", flush=True)
+        print(
+            f"[rank {rank}] target_rank={target_rank} expected={expected} "
+            f"ok={ok} nonpoison_count={nonpoison}/{ncols} "
+            f"sample={out.cpu().flatten()[:8].tolist()}",
+            flush=True,
+        )
         if not ok:
             local_ok = False
     store.epoch_end()
@@ -273,8 +283,11 @@ def test_get_host_to_host_cxi(comm, monkeypatch):
         store.get("x", out, start=target_rank * nrows)
         expected = float(target_rank + 1)
         ok = bool(np.all(out == expected))
-        print(f"[rank {rank}] target_rank={target_rank} expected={expected} "
-              f"got={out.tolist()} ok={ok}", flush=True)
+        print(
+            f"[rank {rank}] target_rank={target_rank} expected={expected} "
+            f"got={out.tolist()} ok={ok}",
+            flush=True,
+        )
         if not ok:
             local_ok = False
     store.epoch_end()
@@ -359,7 +372,9 @@ def test_add_from_gpu_tensor_host_dest_cxi(comm, monkeypatch):
     nrows, ncols = 8, 4
 
     store = dds.PyDDStore(comm, method=1)
-    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    data = torch.full(
+        (nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda"
+    )
     store.add("x", data)  # GPU source -- Phase 2
 
     store.epoch_begin()
@@ -387,7 +402,9 @@ def test_add_from_gpu_tensor_gpu_dest_cxi(comm, monkeypatch):
     nrows, ncols = 8, 4
 
     store = dds.PyDDStore(comm, method=1)
-    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    data = torch.full(
+        (nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda"
+    )
     store.add("x", data)
 
     store.epoch_begin()
@@ -422,10 +439,14 @@ def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
         pytest.skip("requires at least 2 ranks for a genuine remote read")
     nrows, ncols = 8, 4
 
-    hs_dir = comm.bcast(str(tmp_path / "ddstore_hs_add_method2") if rank == 0 else None, root=0)
+    hs_dir = comm.bcast(
+        str(tmp_path / "ddstore_hs_add_method2") if rank == 0 else None, root=0
+    )
 
     core_store = dds.PyDDStore(comm, method=2, handshake_dir=hs_dir)
-    data = torch.full((nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda")
+    data = torch.full(
+        (nrows, ncols), float(rank + 1), dtype=torch.float32, device="cuda"
+    )
     core_store.add("x", data)  # GPU source -- Phase 2
     comm.Barrier()
 
@@ -451,3 +472,81 @@ def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
     comm.Barrier()
     assert all_passed(comm, local_ok)
     core_store.free()
+
+
+# ---------------------------------------------------------------------------
+# thread-safety: concurrent get() calls from multiple Python threads
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_get_thread_safety(comm, monkeypatch):
+    """DDStore::get() releases the GIL for its blocking transfer (see the
+    `with nogil:` block in pyddstore.pyx) but has no internal locking of its
+    own -- concurrent calls from multiple threads on the same store race on
+    the CQ poll loop and the recv-MR region cache in common.cxx.
+
+    examples/vae/distdataset.py's DistDataset/DistDatasetReader (used by
+    ThreadDataLoader, examples/vae/ddstore_dataloader.py, to parallelize
+    __getitem__ across threads) close this with a `threading.Lock` around
+    each get() call. This test reproduces that exact pattern directly
+    against PyDDStore: N threads issue concurrent get() calls serialized by
+    a lock, each checked against a trusted sequential reference -- it would
+    have caught the race if the lock were missing or misplaced.
+    """
+    monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+    if size < 2:
+        pytest.skip("requires at least 2 ranks for a genuine remote read")
+    nrows, ncols = 8, 4
+
+    store = dds.PyDDStore(comm, method=1)
+    data = np.full((nrows, ncols), float(rank + 1), dtype=np.float32)
+    store.add("x", data)
+    comm.Barrier()
+
+    store.epoch_begin()
+    lock = threading.Lock()
+    results = {}
+    errors = []
+
+    def locked_get(target_rank):
+        out = np.full((1, ncols), -999.0, dtype=np.float32)
+        with lock:
+            store.get("x", out, start=target_rank * nrows)
+        results[target_rank] = out.copy()
+
+    def worker(target_ranks):
+        try:
+            for target_rank in target_ranks:
+                locked_get(target_rank)
+        except Exception as exc:  # noqa: BLE001 - surface any thread exception
+            errors.append(exc)
+
+    n_threads = 4
+    threads = [
+        threading.Thread(target=worker, args=(list(range(t, size, n_threads)),))
+        for t in range(min(n_threads, size))
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    store.epoch_end()
+
+    assert not errors, f"worker thread(s) raised: {errors}"
+    local_ok = True
+    for target_rank in range(size):
+        expected = float(target_rank + 1)
+        got = results[target_rank]
+        ok = bool(np.all(got == expected))
+        if not ok:
+            local_ok = False
+        print(
+            f"[rank {rank}] target_rank={target_rank} expected={expected} "
+            f"got={got.tolist()} ok={ok}",
+            flush=True,
+        )
+
+    assert all_passed(comm, local_ok)
+    store.free()

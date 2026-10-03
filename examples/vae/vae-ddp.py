@@ -20,6 +20,7 @@ from mpi4py import MPI
 
 import distdataset
 from distdataset import DistDataset
+from ddstore_dataloader import ThreadDataLoader
 
 from ddp_utils import setup_ddp, get_local_rank
 from vae_model import VAE, loss_function
@@ -60,19 +61,43 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Allocate the DDStore get() destination buffer directly on the "
-         "training device (GPUDirect RDMA, Phase 1), skipping the "
-         "host->device copy. Requires DDSTORE_METHOD in (1, 2) and "
-         "DDSTORE_FABRIC=cxi (e.g. DDSTORE_METHOD=2 as in run-vae.sh).",
+    "training device (GPUDirect RDMA, Phase 1), skipping the "
+    "host->device copy. Requires DDSTORE_METHOD in (1, 2) and "
+    "DDSTORE_FABRIC=cxi (e.g. DDSTORE_METHOD=2 as in run-vae.sh).",
 )
 parser.add_argument(
     "--gpu-source",
     action="store_true",
     default=False,
     help="Stack this rank's local shard directly on the training device "
-         "and add() it in place (GPUDirect RDMA source, Phase 2), skipping "
-         "the host round-trip. Same DDSTORE_METHOD/DDSTORE_FABRIC "
-         "requirements as --gpu-dest; independent of it -- use either or "
-         "both.",
+    "and add() it in place (GPUDirect RDMA source, Phase 2), skipping "
+    "the host round-trip. Same DDSTORE_METHOD/DDSTORE_FABRIC "
+    "requirements as --gpu-dest; independent of it -- use either or "
+    "both.",
+)
+parser.add_argument(
+    "--loader",
+    choices=["default", "threaded"],
+    default="default",
+    help="DataLoader implementation for the training set. 'threaded' uses "
+    "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
+    "thread-pool-based loader that allows --num-workers > 0 together "
+    "with --gpu-dest/--gpu-source (the default loader forks worker "
+    "processes, which cannot safely own GPU state, so it stays "
+    "single-threaded for those flags). Requires DDSTORE_METHOD 1 or 2. "
+    "Default: default.",
+)
+parser.add_argument(
+    "--num-workers",
+    type=int,
+    default=1,
+    metavar="N",
+    help="Number of worker threads (--loader=threaded) or worker processes "
+    "(--loader=default). With --loader=default, must stay <= 1 -- "
+    "forking worker processes after MPI_Init hangs with DDStore; use "
+    "--loader=threaded for real parallelism instead. Also forced to 0 "
+    "for --loader=default when --gpu-dest/--gpu-source is set "
+    "(fork-safety guard). Default: 1.",
 )
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -102,8 +127,16 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-print("DDP setup:", comm_size, rank, device,
-      "gpu_dest:", args.gpu_dest, "gpu_source:", args.gpu_source)
+print(
+    "DDP setup:",
+    comm_size,
+    rank,
+    device,
+    "gpu_dest:",
+    args.gpu_dest,
+    "gpu_source:",
+    args.gpu_source,
+)
 
 if rank == 0:
     os.makedirs("results", exist_ok=True)
@@ -115,13 +148,23 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
 # kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 # kwargs = {'pin_memory': True} if args.cuda else {}
-kwargs = {}
-# --gpu-dest returns CUDA/HIP tensors from __getitem__; DataLoader worker
-# processes can't safely own GPU state across a fork, so this only works
-# with num_workers=0 (today's default). Don't add num_workers>0 here
-# without redesigning the buffer/collate strategy.
-if args.gpu_dest:
-    assert kwargs.get("num_workers", 0) == 0
+# --gpu-dest/--gpu-source return CUDA/HIP tensors from __getitem__/add();
+# DataLoader worker processes can't safely own GPU state across a fork, so
+# the default (forked-process) loader is forced to num_workers=0 whenever
+# either is set -- use --loader=threaded for num_workers > 0 with GPU
+# buffers instead. Separately, forking *at all* after MPI_Init is a known
+# MPI hazard that hangs with DDStore even without GPU buffers -- fail fast
+# instead of hanging silently.
+if args.loader == "default" and args.num_workers > 1:
+    raise RuntimeError(
+        "--num-workers > 1 with --loader=default forks worker processes "
+        "after MPI_Init, which hangs with DDStore. Use --num-workers=1, or "
+        "--loader=threaded for real parallelism."
+    )
+if args.gpu_dest or args.gpu_source:
+    kwargs = {}
+else:
+    kwargs = {"num_workers": args.num_workers} if args.num_workers > 0 else {}
 
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
@@ -134,8 +177,25 @@ trainset = DistDataset(
 comm.Barrier()
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-train_loader = torch.utils.data.DataLoader(
-    trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+if args.loader == "threaded":
+    if int(os.environ.get("DDSTORE_METHOD", "0")) == 0:
+        raise RuntimeError("--loader=threaded requires DDSTORE_METHOD=1 or 2")
+    train_loader = ThreadDataLoader(
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
+else:
+    # --num-workers applies here too (forked processes), unless --gpu-dest/
+    # --gpu-source forced kwargs back to {} above (fork-safety guard).
+    train_loader = torch.utils.data.DataLoader(
+        trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+    )
+
+print(
+    f"train_loader: {type(train_loader).__name__}, num_workers={train_loader.num_workers}"
 )
 
 testset = datasets.MNIST(

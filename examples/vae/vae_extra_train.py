@@ -44,6 +44,7 @@ from mpi4py import MPI
 
 from ddp_utils import setup_ddp, get_local_rank
 from distdataset import DistDatasetReader
+from ddstore_dataloader import ThreadDataLoader
 from vae_model import VAE, loss_function
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example - extra (reader) group")
@@ -94,9 +95,28 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Allocate the DDStore get() destination buffer directly on the "
-         "training device (GPUDirect RDMA, Phase 1), skipping the "
-         "host->device copy. Requires DDSTORE_FABRIC=cxi and a "
-         "libfabric-backed method (already the case for this script).",
+    "training device (GPUDirect RDMA, Phase 1), skipping the "
+    "host->device copy. Requires DDSTORE_FABRIC=cxi and a "
+    "libfabric-backed method (already the case for this script).",
+)
+parser.add_argument(
+    "--loader",
+    choices=["default", "threaded"],
+    default="default",
+    help="DataLoader implementation for the training set. 'threaded' uses "
+    "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
+    "thread-pool-based loader that allows --num-workers > 0 together "
+    "with --gpu-dest (the default loader forks worker processes, "
+    "which cannot safely own GPU state, so it stays single-threaded "
+    "for that flag). Default: default.",
+)
+parser.add_argument(
+    "--num-workers",
+    type=int,
+    default=4,
+    metavar="N",
+    help="Number of worker threads for --loader=threaded. Ignored with "
+    "--loader=default (always 0 there). Default: 4.",
 )
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -139,14 +159,30 @@ if args.gpu_dest:
     assert kwargs.get("num_workers", 0) == 0
 
 trainset = DistDatasetReader(
-    "train", args.handshake_dir, args.n_core,
+    "train",
+    args.handshake_dir,
+    args.n_core,
     device=device if args.gpu_dest else None,
 )
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-train_loader = torch.utils.data.DataLoader(
-    trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
-)
+if args.loader == "threaded":
+    # DistDatasetReader always joins via method=2 (file-based handshake),
+    # so no DDSTORE_METHOD=0 guard is needed here (unlike vae-ddp.py).
+    train_loader = ThreadDataLoader(
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
+else:
+    # --num-workers is ignored here: kwargs never carries num_workers for
+    # the default loader (see the fork-safety guard above), so this is
+    # always the existing num_workers=0 behavior regardless of its value.
+    train_loader = torch.utils.data.DataLoader(
+        trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+    )
 
 testset = datasets.MNIST(
     "data", train=False, download=True, transform=transforms.ToTensor()

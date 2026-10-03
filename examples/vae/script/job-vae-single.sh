@@ -21,6 +21,15 @@ Options:
   --fabric=X     DDSTORE_FABRIC: hsn or cxi. Default: cxi.
   --gpudirect    Test GPUDirect RDMA. Requires --method=1 or 2 and
                  --fabric=cxi.
+  --thread       Use ThreadDataLoader (thread-pool DataLoader) instead of the
+                 default forked-process DataLoader. Needed for
+                 --num-workers > 0 together with --gpudirect. Requires
+                 --method=1 or 2.
+  --num-workers=N  Worker processes for the default loader (must stay <= 1
+                 -- forking after MPI_Init hangs with DDStore for N > 1;
+                 use --thread instead), or worker threads with --thread.
+                 Forced to 0 for the default loader when --gpudirect is
+                 set (fork-safety guard). Default: 1.
   -h, --help     Show this help message and exit.
 
 Examples:
@@ -28,6 +37,7 @@ Examples:
   $(basename "$0") --method=1 --gpudirect       # GPUDirect over libfabric
   $(basename "$0") --method=2 --gpudirect       # GPUDirect over file-based handshake
   $(basename "$0") --fabric=hsn                 # baseline over hsn instead
+  $(basename "$0") --method=1 --gpudirect --thread --num-workers=4
 EOF
 }
 
@@ -45,17 +55,27 @@ export VAE_PROFILE=1
 
 METHOD=
 FABRIC=
-EXTRA_ARGS=""
+GPUDIRECT_ARGS=""
+THREAD=0
+NUM_WORKERS=
 for arg in "$@"; do
     case "$arg" in
         --method=*) METHOD="${arg#--method=}" ;;
         --fabric=*) FABRIC="${arg#--fabric=}" ;;
-        --gpudirect) EXTRA_ARGS="--gpu-dest --gpu-source" ;;
+        --gpudirect) GPUDIRECT_ARGS="--gpu-dest --gpu-source" ;;
+        --thread) THREAD=1 ;;
+        --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
     esac
 done
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
 METHOD="${METHOD:-0}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+
+EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS"
+if [ "$THREAD" == "1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --loader=threaded"
+fi
 
 echo "DDSTORE_METHOD=$METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
 

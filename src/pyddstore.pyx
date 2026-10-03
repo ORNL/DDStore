@@ -92,7 +92,7 @@ cdef extern from "ddstore.hpp":
         # Method 2: extra member (no MPI communicator)
         DDStore(int method, string handshake_dir, int n_core)
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
-        void get[T](string name, long start, long count, T* buffer, int hmem_iface) except +
+        void get[T](string name, long start, long count, T* buffer, int hmem_iface) except + nogil
         void prefetch_recv_mr[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void epoch_begin()
         void epoch_end()
@@ -270,18 +270,29 @@ cdef class PyDDStore:
         cdef np.ndarray np_arr = arr
         assert np_arr.flags.c_contiguous
         assert np_arr.shape[0] >= count
+        # The host read runs without the GIL, so other Python threads (e.g. a
+        # training loop while a background thread prefetches) keep running.
+        # Method 1/2 reads make no MPI calls.
+        cdef string cname = s2b(name)
+        cdef char* data = np_arr.data
         if np_arr.dtype == np.int32:
-            self.c_ddstore.get(s2b(name), start, count, <int *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <int *> data, 0)
         elif np_arr.dtype == np.int64:
-            self.c_ddstore.get(s2b(name), start, count, <long *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <long *> data, 0)
         elif np_arr.dtype == np.uint8:
-            self.c_ddstore.get(s2b(name), start, count, <char *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <char *> data, 0)
         elif np_arr.dtype == np.float32:
-            self.c_ddstore.get(s2b(name), start, count, <float *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <float *> data, 0)
         elif np_arr.dtype == np.float64:
-            self.c_ddstore.get(s2b(name), start, count, <double *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <double *> data, 0)
         elif np_arr.dtype == np.bool_:
-            self.c_ddstore.get(s2b(name), start, count, <char *> np_arr.data, 0)
+            with nogil:
+                self.c_ddstore.get(cname, start, count, <char *> data, 0)
         else:
             raise NotImplementedError
     

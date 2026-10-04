@@ -43,6 +43,10 @@ Options:
                  PyTorch's standard DataLoader in the main process. > 0
                  switches to ThreadDataLoader with that many worker threads.
                  Default: 0.
+  --replicate=R  Repeat the MNIST training set R times on the core side
+                 (longer epochs, same per-sample cost). Default: 1.
+  --image-scale=S  Upscale images to (28*S)x(28*S) on the core side (the
+                 extra side follows the published size). Default: 1.
   -h, --help     Show this help message and exit.
 EOF
 }
@@ -59,6 +63,8 @@ GPUDIRECT=0
 LAYOUT=
 CORE_NNODES_OPT=
 NUM_WORKERS=
+REPLICATE=
+IMAGE_SCALE=
 for arg in "$@"; do
     case "$arg" in
         --method=*) METHOD="${arg#--method=}" ;;
@@ -67,10 +73,14 @@ for arg in "$@"; do
         --layout=*) LAYOUT="${arg#--layout=}" ;;
         --core-nnodes=*) CORE_NNODES_OPT="${arg#--core-nnodes=}" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
+        --replicate=*) REPLICATE="${arg#--replicate=}" ;;
+        --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
     esac
 done
 LAYOUT="${LAYOUT:-colocate}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+REPLICATE="${REPLICATE:-1}"
+IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
 export DDSTORE_METHOD="${METHOD:-2}"
@@ -105,11 +115,11 @@ CORE_NTASKS=$((CORE_NNODES * CORE_NR))
 EXTRA_NTASKS=$((EXTRA_NNODES * EXTRA_NR))
 
 echo "DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYOUT GPUDIRECT=$GPUDIRECT"
-echo "CORE_NNODES=$CORE_NNODES CORE_NTASKS=$CORE_NTASKS CORE_GPUS_PER_TASK=$CORE_GPUS_PER_TASK CORE_EXTRA_ARGS=\"$CORE_EXTRA_ARGS\""
+echo "CORE_NNODES=$CORE_NNODES CORE_NTASKS=$CORE_NTASKS CORE_GPUS_PER_TASK=$CORE_GPUS_PER_TASK CORE_EXTRA_ARGS=\"$CORE_EXTRA_ARGS\" REPLICATE=$REPLICATE IMAGE_SCALE=$IMAGE_SCALE"
 echo "EXTRA_NNODES=$EXTRA_NNODES EXTRA_NTASKS=$EXTRA_NTASKS EXTRA_EXTRA_ARGS=\"$EXTRA_EXTRA_ARGS\" NUM_WORKERS=$NUM_WORKERS"
 
 MASTER_PORT=8889 srun -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-task=$CORE_GPUS_PER_TASK --cpu-bind=verbose,core -l \
-    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_core_server.py ddstore_hs_vae $CORE_EXTRA_ARGS \
+    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_core_server.py ddstore_hs_vae --replicate=$REPLICATE --image-scale=$IMAGE_SCALE $CORE_EXTRA_ARGS \
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /') &
 sleep 5
 

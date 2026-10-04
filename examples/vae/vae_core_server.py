@@ -8,7 +8,7 @@ itself — it just holds the data in memory until the extra group signals it
 is done.
 
 Usage:
-  srun -n<n_core> python examples/vae/vae_core_server.py [handshake_dir] [--gpu-source]
+  srun -n<n_core> python examples/vae/vae_core_server.py [handshake_dir] [--gpu-source] [--replicate=R] [--image-scale=S]
 
   --gpu-source  Stack this rank's shard directly on the GPU and add() it in
                 place (GPUDirect RDMA source, Phase 2), skipping the host
@@ -16,6 +16,11 @@ Usage:
                 and DDSTORE_FABRIC=cxi, and one visible GPU per rank
                 (--gpus-per-task=1, unlike the --gpus-per-task=0 this
                 script normally runs with).
+  --replicate=R Repeat the MNIST training set R times (default 1), for
+                longer epochs with the same per-sample cost. The extra side
+                picks up the row count from the published variable.
+  --image-scale=S Upscale images to (28*S)x(28*S) (default 1). The extra
+                side derives S from the published row width.
 
 Environment:
   DDSTORE_HANDSHAKE_DIR       overrides handshake_dir positional arg
@@ -40,6 +45,7 @@ from torchvision import datasets, transforms
 from mpi4py import MPI
 
 from distdataset import DistDataset
+from vae_model import mnist_transform
 
 
 def _resolve_dir(arg):
@@ -49,6 +55,13 @@ def _resolve_dir(arg):
 
 
 gpu_source = "--gpu-source" in sys.argv
+replicate = 1
+image_scale = 1
+for a in sys.argv[1:]:
+    if a.startswith("--replicate="):
+        replicate = int(a.split("=", 1)[1])
+    elif a.startswith("--image-scale="):
+        image_scale = int(a.split("=", 1)[1])
 positional_args = [a for a in sys.argv[1:] if not a.startswith("--")]
 hs_dir = _resolve_dir(positional_args[0] if positional_args else "")
 os.environ["DDSTORE_METHOD"] = "2"
@@ -72,13 +85,21 @@ if rank == 0:
 comm.Barrier()
 
 trainset = datasets.MNIST(
-    "data", train=True, download=True, transform=transforms.ToTensor()
+    "data", train=True, download=True, transform=mnist_transform(image_scale)
 )
-dds_trainset = DistDataset(trainset, "train", comm, add_device=add_device)
+dds_trainset = DistDataset(
+    torch.utils.data.ConcatDataset([trainset] * replicate),
+    "train",
+    comm,
+    add_device=add_device,
+)
 comm.Barrier()
 
 if rank == 0:
-    print("gpu_source:", gpu_source, flush=True)
+    print(
+        "gpu_source:", gpu_source, "replicate:", replicate,
+        "image_scale:", image_scale, flush=True,
+    )
 
 if rank == 0:
     print(

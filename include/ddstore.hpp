@@ -67,6 +67,26 @@ public:
     /* Method 2 extra member: discover variable published by core members.   */
     void join(std::string name);
 
+    /* DDSTORE_PROFILE=1 counters for `name` (methods 1/2), as
+     * {calls, lock_wait_ns, mr_ns, mr_miss, read_ns, cq_ns}; all zero for
+     * method 0 or when profiling is off. Takes the variable's lock.         */
+    void profile(std::string name, unsigned long long out[6])
+    {
+        for (int i = 0; i < 6; i++)
+            out[i] = 0;
+        const VarInfo_t &varinfo = this->varlist.at(name);
+        struct fabric_state *fs = varinfo.fabric_state;
+        if (!fs)
+            return;
+        fabric_state_lock_guard lock(fs);
+        out[0] = fs->prof_calls;
+        out[1] = fs->prof_lock_wait_ns;
+        out[2] = fs->prof_mr_ns;
+        out[3] = fs->prof_mr_miss;
+        out[4] = fs->prof_read_ns;
+        out[5] = fs->prof_cq_ns;
+    }
+
     /* hmem_iface: 0 (FI_HMEM_SYSTEM) for a host buffer, or an fi_hmem_iface
      * value (FI_HMEM_CUDA, FI_HMEM_ROCR, ...) identifying what kind of GPU
      * memory `buffer` is. Mirrors get()'s hmem_iface parameter.
@@ -481,7 +501,14 @@ public:
              * concurrent get() calls on this variable, not just the
              * read_from_remote() call that follows them -- see recv_lock's
              * comment in common.h. */
+            const bool prof = ddstore_profile_enabled();
+            uint64_t t_wait = prof ? ddstore_now_ns() : 0;
             fabric_state_lock_guard lock(varinfo.fabric_state);
+            if (prof)
+            {
+                varinfo.fabric_state->prof_calls++;
+                varinfo.fabric_state->prof_lock_wait_ns += ddstore_now_ns() - t_wait;
+            }
             if (hmem_iface != 0 && !is_hmem_capable(varinfo.fabric_state))
                 throw std::runtime_error(
                     "GPU destination buffer requires DDSTORE_FABRIC=cxi "

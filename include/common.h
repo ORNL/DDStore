@@ -4,7 +4,10 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <mpi.h>
 
 #define DP_AV_DEF_SIZE 512
@@ -102,7 +105,38 @@ extern "C"
          * PTHREAD_MUTEX_INITIALIZER is a common but implementation-defined
          * assumption; init explicitly instead. */
         pthread_mutex_t recv_lock;
+
+        /* DDSTORE_PROFILE=1: cumulative get() timing for this variable, all
+         * updated while recv_lock is held (see ddstore_profile_enabled()).
+         * prof_lock_wait_ns is the time spent waiting to acquire recv_lock;
+         * mr = recv-MR cache check / (re)registration; read = posting
+         * fi_read(); cq = polling the CQ until the read completes.          */
+        uint64_t prof_calls;
+        uint64_t prof_lock_wait_ns;
+        uint64_t prof_mr_ns;
+        uint64_t prof_mr_miss;
+        uint64_t prof_read_ns;
+        uint64_t prof_cq_ns;
     };
+
+    static inline uint64_t ddstore_now_ns(void)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    }
+
+    /* True if DDSTORE_PROFILE is set to a non-"0" value (read once).        */
+    static inline bool ddstore_profile_enabled(void)
+    {
+        static int enabled = -1;
+        if (enabled < 0)
+        {
+            const char *e = getenv("DDSTORE_PROFILE");
+            enabled = (e && e[0] && strcmp(e, "0") != 0) ? 1 : 0;
+        }
+        return enabled == 1;
+    }
 
     static bool is_local_mr_req(struct fabric_state *f)
     {

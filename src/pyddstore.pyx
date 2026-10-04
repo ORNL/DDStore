@@ -3,6 +3,7 @@
 # cython: language=c++
 
 import os
+import time
 
 import mpi4py.MPI as MPI
 cimport mpi4py.MPI as MPI
@@ -116,6 +117,7 @@ cdef extern from "ddstore.hpp":
         void join(string name) except +
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
+        void profile(string name, unsigned long long *out) except +
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -131,6 +133,11 @@ cdef class PyDDStore:
     # lifetime-contract comment) -- this dict keeps the Python reference
     # alive for as long as the variable stays registered.
     cdef dict _gpu_owned_buffers
+    # DDSTORE_PROFILE=1: Python-side get() timing (see get_profile()).
+    cdef bint _prof
+    cdef double _prof_get_s
+    cdef double _prof_sync_s
+    cdef long _prof_gets
 
     def __cinit__(self, comm_or_none=None, int method=0,
                   str handshake_dir="", int n_core=0, nic_map=None):
@@ -152,6 +159,10 @@ cdef class PyDDStore:
         cdef MPI.Comm mpi_comm
         self.method = method
         self._gpu_owned_buffers = {}
+        self._prof = os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0")
+        self._prof_get_s = 0.0
+        self._prof_sync_s = 0.0
+        self._prof_gets = 0
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
         if method == 2:
@@ -241,6 +252,8 @@ cdef class PyDDStore:
             self._gpu_owned_buffers[name] = arr
 
     def get(self, str name, arr, long start=0):
+        cdef double t_get = time.perf_counter() if self._prof else 0.0
+        cdef double t_sync
         cdef long count = arr.shape[0]
         cdef size_t ptr
         cdef int itemsize
@@ -252,7 +265,12 @@ cdef class PyDDStore:
             assert arr.is_contiguous()
             import torch
             # See the matching comment in add() for what this guards against.
-            torch.cuda.synchronize(device=arr.device)
+            if self._prof:
+                t_sync = time.perf_counter()
+                torch.cuda.synchronize(device=arr.device)
+                self._prof_sync_s += time.perf_counter() - t_sync
+            else:
+                torch.cuda.synchronize(device=arr.device)
             ptr = arr.data_ptr()
             itemsize = arr.element_size()
             iface = _hmem_iface_for(arr)
@@ -275,6 +293,27 @@ cdef class PyDDStore:
                 self.c_ddstore.get(cname, start, count, <int *> ptr, iface)
             else:
                 self.c_ddstore.get(cname, start, count, <long *> ptr, iface)
+        if self._prof:
+            self._prof_get_s += time.perf_counter() - t_get
+            self._prof_gets += 1
+
+    def get_profile(self, str name):
+        """DDSTORE_PROFILE=1 timing for `name` (methods 1/2), in seconds.
+
+        C++ counters for this variable: calls, lock_wait, mr (recv-MR cache
+        check/registration), mr_miss (re-registrations), read (posting
+        fi_read), cq (waiting for completion). Python counters for this
+        store, across all variables: py_gets, py_get (whole get() calls),
+        py_sync (torch.cuda.synchronize on the GPU-destination path).
+        """
+        cdef unsigned long long c[6]
+        self.c_ddstore.profile(s2b(name), c)
+        return {
+            "calls": c[0], "lock_wait": c[1] * 1e-9, "mr": c[2] * 1e-9,
+            "mr_miss": c[3], "read": c[4] * 1e-9, "cq": c[5] * 1e-9,
+            "py_gets": self._prof_gets, "py_get": self._prof_get_s,
+            "py_sync": self._prof_sync_s,
+        }
 
     def epoch_begin(self):
         self.c_ddstore.epoch_begin()

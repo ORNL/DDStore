@@ -19,7 +19,7 @@ from distdataset import DistDataset
 from ddstore_dataloader import ThreadDataLoader
 
 from ddp_utils import setup_ddp, get_local_rank
-from vae_model import VAE, loss_function
+from vae_model import VAE, loss_function, mnist_transform
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example")
 parser.add_argument(
@@ -84,6 +84,20 @@ parser.add_argument(
     "so any --num-workers > 0 goes through threads, never a fork. "
     "Requires DDSTORE_METHOD 1 or 2 when > 0. Default: 0.",
 )
+parser.add_argument(
+    "--replicate",
+    type=int,
+    default=1,
+    metavar="R",
+    help="Repeat the MNIST training set this many times (torch ConcatDataset), for longer epochs with the same per-sample cost. Default: 1.",
+)
+parser.add_argument(
+    "--image-scale",
+    type=int,
+    default=1,
+    metavar="S",
+    help="Upscale MNIST images to (28*S)x(28*S) (bilinear), so each sample is S^2 times larger; the VAE hidden layer grows to 400*S. Default: 1 (plain 28x28).",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -127,12 +141,16 @@ if rank == 0:
     os.makedirs("results", exist_ok=True)
 comm.Barrier()
 
-model = VAE().to(device)
+side = 28 * args.image_scale
+model = VAE(input_dim=side * side, hidden=400 * args.image_scale).to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
+mnist_train = datasets.MNIST(
+    "data", train=True, download=True, transform=mnist_transform(args.image_scale)
+)
 trainset = DistDataset(
-    datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
+    torch.utils.data.ConcatDataset([mnist_train] * args.replicate),
     "train",
     comm,
     device=device if args.gpu_dest else None,
@@ -162,7 +180,7 @@ print(
 )
 
 testset = datasets.MNIST(
-    "data", train=False, download=True, transform=transforms.ToTensor()
+    "data", train=False, download=True, transform=mnist_transform(args.image_scale)
 )
 test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
@@ -256,7 +274,7 @@ def test(epoch):
             if i == 0:
                 n = min(data.size(0), 8)
                 comparison = torch.cat(
-                    [data[:n], recon_batch.view(args.batch_size, 1, 28, 28)[:n]]
+                    [data[:n], recon_batch.view(-1, 1, side, side)[:n]]
                 )
                 save_image(
                     comparison.cpu(),
@@ -278,7 +296,38 @@ if __name__ == "__main__":
                 sample = torch.randn(64, 20).to(device)
                 sample = model.module.decode(sample).cpu()
                 save_image(
-                    sample.view(64, 1, 28, 28), "results/sample_" + str(epoch) + ".png"
+                    sample.view(64, 1, side, side), "results/sample_" + str(epoch) + ".png"
                 )
+
+    # DDSTORE_PROFILE=1: where get() time goes, summed over all ranks and
+    # both variables (data + labels), all epochs.
+    if os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0"):
+        ds = trainset.ddstore
+        tot = {}
+        for var in ("traindata", "trainlabels"):
+            for k, v in ds.get_profile(var).items():
+                if not k.startswith("py_"):
+                    tot[k] = tot.get(k, 0) + v
+        prof = ds.get_profile("traindata")
+        for k in ("py_gets", "py_get", "py_sync"):
+            tot[k] = prof[k]
+        tot = {k: comm.allreduce(v) for k, v in tot.items()}
+        if rank == 0:
+            n = max(tot["calls"], 1)
+            us = lambda x: 1e6 * x / n
+            other = tot["py_get"] - tot["py_sync"] - tot["lock_wait"] - tot["mr"] - tot["read"] - tot["cq"]
+            print(
+                "[ddstore-profile] all ranks: gets={} py_gets={} mr_miss={} ({:.1%})".format(
+                    tot["calls"], tot["py_gets"], tot["mr_miss"], tot["mr_miss"] / n
+                )
+            )
+            print(
+                "[ddstore-profile] per get (us): total={:.1f} sync={:.1f} lock_wait={:.1f} "
+                "mr={:.1f} read={:.1f} cq={:.1f} other={:.1f}".format(
+                    us(tot["py_get"]), us(tot["py_sync"]), us(tot["lock_wait"]),
+                    us(tot["mr"]), us(tot["read"]), us(tot["cq"]), us(other)
+                ),
+                flush=True,
+            )
 
     dist.destroy_process_group()

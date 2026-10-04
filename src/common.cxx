@@ -674,6 +674,8 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
      * recv_mr_reg_len). Hits when the caller passes the same buffer again --
      * e.g. PyTorch's caching allocator returning the same block for a
      * same-shape torch.empty() -- so each get() needn't re-register.        */
+    const bool prof = ddstore_profile_enabled();
+    uint64_t t_mr = prof ? ddstore_now_ns() : 0;
     char  *cur_base = fabric_state->recv_data;
     size_t cur_len  = fabric_state->recv_data_len;
     bool in_cached_region =
@@ -683,6 +685,8 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
 
     if (!in_cached_region)
     {
+        if (prof)
+            fabric_state->prof_mr_miss++;
         /* Close the stale registration before creating a new one. */
         if (fabric_state->recv_mr)
             fi_close(&fabric_state->recv_mr->fid);
@@ -758,6 +762,13 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         memory_descriptor = fi_mr_desc(fabric_state->recv_mr);
     }
 
+    uint64_t t_read = 0;
+    if (prof)
+    {
+        t_read = ddstore_now_ns();
+        fabric_state->prof_mr_ns += t_read - t_mr;
+    }
+
     size_t rc;
     // fprintf(stderr, "fabric_state->remote_address: %llu\n", fabric_state->remote_address[src]);
     do
@@ -787,6 +798,13 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
     //     return 1;
     // }
 
+    uint64_t t_cq = 0;
+    if (prof)
+    {
+        t_cq = ddstore_now_ns();
+        fabric_state->prof_read_ns += t_cq - t_read;
+    }
+
     /* This loop blocks until the transfer completes — read_from_remote() does
      * not return until it does. For a GPU (recv_hmem_iface != FI_HMEM_SYSTEM)
      * destination, this is load-bearing: it's what keeps the caller's device
@@ -800,6 +818,8 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
         if (rc == 1)
         {
+            if (prof)
+                fabric_state->prof_cq_ns += ddstore_now_ns() - t_cq;
             /* NOTE: CQEntry.len is NOT a reliable success signal on this
              * provider/CQ format — it reads 0 even for host-to-host
              * transfers independently verified to deliver correct data, so

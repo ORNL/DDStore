@@ -25,6 +25,10 @@ Options:
                  DataLoader in the main process (no worker processes).
                  > 0 switches to ThreadDataLoader with that many worker
                  threads (requires --method=1 or 2). Default: 0.
+  --replicate=R  Repeat the MNIST training set R times (longer epochs,
+                 same per-sample cost). Default: 1.
+  --image-scale=S  Upscale images to (28*S)x(28*S): S^2 larger samples.
+                 Default: 1.
   -h, --help     Show this help message and exit.
 
 Examples:
@@ -53,20 +57,26 @@ METHOD=
 FABRIC=
 GPUDIRECT_ARGS=""
 NUM_WORKERS=
+REPLICATE=
+IMAGE_SCALE=
 for arg in "$@"; do
     case "$arg" in
         --method=*) METHOD="${arg#--method=}" ;;
         --fabric=*) FABRIC="${arg#--fabric=}" ;;
         --gpudirect) GPUDIRECT_ARGS="--gpu-dest --gpu-source" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
+        --replicate=*) REPLICATE="${arg#--replicate=}" ;;
+        --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
     esac
 done
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
 METHOD="${METHOD:-0}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+REPLICATE="${REPLICATE:-1}"
+IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
-EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS"
+EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --image-scale=$IMAGE_SCALE"
 
 echo "DDSTORE_METHOD=$METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
 

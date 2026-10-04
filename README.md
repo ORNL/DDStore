@@ -386,6 +386,27 @@ sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node
 
 Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node`, `--core-nnodes`, and `--num-workers` (for the extra/training step). Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
+### Larger VAE cases
+
+`vae-ddp.py` (and `vae_core_server.py` for the core/extra split; the extra side follows the published data) takes two size knobs, also exposed by both job scripts:
+
+- `--replicate R` — repeat the MNIST training set `R` times: longer epochs, same per-sample cost.
+- `--image-scale S` — upscale images to (28·S)×(28·S): each row is S² larger (3 KB at S=1, 12.5 KB at S=2); the VAE hidden layer grows to 400·S.
+
+Both default to 1, which reproduces the original example exactly.
+
+### Profiling `get()` (`DDSTORE_PROFILE=1`)
+
+With `DDSTORE_PROFILE=1`, `PyDDStore.get_profile(name)` returns where `get()` time goes for a variable: lock wait, receive-MR check/registration (and miss count), posting `fi_read`, waiting for completion (C++, methods 1/2), plus the GPU-destination `torch.cuda.synchronize()` and whole-call time (Python). `vae-ddp.py` prints an all-rank summary at the end when it is set. Off by default.
+
+[examples/scripts/bench_get.py](examples/scripts/bench_get.py) measures single-row `get()` latency/throughput vs row size, host vs GPU destination, and thread count, with the same breakdown.
+
+Measured on Frontier (`method=1`, `cxi`, 2 nodes × 8 ranks):
+
+- Inside the VAE, GPU-destination `get()` is dominated by the per-call device sync once a worker thread runs alongside training: ~4 µs per sample with no workers, but 130–190 µs with 1 worker and 290–430 µs with 2 (S=1/S=2), because the worker's sync waits for the training kernels. Lock wait (≤0.2 µs) and MR registration (<1 µs, even at 100% misses) are negligible; the RDMA itself is ~4–5 µs.
+- `bench_get.py`, one thread, µs per single-row `get()`: 3 KB — host 8.6, GPU 19.5 (12.2 reusing the buffer); 12.5 KB — host 9.9, GPU 20.5; 200 KB — host 53, GPU 37; 1 MB — host 206–276, GPU 134. GPUDirect wins from somewhere between 12.5 KB and 200 KB per row; below that its fixed per-call overhead (sync, allocation) dominates.
+- A second thread adds no per-rank throughput: the per-variable lock serializes the transfers (lock wait ≈ transfer time at large rows).
+
 ## Testing
 
 ### Unit tests (pytest)

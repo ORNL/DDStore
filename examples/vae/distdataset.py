@@ -118,6 +118,10 @@ class DistDataset(Dataset):
 
         self.ddstore.add(f"{self.label}data", self.data)
         self.ddstore.add(f"{self.label}labels", self.labels)
+        # Row width and image side, from the data (28*28 for plain MNIST,
+        # larger with vae-ddp.py --image-scale).
+        self.data_disp = int(self.data.shape[1])
+        self.side = int(round(self.data_disp**0.5))
 
         # get() allocates a fresh GPU tensor per call on the GPU path (no
         # buffer pool) -- simpler, at the cost of a fresh fi_mr_regattr per
@@ -143,16 +147,16 @@ class DistDataset(Dataset):
         # complexity for no benefit.
         label = np.zeros(1, dtype=np.int32)
         if device is not None:
-            val = torch.empty((1, 28 * 28), dtype=torch.float32, device=device)
+            val = torch.empty((1, self.data_disp), dtype=torch.float32, device=device)
         else:
-            val = np.zeros((1, 28 * 28), dtype=np.float32)
+            val = np.zeros((1, self.data_disp), dtype=np.float32)
             val = np.ascontiguousarray(val)
             assert val.data.contiguous
         self.ddstore.get(f"{self.label}data", val, idx)
         self.ddstore.get(f"{self.label}labels", label, idx)
         if device is None:
             val = torch.tensor(val)
-        val = torch.reshape(val, (1, 28, 28))
+        val = torch.reshape(val, (1, self.side, self.side))
         return (val, label[0])
 
     def __getitem__(self, idx):

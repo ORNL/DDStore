@@ -41,7 +41,7 @@ from mpi4py import MPI
 from ddp_utils import setup_ddp, get_local_rank
 from distdataset import DistDatasetReader
 from ddstore_dataloader import ThreadDataLoader
-from vae_model import VAE, loss_function
+from vae_model import VAE, loss_function, mnist_transform
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example - extra (reader) group")
 parser.add_argument(
@@ -135,16 +135,20 @@ else:
 
 print("DDP setup:", comm_size, rank, device, "gpu_dest:", args.gpu_dest)
 
-model = VAE().to(device)
-model = torch.nn.parallel.DistributedDataParallel(model)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
 trainset = DistDatasetReader(
     "train",
     args.handshake_dir,
     args.n_core,
     device=device if args.gpu_dest else None,
 )
+
+# Image size comes from the core side's published data (vae_core_server.py
+# --image-scale); the model and test set must match it.
+side = trainset.side
+image_scale = side // 28
+model = VAE(input_dim=side * side, hidden=400 * image_scale).to(device)
+model = torch.nn.parallel.DistributedDataParallel(model)
+optimizer = optim.Adam(model.parameters(), lr=1e-3)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
 if args.num_workers > 0:
@@ -167,7 +171,7 @@ print(
 )
 
 testset = datasets.MNIST(
-    "data", train=False, download=True, transform=transforms.ToTensor()
+    "data", train=False, download=True, transform=mnist_transform(image_scale)
 )
 test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
@@ -217,7 +221,7 @@ def test(epoch):
             if i == 0:
                 n = min(data.size(0), 8)
                 comparison = torch.cat(
-                    [data[:n], recon_batch.view(args.batch_size, 1, 28, 28)[:n]]
+                    [data[:n], recon_batch.view(-1, 1, side, side)[:n]]
                 )
                 save_image(
                     comparison.cpu(),
@@ -237,7 +241,7 @@ if __name__ == "__main__":
             sample = torch.randn(64, 20).to(device)
             sample = model.module.decode(sample).cpu()
             save_image(
-                sample.view(64, 1, 28, 28),
+                sample.view(64, 1, side, side),
                 "results/extra_sample_" + str(epoch) + ".png",
             )
 

@@ -303,7 +303,12 @@ cdef class PyDDStore:
         into `arr`, whose first dimension must equal len(indices): row i of
         `arr` receives row indices[i]. Same buffer rules as get(); for
         method 1/2 all reads of the batch are in flight together, under one
-        lock acquisition and (GPU destination) one device sync."""
+        lock acquisition and (GPU destination) one device sync.
+
+        Method 0 is COLLECTIVE (MDLoader-style Allgatherv of indices +
+        Alltoallv of rows): every rank of the store must call get_batch()
+        for the variable the same number of times, in the same order, from
+        one thread at a time (len(indices) may differ, including 0)."""
         cdef double t_get = time.perf_counter() if self._prof else 0.0
         cdef double t_sync
         cdef np.ndarray idx = np.ascontiguousarray(indices, dtype=np.int64)

@@ -156,7 +156,9 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into `arr`: row `i` of `arr` receives row `indices[i]`, so `arr.shape[0]` must equal `len(indices)` (else `ValueError`). Same buffer rules as `get()` (NumPy array or CUDA/HIP tensor). Every index is checked before anything is read; an out-of-range one raises `IndexError` and leaves the store usable.
 
-For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is still one `fi_read` per row. `method=0` loops the per-row `MPI_Get` path.
+For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is still one `fi_read` per row.
+
+For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/document/10596438/): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
 
 ```python
 idx = np.array([2048, 7, 4096, 7])
@@ -193,6 +195,40 @@ Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. 
 ### `free()`
 
 Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
+
+## Environment variables
+
+**Read by DDStore itself** (the C++ library, `pyddstore`, `cpu_nic_map`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DDSTORE_FABRIC` | `hsn` | libfabric provider for `method=1`/`2`: `hsn` (`tcp;ofi_rxm`) or `cxi` (native Slingshot; required for [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers)). See [libfabric RDMA](#libfabric-rdma-method1). |
+| `FABRIC_IFACE` | auto | Network interface (libfabric domain, e.g. `cxi0`, `hsn0`) for `method=1`/`2`. Set it to force one; otherwise picked from the rank's CPU affinity. |
+| `DDSTORE_NIC_MAP` | unset | Precomputed CPU→NIC map used for that automatic pick instead of a live hwloc query (`python3 -m cpu_nic_map --env`). The constructor's `nic_map=` argument takes priority. |
+| `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | `method=2` handshake directory when none is given (C++ API; `PyDDStore` requires `handshake_dir`, and the examples fill it from this variable). Must be on a shared filesystem. |
+| `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds a `method=2` extra member's `join()` polls for the core group's record file. |
+| `DDSTORE_PROFILE` | off | `1` turns on `get()`/`get_batch()` timing counters, read with `get_profile(name)`. See [Profiling](#profiling-get-ddstore_profile1). |
+
+The backend itself is not an environment variable in the library: pass `method=` to `PyDDStore` (`DDSTORE_METHOD` below is how the examples choose it).
+
+**Read by the examples** (`examples/vae/`, `examples/scripts/`, job scripts):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DDSTORE_METHOD` | `0` (`bench_get.py`: `1`) | Backend passed as `method=`: `0` MPI RMA, `1` libfabric, `2` file-based handshake. `--num-workers > 0` in `vae-ddp.py` needs `1` or `2`. |
+| `DDSTORE_BATCH_GET` | `1` | `DistDataset.__getitems__` reads a whole batch with one `get_batch()`; `0` falls back to one `get()` per sample. |
+| `DDSTORE_N_CORE` | `4` | `vae_extra_train.py`, `test_method2_*.py`: number of core ranks that published the data (`--n-core` overrides). |
+| `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` | `0` / `0` | `ThreadDataLoader`: pin worker thread *i* to CPUs `[offset + i·width, offset + (i+1)·width)` of the process's affinity; width `0` = no pinning. |
+| `DDSTORE_BACKEND` | auto | `torch.distributed` backend for the examples' DDP setup (`nccl`, `gloo`, `xccl`). |
+| `VAE_PROFILE` | off | `1`: `vae-ddp.py` prints per-epoch fetch vs compute time. |
+| `MASTER_PORT` | `2345` | DDP rendezvous port; the core/extra job script gives each step its own. |
+
+**System settings that matter on Frontier:**
+
+| Variable | Effect |
+|---|---|
+| `SLINGSHOT_VNIS` | Set by Slurm per step. With `--network=job_vni`, keep only the last (job-wide) entry before starting Python so separate `srun` steps can reach each other — see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi-frontier). |
+| `GPU_MAX_HW_QUEUES` | ROCm hardware queues per GPU per process (default 4); raise it if data-loading threads use their own streams — see [HIP streams](#hip-streams-and-hardware-queues-amdrocm). |
 
 ## Backends
 
@@ -252,14 +288,7 @@ store.get("x", out, start=global_idx)
 store.free()
 ```
 
-Environment variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | Shared directory for handshake record files |
-| `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds to poll for core records / a join before raising a timeout |
-| `DDSTORE_NIC_MAP` | unset | CPU→NIC map for `FABRIC_IFACE` auto-selection — see [libfabric RDMA](#libfabric-rdma-method1) above |
-| `DDSTORE_FABRIC` | `hsn` | `hsn` (`tcp;ofi_rxm`) or `cxi` (native CXI) — see [libfabric RDMA](#libfabric-rdma-method1) above |
+Environment variables: `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S`, `DDSTORE_FABRIC` and `DDSTORE_NIC_MAP` — see [Environment variables](#environment-variables).
 
 See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_extra.py](test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) for a full DDP training example using this split.
 

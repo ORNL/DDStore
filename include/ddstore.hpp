@@ -1,5 +1,7 @@
 #include <iostream>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include <mpi.h>
 #include <string>
@@ -527,10 +529,15 @@ public:
 
     /* Batched get: row i of `buffer` (n contiguous rows) receives global
      * row idx[i]; rows may come from any ranks, in any order, with repeats.
-     * Every index is validated before anything is read. Methods 1/2 take the
-     * variable's lock once and post all n fi_read()s before waiting for any
-     * (read_batch_from_remote()); method 0 loops the per-row MPI_Get path.
-     * hmem_iface as in get().                                               */
+     * Every index is validated before anything is read. hmem_iface as in get().
+     *
+     * Methods 1/2 (one-sided): take the variable's lock once and post all n
+     * fi_read()s before waiting for any (read_batch_from_remote()).
+     *
+     * Method 0 (collective, MDLoader-style): COLLECTIVE over this store's
+     * communicator — every rank must call get_batch() for the same variable
+     * the same number of times, in the same order (n may differ per rank,
+     * including 0). See get_batch_alltoall().                              */
     template <typename T>
     void get_batch(std::string name, const long *idx, long n, T *buffer, int hmem_iface = 0)
     {
@@ -538,6 +545,15 @@ public:
 
         if (varinfo.itemsize != sizeof(T))
             throw std::invalid_argument("Invalid data type");
+
+        if (this->method == 0)
+        {
+            if (hmem_iface != 0)
+                throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
+            this->get_batch_alltoall(varinfo, idx, n, (char *)buffer);
+            return;
+        }
+
         if (n <= 0)
             return;
 
@@ -550,22 +566,6 @@ public:
             long first = t > 0 ? varinfo.lenlist[t - 1] : 0;
             target[i] = t;
             offset[i] = (uint64_t)(idx[i] - first) * row_bytes;
-        }
-
-        if (this->method == 0)
-        {
-            if (hmem_iface != 0)
-                throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
-            MPI_Win win = varinfo.win;
-            for (long i = 0; i < n; i++)
-            {
-                MPI_Win_lock(MPI_LOCK_SHARED, target[i], 0, win);
-                MPI_Get((char *)buffer + i * row_bytes, (int)row_bytes, MPI_BYTE,
-                        target[i], (MPI_Aint)(offset[i] / row_bytes),
-                        (int)row_bytes, MPI_BYTE, win);
-                MPI_Win_unlock(target[i], win);
-            }
-            return;
         }
 
         /* Methods 1 and 2: one lock acquisition for the whole batch. */
@@ -593,7 +593,92 @@ public:
     }
 
 private:
+    /* Method 0 batched get, after MDLoader's collective module (Bae et al.,
+     * IPDPSW 2024): every rank all-gathers the batch indices of all ranks,
+     * packs the rows it owns for each requester, and one MPI_Alltoallv
+     * delivers them; each rank then puts its rows in request order. Uses a
+     * private duplicate of the store's communicator (coll_comm), so it never
+     * matches the caller's own collectives or the windows' fences. The
+     * indices are validated after the gather, on the global list, so every
+     * rank throws the same error together instead of one rank leaving the
+     * others blocked in the exchange.                                       */
+    void get_batch_alltoall(const VarInfo_t &varinfo, const long *idx, long n, char *out)
+    {
+        std::lock_guard<std::mutex> guard(this->coll_mutex);
+        if (this->coll_comm == MPI_COMM_NULL)
+            MPI_Comm_dup(this->comm, &this->coll_comm);
+
+        const int P = this->comm_size;
+        const int me = this->rank;
+        const size_t row = (size_t)varinfo.disp * varinfo.itemsize;
+
+        /* 1. Every rank learns every rank's requests. */
+        int nloc = (int)n;
+        std::vector<int> nreq(P), rbase(P + 1, 0);
+        MPI_Allgather(&nloc, 1, MPI_INT, nreq.data(), 1, MPI_INT, this->coll_comm);
+        for (int p = 0; p < P; p++)
+            rbase[p + 1] = rbase[p] + nreq[p];
+        std::vector<long> all(rbase[P] > 0 ? rbase[P] : 1);
+        MPI_Allgatherv(idx, nloc, MPI_LONG, all.data(), nreq.data(), rbase.data(),
+                       MPI_LONG, this->coll_comm);
+
+        const long total_rows = varinfo.lenlist.empty() ? 0 : varinfo.lenlist.back();
+        for (int j = 0; j < rbase[P]; j++)
+            if (all[j] < 0 || all[j] >= total_rows)
+                throw std::out_of_range(
+                    "Global index " + std::to_string(all[j]) +
+                    " is out of range [0, " + std::to_string(total_rows) + ")");
+
+        /* 2. Rows this rank owns, packed per requester in request order. */
+        const long my_first = me > 0 ? varinfo.lenlist[me - 1] : 0;
+        const long my_end = varinfo.lenlist[me];
+        std::vector<int> scount(P, 0), sdispl(P, 0);
+        for (int p = 0; p < P; p++)
+            for (int j = rbase[p]; j < rbase[p + 1]; j++)
+                if (all[j] >= my_first && all[j] < my_end)
+                    scount[p]++;
+        for (int p = 1; p < P; p++)
+            sdispl[p] = sdispl[p - 1] + scount[p - 1];
+        const int nsend = sdispl[P - 1] + scount[P - 1];
+        std::vector<char> sendbuf((size_t)(nsend > 0 ? nsend : 1) * row);
+        {
+            size_t k = 0;
+            for (int p = 0; p < P; p++)
+                for (int j = rbase[p]; j < rbase[p + 1]; j++)
+                    if (all[j] >= my_first && all[j] < my_end)
+                        memcpy(sendbuf.data() + (k++) * row,
+                               (char *)varinfo.base + (size_t)(all[j] - my_first) * row, row);
+        }
+
+        /* 3. Where each of this rank's rows comes from. */
+        std::vector<int> owner(n > 0 ? n : 1), rcount(P, 0), rdispl(P, 0);
+        for (long i = 0; i < n; i++)
+        {
+            owner[i] = sortedsearch(varinfo.lenlist, idx[i]);
+            rcount[owner[i]]++;
+        }
+        for (int p = 1; p < P; p++)
+            rdispl[p] = rdispl[p - 1] + rcount[p - 1];
+        std::vector<char> recvbuf((size_t)(n > 0 ? n : 1) * row);
+
+        /* 4. One exchange, counted in rows. */
+        MPI_Datatype rowtype;
+        MPI_Type_contiguous((int)row, MPI_BYTE, &rowtype);
+        MPI_Type_commit(&rowtype);
+        MPI_Alltoallv(sendbuf.data(), scount.data(), sdispl.data(), rowtype,
+                      recvbuf.data(), rcount.data(), rdispl.data(), rowtype, this->coll_comm);
+        MPI_Type_free(&rowtype);
+
+        /* 5. Received rows are grouped by owner, each group in request
+         * order: put them back in this rank's request order. */
+        std::vector<int> next(rdispl);
+        for (long i = 0; i < n; i++)
+            memcpy(out + (size_t)i * row, recvbuf.data() + (size_t)(next[owner[i]]++) * row, row);
+    }
+
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)
+    MPI_Comm   coll_comm = MPI_COMM_NULL; /* method 0 get_batch; see above  */
+    std::mutex coll_mutex;                /* one get_batch_alltoall at a time */
 
     MPI_Comm    comm;
     int         comm_size;

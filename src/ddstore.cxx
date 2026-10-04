@@ -227,4 +227,6 @@ void DDStore::free()
         var.owns_base = false;
         var.active = false;
     }
+    if (this->coll_comm != MPI_COMM_NULL && !finalized)
+        MPI_Comm_free(&this->coll_comm);
 }

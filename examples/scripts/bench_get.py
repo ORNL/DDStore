@@ -122,8 +122,10 @@ for nf in row_floats:
             d = {k: p1[k] - p0[k] for k in p1}
             vals = comm.gather((dt, d), root=0)
             if rank == 0:
-                n = sum(v[1]["rows"] for v in vals) or 1
                 ngets = args.nget * size
+                # rows comes from the C++ counters (methods 1/2 only); method 0
+                # has none, so fall back to the rows this run requested.
+                n = sum(v[1]["rows"] for v in vals) or ngets
                 us_get = 1e6 * sum(v[0] for v in vals) / ngets
                 mbps = nf * 4 * args.nget / (sum(v[0] for v in vals) / size) / 1e6
                 s = lambda k: 1e6 * sum(v[1][k] for v in vals) / n

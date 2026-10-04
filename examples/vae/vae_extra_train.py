@@ -36,10 +36,6 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import torch.distributed as dist
 
-import mpi4py
-
-mpi4py.rc.thread_level = "serialized"
-mpi4py.rc.threads = False
 from mpi4py import MPI
 
 from ddp_utils import setup_ddp, get_local_rank

@@ -36,13 +36,21 @@ CC=mpicc CXX=mpicxx pip install -e .
 CC=mpicc CXX=mpicxx pip install git+https://github.com/ORNL/DDStore.git
 ```
 
+To build against the packages already in the current environment (e.g. an `mpi4py` built against Cray MPICH) instead of letting pip fetch fresh build dependencies into an isolated build environment, disable build isolation:
+
+```bash
+CC=cc CXX=CC pip install --no-build-isolation --no-deps -e .
+```
+
+If that fails with `ModuleNotFoundError: No module named 'distutils.msvccompiler'` (newer setuptools combined with an older system NumPy, e.g. `cray-python/3.11.7` on Frontier), point setuptools at the standard-library `distutils` for the build:
+
+```bash
+SETUPTOOLS_USE_DISTUTILS=stdlib CC=cc CXX=CC pip install --no-build-isolation --no-deps -e .
+```
+
 ## Quick Start
 
 ```python
-import mpi4py
-mpi4py.rc.thread_level = "serialized"
-mpi4py.rc.threads = False
-
 import numpy as np
 from mpi4py import MPI
 import pyddstore as dds
@@ -264,6 +272,8 @@ See [test/test_gpu_rdma.py](test/test_gpu_rdma.py) for runnable examples coverin
 
 GPU kernels execute asynchronously: a compute kernel that just wrote to (or is about to read) a buffer may not have fully retired by the time that buffer is handed to RDMA. On at least one ROCm+CXI build, this produced a real, confirmed bug: the RDMA transfer reported success, but the destination buffer could still show stale, pre-transfer content, because the GPU's cache hadn't been reconciled with the external NIC write. Under sustained, real-workload conditions (not just short unit tests) this showed up as hard GPU faults, not just wrong data. To guard against this, `PyDDStore` always synchronizes the GPU device (`torch.cuda.synchronize()`) before registering a buffer for RDMA in `add()`/`get()`. This is a blocking, whole-device sync, which can serialize GPU compute against RDMA transfers when called at high frequency (e.g. once per sample in a data loader) — see the performance note below.
 
+The sync in `get()` was re-checked by removing it: every `--gpu-dest` run of `vae-ddp.py` (`method=1`, `cxi`, 2 Frontier nodes, any `--num-workers` including 0) aborted during the first epoch with `HSA_STATUS_ERROR_EXCEPTION ... code: 0x1016` (GPU memory fault) on every rank, while host-path and `--gpu-source`-only runs were unaffected. With the sync restored the same runs complete normally. Keep it.
+
 ## Known Limitations
 
 ### Multiple `srun` steps in one job (`method=2`, `cxi`)
@@ -276,7 +286,17 @@ On Frontier, `method=2`'s separate core/extra `srun` steps within one job have s
 
 ### Thread-safety of concurrent `get()` calls
 
-`DDStore::get()` releases the GIL for its blocking RDMA transfer (`nogil` in `src/pyddstore.pyx`) but has no internal locking of its own (confirmed by direct experiment: disabling the lock in `DistDataset`/`DistDatasetReader`'s `get()` crashed with `double free or corruption` under concurrent thread access). `ThreadDataLoader` (`examples/vae/ddstore_dataloader.py`) relies on that lock to serialize concurrent `get()` calls from its worker threads — don't remove it.
+`get()` is safe to call from multiple threads. For `method=1`/`2`, `DDStore::get()` serializes calls on the same variable with a per-variable mutex (`fabric_state::recv_lock` in `include/common.h`, taken via `fabric_state_lock_guard`), held for the whole RDMA read. It is required: each variable's libfabric domain is opened as `FI_THREAD_DOMAIN` (the application must serialize access), and `get()` writes per-variable fields (`recv_data`, the cached receive MR) that concurrent calls would otherwise race on — without it, concurrent `get()` calls crashed with `double free or corruption`. Different variables have separate domains/endpoints/CQs and don't contend. `method=0` doesn't use the lock.
+
+`get()` releases the GIL for the transfer on both the host and the GPU-destination path. The GPU-destination path first does a whole-device `torch.cuda.synchronize()` per call (see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers)), and that sync still dominates: releasing the GIL there made no measurable difference to `--gpu-dest` epoch time. `add()` keeps the GIL (one-time collective setup).
+
+### MPI thread level
+
+DDStore and the examples use mpi4py's default initialization (`MPI_Init_thread` requesting `MPI_THREAD_MULTIPLE`); no `mpi4py.rc` settings are needed. Only the main thread calls MPI — `add()`/`init()`/`join()` at setup, plus `epoch_begin()`/`epoch_end()` and `get()` for `method=0` — while `ThreadDataLoader` worker threads only call `get()` with `method=1`/`2`, which makes no MPI calls. So `MPI_THREAD_FUNNELED` is the minimum strictly required; the earlier `mpi4py.rc.threads = False` (which yields `MPI_THREAD_SINGLE`, technically wrong once worker threads exist) was removed. On Frontier (Cray MPICH, 2 nodes × 8 ranks), `vae-ddp.py` and the pytest suites gave identical results and timing with `SINGLE`, `FUNNELED` and `MULTIPLE`. If you call MPI from your own worker threads with `method=0`, keep the default `MULTIPLE`.
+
+### HIP streams and hardware queues (AMD/ROCm)
+
+HIP maps streams onto a small pool of hardware queues per GPU per process — `GPU_MAX_HW_QUEUES`, 4 by default — and streams beyond that share a queue round-robin. Work in a shared queue runs in order, so a sync on a "separate" stream can still wait behind another stream's kernels. Measured on Frontier (ROCm 7.2): with the default stream kept busy, 12 of 16 new streams were independent of it by default (every 4th collided, including the first one created), 14 of 16 with `GPU_MAX_HW_QUEUES=8`, 15 of 16 with `16`. If you give data-loading threads their own streams, raise `GPU_MAX_HW_QUEUES` and remember the training stream and RCCL already occupy queues.
 
 ### GPU-to-GPU RDMA performance on AMD/ROCm
 
@@ -322,7 +342,19 @@ mpirun -n 4 python examples/vae/vae-ddp.py
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --gpu-dest --gpu-source
 ```
 
-`--num-workers` (default 0) controls the training `DataLoader`'s parallelism. `0` uses PyTorch's normal `DataLoader`, single-threaded (no forked worker processes at all, so no MPI-after-`MPI_Init`-fork hazard). Any `--num-workers > 0` switches to [examples/vae/ddstore_dataloader.py](examples/vae/ddstore_dataloader.py)'s `ThreadDataLoader` instead — real threads, no fork, so it's safe together with `--gpu-dest`/`--gpu-source` too. The applied loader and worker count are printed at startup: `train_loader: DataLoader, num_workers=N` or `train_loader: ThreadDataLoader, num_workers=N`. `ThreadDataLoader` requires `DDSTORE_METHOD` 1 or 2 (libfabric) in `vae-ddp.py`. Concurrent `get()` calls from multiple threads are serialized internally by a lock in `DistDataset`/`DistDatasetReader` (the underlying RDMA transfer has no locking of its own; confirmed necessary by direct experiment — see Known Limitations), so threads gain overlap on everything except the RDMA call itself. `vae_extra_train.py` has the same `--num-workers` flag and behavior:
+`--num-workers` (default 0) controls the training `DataLoader`'s parallelism. `0` uses PyTorch's normal `DataLoader`, single-threaded (no forked worker processes at all, so no MPI-after-`MPI_Init`-fork hazard). Any `--num-workers > 0` switches to [examples/vae/ddstore_dataloader.py](examples/vae/ddstore_dataloader.py)'s `ThreadDataLoader` instead — real threads, no fork, so it's safe together with `--gpu-dest`/`--gpu-source` too. The applied loader and worker count are printed at startup: `train_loader: DataLoader, num_workers=N` or `train_loader: ThreadDataLoader, num_workers=N`. `ThreadDataLoader` requires `DDSTORE_METHOD` 1 or 2 (libfabric) in `vae-ddp.py`. Concurrent `get()` calls from multiple threads are serialized inside `DDStore::get()` by a per-variable lock (see [Thread-safety](#thread-safety-of-concurrent-get-calls)), so threads gain overlap on everything except the RDMA call itself. `vae_extra_train.py` has the same `--num-workers` flag and behavior.
+
+Measured with `vae-ddp.py`, `method=1`, `cxi`, 2 Frontier nodes × 8 ranks, `VAE_PROFILE=1`, average per-epoch time over epochs 2–8 (epochs are short, ~0.2 s, so treat as trends):
+
+| `--num-workers` | host path: fetch / total (s) | `--gpu-dest --gpu-source`: fetch / total (s) |
+|---|---|---|
+| 0 (`DataLoader`) | 0.11 / 0.22 | 0.15 / 0.25 |
+| 1 | 0.02 / 0.14–0.16 | 0.09 / 0.26 |
+| 2 | 0.03 / 0.16 | 0.11 / 0.31 |
+| 4 | 0.04 / 0.17 | 0.12 / 0.30 |
+| 8 | 0.08 / 0.21 | 0.15 / 0.35–0.38 |
+
+On the host path one worker thread (background prefetch) cuts epoch time ~30%; more workers make it steadily worse as they contend for the per-variable lock and the GIL. On the GPU path threading doesn't help, because of the per-call whole-device sync. All runs finished with the same final loss. Recommended: `--num-workers=1` on the host path, `0` on the GPU path.
 
 ```bash
 # ThreadDataLoader, 4 worker threads, host path (no GPU buffers)

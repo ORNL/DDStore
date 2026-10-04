@@ -37,10 +37,6 @@ import time
 import torch
 from torchvision import datasets, transforms
 
-import mpi4py
-
-mpi4py.rc.thread_level = "serialized"
-mpi4py.rc.threads = False
 from mpi4py import MPI
 
 from distdataset import DistDataset

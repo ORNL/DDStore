@@ -118,6 +118,9 @@ def test_get_into_gpu_tensor_cxi_compute_kernel_read(comm, monkeypatch):
     print(
         f"[rank {rank}] completed {n_iters} iterations without a HIP error", flush=True
     )
+    # Wait for every rank's reads before tearing down: otherwise a fast rank
+    # can free its endpoint while a peer is still reading (PTLTE_NOT_FOUND).
+    comm.Barrier()
     store.free()
 
 

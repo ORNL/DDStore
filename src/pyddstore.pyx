@@ -75,6 +75,21 @@ def _check_gpu_fabric_preconditions(int method, str what):
             "DDSTORE_FABRIC=cxi or pass a host (CPU) numpy array instead."
             % (what, provider))
 
+def _check_dtype(arr, bint is_gpu):
+    """Raise NotImplementedError unless arr's dtype is one DDStore supports.
+    add()/get() dispatch on item size alone (1/4/8 bytes), so this is what
+    keeps e.g. float16 or complex64 from slipping through on a size match.
+    """
+    if is_gpu:
+        import torch
+        ok = arr.dtype in (torch.int32, torch.int64, torch.uint8,
+                           torch.float32, torch.float64, torch.bool)
+    else:
+        ok = arr.dtype in (np.int32, np.int64, np.uint8,
+                           np.float32, np.float64, np.bool_)
+    if not ok:
+        raise NotImplementedError("unsupported dtype: %s" % arr.dtype)
+
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
         string name
@@ -175,10 +190,13 @@ cdef class PyDDStore:
 
     def add(self, str name, arr):
         cdef size_t ptr
+        cdef int itemsize
         cdef int iface
-        cdef long nrows
+        cdef long nrows = arr.shape[0]
         cdef int disp
-        if _is_cuda_tensor(arr):
+        cdef bint is_gpu = _is_cuda_tensor(arr)
+        _check_dtype(arr, is_gpu)
+        if is_gpu:
             _check_gpu_fabric_preconditions(self.method, "GPU source buffer")
             assert arr.is_contiguous()
             if name in self._gpu_owned_buffers:
@@ -194,107 +212,70 @@ cdef class PyDDStore:
             # silently masked by stale GPU cache content from a preceding,
             # not-yet-retired write to the same memory.
             torch.cuda.synchronize(device=arr.device)
-            iface = _hmem_iface_for(arr)
             ptr = arr.data_ptr()
-            nrows = arr.shape[0]
-            disp = arr.numel() // arr.shape[0]
-            if arr.dtype == torch.int32:
-                self.c_ddstore.add(s2b(name), <int *> ptr, nrows, disp, iface)
-            elif arr.dtype == torch.int64:
-                self.c_ddstore.add(s2b(name), <long *> ptr, nrows, disp, iface)
-            elif arr.dtype == torch.uint8:
-                self.c_ddstore.add(s2b(name), <char *> ptr, nrows, disp, iface)
-            elif arr.dtype == torch.float32:
-                self.c_ddstore.add(s2b(name), <float *> ptr, nrows, disp, iface)
-            elif arr.dtype == torch.float64:
-                self.c_ddstore.add(s2b(name), <double *> ptr, nrows, disp, iface)
-            elif arr.dtype == torch.bool:
-                self.c_ddstore.add(s2b(name), <char *> ptr, nrows, disp, iface)
-            else:
-                raise NotImplementedError
+            itemsize = arr.element_size()
+            disp = arr.numel() // nrows
+            iface = _hmem_iface_for(arr)
+        else:
+            assert arr.flags.c_contiguous
+            ptr = arr.ctypes.data
+            itemsize = arr.itemsize
+            disp = arr.size // nrows
+            iface = 0
+
+        # DDStore::add<T>() only uses T through sizeof(T), so dispatching on
+        # item size is enough.
+        cdef string cname = s2b(name)
+        if itemsize == 1:
+            self.c_ddstore.add(cname, <char *> ptr, nrows, disp, iface)
+        elif itemsize == 4:
+            self.c_ddstore.add(cname, <int *> ptr, nrows, disp, iface)
+        else:
+            self.c_ddstore.add(cname, <long *> ptr, nrows, disp, iface)
+
+        if is_gpu:
             # Keepalive: DDStore now holds a raw pointer into arr's storage
             # with no copy and no C++-level refcounting -- see ddstore.hpp
             # add()'s lifetime-contract doc comment. Must outlive this
             # variable's registration; cleared in free()/__dealloc__.
             self._gpu_owned_buffers[name] = arr
-            return
-
-        cdef np.ndarray np_arr = arr
-        assert np_arr.flags.c_contiguous
-        nrows = np_arr.shape[0]
-        disp = np_arr.size // np_arr.shape[0]
-        if np_arr.dtype == np.int32:
-            self.c_ddstore.add(s2b(name), <int *> np_arr.data, nrows, disp, 0)
-        elif np_arr.dtype == np.int64:
-            self.c_ddstore.add(s2b(name), <long *> np_arr.data, nrows, disp, 0)
-        elif np_arr.dtype == np.uint8:
-            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp, 0)
-        elif np_arr.dtype == np.float32:
-            self.c_ddstore.add(s2b(name), <float *> np_arr.data, nrows, disp, 0)
-        elif np_arr.dtype == np.float64:
-            self.c_ddstore.add(s2b(name), <double *> np_arr.data, nrows, disp, 0)
-        elif np_arr.dtype == np.bool_:
-            self.c_ddstore.add(s2b(name), <char *> np_arr.data, nrows, disp, 0)
-        else:
-            raise NotImplementedError
 
     def get(self, str name, arr, long start=0):
         cdef long count = arr.shape[0]
         cdef size_t ptr
+        cdef int itemsize
         cdef int iface
-        if _is_cuda_tensor(arr):
+        cdef bint is_gpu = _is_cuda_tensor(arr)
+        _check_dtype(arr, is_gpu)
+        if is_gpu:
             _check_gpu_fabric_preconditions(self.method, "GPU destination buffer")
             assert arr.is_contiguous()
             import torch
             # See the matching comment in add() for what this guards against.
             torch.cuda.synchronize(device=arr.device)
-            iface = _hmem_iface_for(arr)
             ptr = arr.data_ptr()
-            if arr.dtype == torch.int32:
-                self.c_ddstore.get(s2b(name), start, count, <int *> ptr, iface)
-            elif arr.dtype == torch.int64:
-                self.c_ddstore.get(s2b(name), start, count, <long *> ptr, iface)
-            elif arr.dtype == torch.uint8:
-                self.c_ddstore.get(s2b(name), start, count, <char *> ptr, iface)
-            elif arr.dtype == torch.float32:
-                self.c_ddstore.get(s2b(name), start, count, <float *> ptr, iface)
-            elif arr.dtype == torch.float64:
-                self.c_ddstore.get(s2b(name), start, count, <double *> ptr, iface)
-            elif arr.dtype == torch.bool:
-                self.c_ddstore.get(s2b(name), start, count, <char *> ptr, iface)
-            else:
-                raise NotImplementedError
-            return
-
-        cdef np.ndarray np_arr = arr
-        assert np_arr.flags.c_contiguous
-        assert np_arr.shape[0] >= count
-        # The host read runs without the GIL, so other Python threads (e.g. a
-        # training loop while a background thread prefetches) keep running.
-        # Method 1/2 reads make no MPI calls.
-        cdef string cname = s2b(name)
-        cdef char* data = np_arr.data
-        if np_arr.dtype == np.int32:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <int *> data, 0)
-        elif np_arr.dtype == np.int64:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <long *> data, 0)
-        elif np_arr.dtype == np.uint8:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <char *> data, 0)
-        elif np_arr.dtype == np.float32:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <float *> data, 0)
-        elif np_arr.dtype == np.float64:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <double *> data, 0)
-        elif np_arr.dtype == np.bool_:
-            with nogil:
-                self.c_ddstore.get(cname, start, count, <char *> data, 0)
+            itemsize = arr.element_size()
+            iface = _hmem_iface_for(arr)
         else:
-            raise NotImplementedError
-    
+            assert arr.flags.c_contiguous
+            ptr = arr.ctypes.data
+            itemsize = arr.itemsize
+            iface = 0
+
+        # DDStore::get<T>() only uses T for its sizeof(T) == itemsize check
+        # and the pointer cast -- the transfer itself is a byte copy -- so
+        # dispatching on item size is enough. The read runs without the GIL,
+        # so other Python threads (e.g. a training loop while a background
+        # thread prefetches) keep running. Method 1/2 reads make no MPI calls.
+        cdef string cname = s2b(name)
+        with nogil:
+            if itemsize == 1:
+                self.c_ddstore.get(cname, start, count, <char *> ptr, iface)
+            elif itemsize == 4:
+                self.c_ddstore.get(cname, start, count, <int *> ptr, iface)
+            else:
+                self.c_ddstore.get(cname, start, count, <long *> ptr, iface)
+
     def epoch_begin(self):
         self.c_ddstore.epoch_begin()
 

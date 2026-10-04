@@ -116,6 +116,7 @@ public:
         else if (this->method == 1)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            pthread_mutex_init(&fabric_state->recv_lock, NULL);
             fabric_state->send_data       = (char *)base;
             fabric_state->send_data_len   = nrows * disp * sizeof(T);
             fabric_state->send_hmem_iface = hmem_iface;
@@ -135,6 +136,7 @@ public:
         else if (this->method == 2)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            pthread_mutex_init(&fabric_state->recv_lock, NULL);
             fabric_state->send_data       = (char *)base;
             fabric_state->send_data_len   = nrows * disp * sizeof(T);
             fabric_state->send_hmem_iface = hmem_iface;
@@ -288,6 +290,7 @@ public:
         else if (this->method == 1)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            pthread_mutex_init(&fabric_state->recv_lock, NULL);
             fabric_state->send_data = (char *)base;
             fabric_state->send_data_len = nrows * disp * itemsize;
             fabric_state->world_size = this->comm_size;
@@ -302,6 +305,7 @@ public:
         else if (this->method == 2)
         {
             fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            pthread_mutex_init(&fabric_state->recv_lock, NULL);
             fabric_state->send_data     = (char *)base;
             fabric_state->send_data_len = nrows * disp * itemsize;
             fabric_state->world_size    = this->n_core;
@@ -463,7 +467,13 @@ public:
         }
         else if (this->method == 1 || this->method == 2)
         {
-            /* Methods 1 and 2 both use libfabric fi_read — same path. */
+            /* Methods 1 and 2 both use libfabric fi_read — same path.
+             * Locked for the whole branch: the recv_data/recv_data_len/
+             * recv_hmem_iface writes below are themselves racy across
+             * concurrent get() calls on this variable, not just the
+             * read_from_remote() call that follows them -- see recv_lock's
+             * comment in common.h. */
+            fabric_state_lock_guard lock(varinfo.fabric_state);
             if (hmem_iface != 0 && !is_hmem_capable(varinfo.fabric_state))
                 throw std::runtime_error(
                     "GPU destination buffer requires DDSTORE_FABRIC=cxi "
@@ -479,68 +489,6 @@ public:
         }
     }
 
-    /* Pre-register a GPU buffer as the recv MR for variable `name`.
-     *
-     * Call once with the full pool tensor before the first get() call.
-     * read_from_remote() reuses this registration for any recv_data pointer
-     * that falls within [buffer, buffer + nrows*disp*sizeof(T)), so all
-     * pool slices share one fi_mr_regattr call instead of one per slice.
-     * No-op for hmem_iface==0 (host path — MR registration is cheap there). */
-    template <typename T>
-    void prefetch_recv_mr(std::string name, T *buffer, long nrows, int disp,
-                          int hmem_iface)
-    {
-        if (hmem_iface == 0)
-            return; /* host path: no pre-registration needed */
-
-        if (this->method != 1 && this->method != 2)
-            return; /* MPI_Win path has no fabric MR */
-
-        const VarInfo_t& varinfo = this->varlist.at(name);
-        struct fabric_state *fs = varinfo.fabric_state;
-        if (!fs)
-            return;
-
-        /* Close any existing recv MR before registering the new region. */
-        if (fs->recv_mr)
-        {
-            fi_close(&fs->recv_mr->fid);
-            fs->recv_mr = NULL;
-        }
-
-        size_t reg_len = (size_t)nrows * disp * sizeof(T);
-        struct iovec iov = {(void *)buffer, reg_len};
-        struct fi_mr_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.mr_iov    = &iov;
-        attr.iov_count = 1;
-        attr.access    = FI_READ;
-        attr.iface     = (enum fi_hmem_iface)hmem_iface;
-        attr.device.reserved = 0;
-        int mr_rc = fi_mr_regattr(fs->domain, &attr, 0, &fs->recv_mr);
-        if (mr_rc != FI_SUCCESS)
-            throw std::runtime_error(
-                std::string("prefetch_recv_mr fi_mr_regattr failed: ") +
-                fi_strerror(mr_rc));
-
-        if (is_mr_endpoint(fs))
-        {
-            int rc = fi_mr_bind(fs->recv_mr, &fs->signal->fid, 0);
-            if (rc != FI_SUCCESS)
-                throw std::runtime_error(
-                    std::string("prefetch_recv_mr fi_mr_bind failed: ") +
-                    fi_strerror(rc));
-            rc = fi_mr_enable(fs->recv_mr);
-            if (rc != FI_SUCCESS)
-                throw std::runtime_error(
-                    std::string("prefetch_recv_mr fi_mr_enable failed: ") +
-                    fi_strerror(rc));
-        }
-
-        /* Record the registered region so read_from_remote()'s range check hits. */
-        fs->recv_mr_base    = (char *)buffer;
-        fs->recv_mr_reg_len = reg_len;
-    }
 
 private:
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)

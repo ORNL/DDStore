@@ -76,29 +76,16 @@ parser.add_argument(
     "both.",
 )
 parser.add_argument(
-    "--loader",
-    choices=["default", "threaded"],
-    default="default",
-    help="DataLoader implementation for the training set. 'threaded' uses "
-    "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
-    "thread-pool-based loader that allows --num-workers > 1 (the default "
-    "loader forks worker processes, which hangs with DDStore above 1). "
-    "With --gpu-dest/--gpu-source, --num-workers must stay <= 1 even with "
-    "--loader=threaded -- confirmed unsafe above that (silent data "
-    "corruption, not a crash; see README Known Limitations). Requires "
-    "DDSTORE_METHOD 1 or 2. Default: default.",
-)
-parser.add_argument(
     "--num-workers",
     type=int,
-    default=1,
+    default=0,
     metavar="N",
-    help="Number of worker threads (--loader=threaded) or worker processes "
-    "(--loader=default). With --loader=default, must stay <= 1 -- "
-    "forking worker processes after MPI_Init hangs with DDStore; use "
-    "--loader=threaded for real parallelism instead. Also forced to 0 "
-    "for --loader=default when --gpu-dest/--gpu-source is set "
-    "(fork-safety guard). Default: 1.",
+    help="Number of DataLoader workers. 0 uses the default (forked-process) "
+    "DataLoader, single-threaded. > 0 switches to ThreadDataLoader "
+    "(examples/vae/ddstore_dataloader.py), with that many worker threads "
+    "-- forked processes can't safely own GPU state or MPI's live state, "
+    "so any --num-workers > 0 goes through threads, never a fork. "
+    "Requires DDSTORE_METHOD 1 or 2 when > 0. Default: 0.",
 )
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -147,69 +134,20 @@ model = VAE().to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-# kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
-# kwargs = {'pin_memory': True} if args.cuda else {}
-# --gpu-dest/--gpu-source return CUDA/HIP tensors from __getitem__/add();
-# DataLoader worker processes can't safely own GPU state across a fork, so
-# the default (forked-process) loader is forced to num_workers=0 whenever
-# either is set -- use --loader=threaded for num_workers > 0 with GPU
-# buffers instead. Separately, forking *at all* after MPI_Init is a known
-# MPI hazard that hangs with DDStore even without GPU buffers -- fail fast
-# instead of hanging silently.
-if args.loader == "default" and args.num_workers > 1:
-    raise RuntimeError(
-        "--num-workers > 1 with --loader=default forks worker processes "
-        "after MPI_Init, which hangs with DDStore. Use --num-workers=1, or "
-        "--loader=threaded for real parallelism."
-    )
-# --loader=threaded + (--gpu-dest or --gpu-source) + --num-workers > 1 is
-# confirmed unsafe by direct experiment: it silently corrupts data (not a
-# crash -- wrong pixel values at a low but nonzero rate). Root cause: the
-# GPU buffer pool in distdataset.py hands out slots via a per-SAMPLE
-# round-robin index shared across threads; slot write order is determined
-# by lock-acquisition order, not batch submission/consumption order, so a
-# bounded in-flight *batch count* doesn't actually bound which physical
-# slots can get overwritten while unread. A real fix needs get() to accept
-# a caller-supplied destination buffer so ThreadDataLoader can allocate one
-# dedicated region per in-flight batch (not per sample) -- not done yet.
-# num_workers<=1 has no concurrent writers, so it's unaffected.
-if args.loader == "threaded" and (args.gpu_dest or args.gpu_source) and args.num_workers > 1:
-    raise RuntimeError(
-        "--loader=threaded with --gpu-dest/--gpu-source and --num-workers > 1 "
-        "is known to silently corrupt data (confirmed by direct experiment -- "
-        "see README Known Limitations). Use --num-workers=1 with GPU buffers, "
-        "or drop --gpu-dest/--gpu-source for real multi-worker parallelism."
-    )
-if args.gpu_dest or args.gpu_source:
-    kwargs = {}
-else:
-    kwargs = {"num_workers": args.num_workers} if args.num_workers > 0 else {}
-
-# ThreadDataLoader bounds in-flight batches to num_workers * prefetch_factor
-# (default prefetch_factor=2, matching torch's own default); the GPU pool
-# must hold at least that many batches' worth of samples or get() hands out
-# a slice that's still "live" in an unconsumed batch -- see the pool-sizing
-# comment in distdataset.py. +1 batch of headroom.
-if args.loader == "threaded":
-    pool_size = (args.num_workers * 2 + 1) * args.batch_size
-else:
-    pool_size = None
-
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
     "train",
     comm,
     device=device if args.gpu_dest else None,
     add_device=device if args.gpu_source else None,
-    pool_size=pool_size,
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 comm.Barrier()
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.loader == "threaded":
+if args.num_workers > 0:
     if int(os.environ.get("DDSTORE_METHOD", "0")) == 0:
-        raise RuntimeError("--loader=threaded requires DDSTORE_METHOD=1 or 2")
+        raise RuntimeError("--num-workers > 0 requires DDSTORE_METHOD=1 or 2")
     train_loader = ThreadDataLoader(
         trainset,
         batch_size=args.batch_size,
@@ -218,10 +156,8 @@ if args.loader == "threaded":
         num_workers=args.num_workers,
     )
 else:
-    # --num-workers applies here too (forked processes), unless --gpu-dest/
-    # --gpu-source forced kwargs back to {} above (fork-safety guard).
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
     )
 
 print(
@@ -231,9 +167,7 @@ print(
 testset = datasets.MNIST(
     "data", train=False, download=True, transform=transforms.ToTensor()
 )
-test_loader = torch.utils.data.DataLoader(
-    testset, batch_size=args.batch_size, shuffle=False, **kwargs
-)
+test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
 
 # VAE_PROFILE=1 splits each epoch's wall time into "fetch" (time spent

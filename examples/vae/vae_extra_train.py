@@ -100,25 +100,15 @@ parser.add_argument(
     "libfabric-backed method (already the case for this script).",
 )
 parser.add_argument(
-    "--loader",
-    choices=["default", "threaded"],
-    default="default",
-    help="DataLoader implementation for the training set. 'threaded' uses "
-    "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
-    "thread-pool-based loader that allows --num-workers > 1 (the default "
-    "loader forks worker processes, which hangs with DDStore above 1). "
-    "With --gpu-dest, --num-workers must stay <= 1 even with "
-    "--loader=threaded -- confirmed unsafe above that (silent data "
-    "corruption, not a crash; see README Known Limitations). "
-    "Default: default.",
-)
-parser.add_argument(
     "--num-workers",
     type=int,
-    default=4,
+    default=0,
     metavar="N",
-    help="Number of worker threads for --loader=threaded. Ignored with "
-    "--loader=default (always 0 there). Default: 4.",
+    help="Number of DataLoader workers. 0 uses the default (forked-process) "
+    "DataLoader, single-threaded. > 0 switches to ThreadDataLoader "
+    "(examples/vae/ddstore_dataloader.py), with that many worker threads "
+    "-- forked processes can't safely own GPU state, so any "
+    "--num-workers > 0 goes through threads, never a fork. Default: 0.",
 )
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -152,44 +142,15 @@ model = VAE().to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
-kwargs = {}
-# --gpu-dest returns CUDA/HIP tensors from __getitem__; DataLoader worker
-# processes can't safely own GPU state across a fork, so this only works
-# with num_workers=0 (today's default). Don't add num_workers>0 here
-# without redesigning the buffer/collate strategy.
-if args.gpu_dest:
-    assert kwargs.get("num_workers", 0) == 0
-
-# --loader=threaded + --gpu-dest + --num-workers > 1 is confirmed unsafe by
-# direct experiment (silent data corruption, not a crash) -- see the
-# matching guard and comment in vae-ddp.py and the README Known Limitations
-# entry for the root cause. num_workers<=1 has no concurrent writers.
-if args.loader == "threaded" and args.gpu_dest and args.num_workers > 1:
-    raise RuntimeError(
-        "--loader=threaded with --gpu-dest and --num-workers > 1 is known "
-        "to silently corrupt data (see README Known Limitations). Use "
-        "--num-workers=1 with --gpu-dest, or drop --gpu-dest for real "
-        "multi-worker parallelism."
-    )
-
-# See the matching comment in vae-ddp.py: ThreadDataLoader bounds in-flight
-# batches to num_workers * prefetch_factor (default 2); the GPU pool must
-# be sized to match or get() hands out a slice that's still live elsewhere.
-if args.loader == "threaded":
-    pool_size = (args.num_workers * 2 + 1) * args.batch_size
-else:
-    pool_size = None
-
 trainset = DistDatasetReader(
     "train",
     args.handshake_dir,
     args.n_core,
     device=device if args.gpu_dest else None,
-    pool_size=pool_size,
 )
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.loader == "threaded":
+if args.num_workers > 0:
     # DistDatasetReader always joins via method=2 (file-based handshake),
     # so no DDSTORE_METHOD=0 guard is needed here (unlike vae-ddp.py).
     train_loader = ThreadDataLoader(
@@ -200,19 +161,18 @@ if args.loader == "threaded":
         num_workers=args.num_workers,
     )
 else:
-    # --num-workers is ignored here: kwargs never carries num_workers for
-    # the default loader (see the fork-safety guard above), so this is
-    # always the existing num_workers=0 behavior regardless of its value.
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
     )
+
+print(
+    f"train_loader: {type(train_loader).__name__}, num_workers={train_loader.num_workers}"
+)
 
 testset = datasets.MNIST(
     "data", train=False, download=True, transform=transforms.ToTensor()
 )
-test_loader = torch.utils.data.DataLoader(
-    testset, batch_size=args.batch_size, shuffle=False, **kwargs
-)
+test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 
 
 def train(epoch):

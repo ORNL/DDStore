@@ -1,7 +1,6 @@
 from mpi4py import MPI
 import numpy as np
 import os
-import threading
 
 import torch
 from torch.utils.data import Dataset
@@ -25,7 +24,6 @@ class DistDataset(Dataset):
         ddstore_width=None,
         device=None,
         add_device=None,
-        pool_size=None,
     ):
         super().__init__()
 
@@ -121,56 +119,15 @@ class DistDataset(Dataset):
         self.ddstore.add(f"{self.label}data", self.data)
         self.ddstore.add(f"{self.label}labels", self.labels)
 
-        # Pre-allocate a pool of GPU destination buffers for get() calls.
+        # get() allocates a fresh GPU tensor per call on the GPU path (no
+        # buffer pool) -- simpler, at the cost of a fresh fi_mr_regattr per
+        # distinct pointer on every call instead of one pre-registered
+        # region reused across calls. Revisit with a pool later if that
+        # registration cost matters.
         #
-        # Problem: DataLoader (num_workers=0) calls __getitem__ batch_size times
-        # sequentially and keeps all returned tensors alive until collate runs.
-        # If get() allocates a fresh torch.empty() each call, PyTorch's caching
-        # allocator gives batch_size distinct pointers.  Each distinct pointer
-        # triggers fi_mr_regattr+fi_mr_bind+fi_mr_enable (expensive on GPU/HSA),
-        # defeating the recv_mr cache in common.cxx.
-        #
-        # Solution: pre-allocate a contiguous (POOL, 784) tensor so all slices
-        # share one MR registration.  Slices are handed out round-robin so
-        # all concurrently-live tensors have distinct pointers (no aliasing)
-        # while staying inside the single registered region.
-        #
-        # Sizing: POOL must be >= the number of samples that can be "in
-        # flight" (returned by get() but not yet consumed by collate) at
-        # once. With the default num_workers=0 DataLoader, that's at most
-        # one batch, so 256 safely covers the default batch_size=128. With
-        # ThreadDataLoader (examples/vae/ddstore_dataloader.py), multiple
-        # batches can be in flight simultaneously -- it bounds this to
-        # num_workers * prefetch_factor batches -- so POOL must be sized
-        # accordingly via `pool_size`; pass it in (e.g.
-        # `pool_size = num_workers * prefetch_factor * batch_size`) when
-        # using ThreadDataLoader, or get() silently hands out a slice that's
-        # still live in another batch (confirmed by direct experiment: this
-        # produced ~99.5% wrong-data rate with 8 workers / 256-slot pool /
-        # batch_size=64, well before exhausting the pool's raw capacity).
-        #
-        # Guards pool-slice selection/increment + the ddstore.get() calls in
-        # get() below -- needed once a caller (e.g. ThreadDataLoader) can
-        # invoke get() from multiple threads concurrently. The underlying
-        # DDStore::get() releases the GIL for its blocking transfer but has
-        # no internal locking of its own, so concurrent calls here would
-        # race on both the pool round-robin index and DDStore's CQ/MR-cache
-        # state (confirmed by direct experiment: disabling this lock crashed
-        # with "double free or corruption" under concurrent access).
-        self._lock = threading.Lock()
-
-        _POOL = pool_size if pool_size is not None else 256
-        if device is not None:
-            self._val_pool = torch.empty(
-                (_POOL, 28 * 28), dtype=torch.float32, device=device
-            )
-            self._val_pool_idx = 0
-            # Pre-register the full pool as a single MR so all row-slices
-            # share one fi_mr_regattr instead of one per __getitem__ call.
-            self.ddstore.prefetch_recv_mr(f"{self.label}data", self._val_pool)
-        else:
-            self._val_pool = None
-            self._val_pool_idx = 0
+        # Thread-safety for concurrent get() calls (e.g. from ThreadDataLoader
+        # worker threads) is handled inside DDStore itself (a per-variable
+        # lock in include/common.h's fabric_state) -- no lock needed here.
 
     def len(self):
         return self.total_ns
@@ -185,21 +142,14 @@ class DistDataset(Dataset):
         # loops discard it, so a GPU-resident label buffer would add
         # complexity for no benefit.
         label = np.zeros(1, dtype=np.int32)
-        with self._lock:
-            if device is not None:
-                # Take the next slice from the pool (round-robin).  All slices
-                # share one MR registration → recv_mr cache always hits after the
-                # first call.  No clone() needed: each slice is a distinct pointer
-                # so the DataLoader can hold all batch_size results simultaneously
-                # without aliasing.
-                val = self._val_pool[self._val_pool_idx : self._val_pool_idx + 1]
-                self._val_pool_idx = (self._val_pool_idx + 1) % self._val_pool.shape[0]
-            else:
-                val = np.zeros((1, 28 * 28), dtype=np.float32)
-                val = np.ascontiguousarray(val)
-                assert val.data.contiguous
-            self.ddstore.get(f"{self.label}data", val, idx)
-            self.ddstore.get(f"{self.label}labels", label, idx)
+        if device is not None:
+            val = torch.empty((1, 28 * 28), dtype=torch.float32, device=device)
+        else:
+            val = np.zeros((1, 28 * 28), dtype=np.float32)
+            val = np.ascontiguousarray(val)
+            assert val.data.contiguous
+        self.ddstore.get(f"{self.label}data", val, idx)
+        self.ddstore.get(f"{self.label}labels", label, idx)
         if device is None:
             val = torch.tensor(val)
         val = torch.reshape(val, (1, 28, 28))
@@ -218,7 +168,7 @@ class DistDatasetReader(Dataset):
     core rank's memory.
     """
 
-    def __init__(self, label, handshake_dir, n_core, device=None, pool_size=None):
+    def __init__(self, label, handshake_dir, n_core, device=None):
         super().__init__()
         self.label = label
         # See DistDataset.__init__ for what `device` does.
@@ -241,20 +191,8 @@ class DistDatasetReader(Dataset):
                 "which is not a perfect square (expected a flattened square image)"
             )
 
-        # See DistDataset.__init__ for what this guards, and for the
-        # `pool_size` sizing requirement when using ThreadDataLoader.
-        self._lock = threading.Lock()
-
-        _POOL = pool_size if pool_size is not None else 256
-        if device is not None:
-            self._val_pool = torch.empty(
-                (_POOL, self.data_disp), dtype=torch.float32, device=device
-            )
-            self._val_pool_idx = 0
-            self.ddstore.prefetch_recv_mr(f"{self.label}data", self._val_pool)
-        else:
-            self._val_pool = None
-            self._val_pool_idx = 0
+        # See DistDataset.__init__ -- thread-safety lives inside DDStore
+        # itself, no lock needed here; and no buffer pool on the GPU path.
 
     def len(self):
         return self.total_ns
@@ -267,16 +205,14 @@ class DistDatasetReader(Dataset):
         ## width, since ddstore.get() infers count from arr.shape[0]
         # Label stays host-only regardless of `device` -- see DistDataset.get().
         label = np.zeros(1, dtype=np.int32)
-        with self._lock:
-            if device is not None:
-                val = self._val_pool[self._val_pool_idx : self._val_pool_idx + 1]
-                self._val_pool_idx = (self._val_pool_idx + 1) % self._val_pool.shape[0]
-            else:
-                val = np.zeros((1, self.data_disp), dtype=np.float32)
-                val = np.ascontiguousarray(val)
-                assert val.data.contiguous
-            self.ddstore.get(f"{self.label}data", val, idx)
-            self.ddstore.get(f"{self.label}labels", label, idx)
+        if device is not None:
+            val = torch.empty((1, self.data_disp), dtype=torch.float32, device=device)
+        else:
+            val = np.zeros((1, self.data_disp), dtype=np.float32)
+            val = np.ascontiguousarray(val)
+            assert val.data.contiguous
+        self.ddstore.get(f"{self.label}data", val, idx)
+        self.ddstore.get(f"{self.label}labels", label, idx)
         if device is None:
             val = torch.tensor(val)
         val = torch.reshape(val, (1, self.side, self.side))

@@ -481,17 +481,20 @@ def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
 
 def test_concurrent_get_thread_safety(comm, monkeypatch):
     """DDStore::get() releases the GIL for its blocking transfer (see the
-    `with nogil:` block in pyddstore.pyx) but has no internal locking of its
-    own -- concurrent calls from multiple threads on the same store race on
-    the CQ poll loop and the recv-MR region cache in common.cxx.
+    `with nogil:` block in pyddstore.pyx), so multiple Python threads can
+    genuinely be inside DDStore::get() at the same time. Without
+    synchronization, concurrent calls on the same variable would race on
+    the CQ poll loop and the recv-MR region cache in common.cxx (confirmed
+    by direct experiment: disabling the protection crashed with "double
+    free or corruption").
 
-    examples/vae/distdataset.py's DistDataset/DistDatasetReader (used by
-    ThreadDataLoader, examples/vae/ddstore_dataloader.py, to parallelize
-    __getitem__ across threads) close this with a `threading.Lock` around
-    each get() call. This test reproduces that exact pattern directly
-    against PyDDStore: N threads issue concurrent get() calls serialized by
-    a lock, each checked against a trusted sequential reference -- it would
-    have caught the race if the lock were missing or misplaced.
+    That protection now lives inside DDStore itself -- a per-variable
+    `pthread_mutex_t` on `struct fabric_state` (include/common.h), taken
+    via the `fabric_state_lock_guard` RAII helper around get()'s critical
+    section in include/ddstore.hpp. This test calls PyDDStore.get()
+    directly from multiple threads with **no lock at the Python level at
+    all** -- it would catch a regression if
+    that C++-level protection were ever removed or narrowed.
     """
     monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
     rank = comm.Get_rank()
@@ -506,20 +509,18 @@ def test_concurrent_get_thread_safety(comm, monkeypatch):
     comm.Barrier()
 
     store.epoch_begin()
-    lock = threading.Lock()
     results = {}
     errors = []
 
-    def locked_get(target_rank):
+    def unlocked_get(target_rank):
         out = np.full((1, ncols), -999.0, dtype=np.float32)
-        with lock:
-            store.get("x", out, start=target_rank * nrows)
+        store.get("x", out, start=target_rank * nrows)
         results[target_rank] = out.copy()
 
     def worker(target_ranks):
         try:
             for target_rank in target_ranks:
-                locked_get(target_rank)
+                unlocked_get(target_rank)
         except Exception as exc:  # noqa: BLE001 - surface any thread exception
             errors.append(exc)
 

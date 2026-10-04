@@ -86,6 +86,24 @@ extern "C"
 
         int world_size;
         int rank;
+
+        /* Serializes concurrent get() calls on THIS variable's
+         * fabric_state -- see fabric_state_lock_guard below. libfabric
+         * itself doesn't guarantee thread safety unless the domain is
+         * opened with FI_THREAD_SAFE (it isn't here; see
+         * init_fabric_hsn()'s FI_THREAD_DOMAIN hint and init_fabric_cxi()'s
+         * unconstrained NULL-hints query), and even then that would only
+         * cover libfabric's own objects, not the plain fields above
+         * (recv_data/recv_mr/recv_mr_base/recv_mr_reg_len) that read_from_
+         * remote() reads and writes as a cache.
+         * Confirmed necessary by direct experiment: concurrent get() calls
+         * without this crashed with "double free or corruption".
+         * Zero-initialized by calloc() at every allocation site below, but
+         * explicitly pthread_mutex_init()'d right after each one anyway --
+         * relying on zero-initialized pthread_mutex_t being equivalent to
+         * PTHREAD_MUTEX_INITIALIZER is a common but implementation-defined
+         * assumption; init explicitly instead. */
+        pthread_mutex_t recv_lock;
     };
 
     static bool is_local_mr_req(struct fabric_state *f)
@@ -174,4 +192,24 @@ extern "C"
 
 #ifdef __cplusplus
 }
+
+/* RAII guard for struct fabric_state::recv_lock -- locks on construction,
+ * unlocks on destruction (including when leaving via an exception), so
+ * every exit path of the critical section it wraps is covered without
+ * having to hand-place lock/unlock calls on each one. See the comment on
+ * recv_lock above for what this protects and why. */
+struct fabric_state_lock_guard
+{
+    struct fabric_state *fs;
+    explicit fabric_state_lock_guard(struct fabric_state *fs) : fs(fs)
+    {
+        pthread_mutex_lock(&fs->recv_lock);
+    }
+    ~fabric_state_lock_guard()
+    {
+        pthread_mutex_unlock(&fs->recv_lock);
+    }
+    fabric_state_lock_guard(const fabric_state_lock_guard &) = delete;
+    fabric_state_lock_guard &operator=(const fabric_state_lock_guard &) = delete;
+};
 #endif

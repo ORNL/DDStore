@@ -292,7 +292,7 @@ On Frontier, `method=2`'s separate core/extra `srun` steps within one job have s
 
 ### MPI thread level
 
-DDStore and the examples use mpi4py's default initialization (`MPI_Init_thread` requesting `MPI_THREAD_MULTIPLE`); no `mpi4py.rc` settings are needed. Only the main thread calls MPI — `add()`/`init()`/`join()` at setup, plus `epoch_begin()`/`epoch_end()` and `get()` for `method=0` — while `ThreadDataLoader` worker threads only call `get()` with `method=1`/`2`, which makes no MPI calls. So `MPI_THREAD_FUNNELED` is the minimum strictly required; the earlier `mpi4py.rc.threads = False` (which yields `MPI_THREAD_SINGLE`, technically wrong once worker threads exist) was removed. On Frontier (Cray MPICH, 2 nodes × 8 ranks), `vae-ddp.py` and the pytest suites gave identical results and timing with `SINGLE`, `FUNNELED` and `MULTIPLE`. If you call MPI from your own worker threads with `method=0`, keep the default `MULTIPLE`.
+DDStore and the examples use mpi4py's default initialization (`MPI_Init_thread` requesting `MPI_THREAD_MULTIPLE`). Only the main thread calls MPI — `add()`/`init()`/`join()` at setup, plus `epoch_begin()`/`epoch_end()` and `get()` for `method=0` — while `ThreadDataLoader` worker threads only call `get()` with `method=1`/`2`, which makes no MPI calls. So `MPI_THREAD_FUNNELED` is the minimum strictly required. On Frontier (Cray MPICH, 2 nodes × 8 ranks), `vae-ddp.py` and the pytest suites gave identical results and timing with `SINGLE`, `FUNNELED` and `MULTIPLE`. If you call MPI from your own worker threads with `method=0`, keep the default `MULTIPLE`.
 
 ### HIP streams and hardware queues (AMD/ROCm)
 

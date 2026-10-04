@@ -118,8 +118,9 @@ void DDStore::epoch_end()
 /* --------------------------------------------------------------------------
  * join() — extra member: discover a variable published by core members.
  *
- * Calls handshake_join() which polls for all CoreRecord files, then
- * populates a fabric_state and builds the lenlist for get() calls.
+ * Calls handshake_join(), which polls for the combined {name}.bin record
+ * file written by core rank 0, then populates a fabric_state and builds
+ * the lenlist for get() calls.
  * -------------------------------------------------------------------------- */
 void DDStore::join(std::string name)
 {
@@ -130,6 +131,7 @@ void DDStore::join(std::string name)
 
     struct fabric_state *fs =
         (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+    pthread_mutex_init(&fs->recv_lock, NULL);
     fs->world_size = this->n_core;
     fs->rank       = -1; /* extra members have no core rank */
 
@@ -137,9 +139,9 @@ void DDStore::join(std::string name)
     if (!fs->info)
         throw std::runtime_error("init_fabric failed for extra member");
 
-    /* Extra member has no send buffer to register as MR — set a dummy
-     * zero-length registration so handshake_join doesn't need special-casing.
-     * We only need fi_read capability, not FI_REMOTE_READ on our side.      */
+    /* Extra member has no send buffer, so nothing is registered for remote
+     * access (mr stays NULL, key 0). It only issues fi_read()s; get()
+     * registers each destination buffer as usual in read_from_remote().     */
     fs->send_data     = NULL;
     fs->send_data_len = 0;
     fs->mr            = NULL;
@@ -171,51 +173,58 @@ void DDStore::join(std::string name)
     var.active       = true;
     var.fence_active = false;
     var.base         = NULL; /* extra member owns no data */
+    var.owns_base    = false;
     var.fabric_state = fs;
     this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
 }
 
 /* --------------------------------------------------------------------------
  * free() — release all resources.
+ *
+ * Per variable: the MPI window (method 0) or the libfabric objects (methods
+ * 1/2) first, since they reference the buffer, then the buffer itself if
+ * DDStore allocated it (owns_base). MPI_Win_free/MPI_Free_mem are skipped
+ * after MPI_Finalize (no longer callable). Idempotent via `active`.
  * -------------------------------------------------------------------------- */
 void DDStore::free()
 {
-    int flag;
-    MPI_Finalized(&flag);
-    if (!this->method && !flag)
+    int finalized;
+    MPI_Finalized(&finalized);
+    for (auto &x : this->varlist)
     {
-        for (auto &x : this->varlist)
+        VarInfo_t &var = x.second;
+        if (!var.active)
+            continue;
+
+        if (this->method == 0)
         {
-            if (x.second.active)
-            {
-                MPI_Win_free(&x.second.win);
-            }
-            x.second.active = false;
+            if (!finalized)
+                MPI_Win_free(&var.win);
         }
-    }
-    else if (this->method == 1 || this->method == 2)
-    {
-        for (auto &x : this->varlist)
+        else if (var.fabric_state)
         {
-            if (x.second.active && x.second.fabric_state)
-            {
-                struct fabric_state *fs = x.second.fabric_state;
-                if (fs->recv_mr)   fi_close(&fs->recv_mr->fid);
-                if (fs->mr)        fi_close(&fs->mr->fid);
-                if (fs->signal)    fi_close(&fs->signal->fid);
-                if (fs->cq_signal) fi_close(&fs->cq_signal->fid);
-                if (fs->av)        fi_close(&fs->av->fid);
-                if (fs->domain)    fi_close(&fs->domain->fid);
-                if (fs->fabric)    fi_close(&fs->fabric->fid);
-                if (fs->info)      fi_freeinfo(fs->info);
-                if (fs->ctx)       ::free(fs->ctx);
-                ::free(fs->comm_partner);
-                ::free(fs->remote_key);
-                ::free(fs->remote_address);
-                ::free(fs);
-                x.second.fabric_state = NULL;
-            }
-            x.second.active = false;
+            struct fabric_state *fs = var.fabric_state;
+            if (fs->recv_mr)   fi_close(&fs->recv_mr->fid);
+            if (fs->mr)        fi_close(&fs->mr->fid);
+            if (fs->signal)    fi_close(&fs->signal->fid);
+            if (fs->cq_signal) fi_close(&fs->cq_signal->fid);
+            if (fs->av)        fi_close(&fs->av->fid);
+            if (fs->domain)    fi_close(&fs->domain->fid);
+            if (fs->fabric)    fi_close(&fs->fabric->fid);
+            if (fs->info)      fi_freeinfo(fs->info);
+            if (fs->ctx)       ::free(fs->ctx);
+            ::free(fs->comm_partner);
+            ::free(fs->remote_key);
+            ::free(fs->remote_address);
+            pthread_mutex_destroy(&fs->recv_lock);
+            ::free(fs);
+            var.fabric_state = NULL;
         }
+
+        if (var.owns_base && var.base && !finalized)
+            MPI_Free_mem(var.base);
+        var.base = NULL;
+        var.owns_base = false;
+        var.active = false;
     }
 }

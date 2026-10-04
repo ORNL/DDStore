@@ -16,8 +16,10 @@ Usage: $(basename "$0") [OPTIONS]
 Runs the core/extra VAE DDP split (default method=2).
 
 Options:
-  --method=N     DDSTORE_METHOD: 0=MPI RMA, 1=libfabric, 2=file-based
-                 handshake. Default: 2.
+  --method=N     Exported as DDSTORE_METHOD, but the core/extra split is
+                 always method=2 (file-based handshake): vae_core_server.py
+                 sets it and vae_extra_train.py always joins via method 2.
+                 Default: 2.
   --fabric=X     DDSTORE_FABRIC: hsn or cxi. Default: cxi.
   --gpudirect    Test GPUDirect RDMA. Requires --method=1 or 2 and
                  --fabric=cxi. Also gives the core step a GPU per rank

@@ -59,7 +59,7 @@ parser.add_argument(
     help="Allocate the DDStore get() destination buffer directly on the "
     "training device (GPUDirect RDMA, Phase 1), skipping the "
     "host->device copy. Requires DDSTORE_METHOD in (1, 2) and "
-    "DDSTORE_FABRIC=cxi (e.g. DDSTORE_METHOD=2 as in run-vae.sh).",
+    "DDSTORE_FABRIC=cxi (e.g. job-vae-single.sh --method=1 --gpudirect).",
 )
 parser.add_argument(
     "--gpu-source",
@@ -76,8 +76,9 @@ parser.add_argument(
     type=int,
     default=0,
     metavar="N",
-    help="Number of DataLoader workers. 0 uses the default (forked-process) "
-    "DataLoader, single-threaded. > 0 switches to ThreadDataLoader "
+    help="Number of DataLoader workers. 0 uses PyTorch's standard "
+    "DataLoader in the main process (no worker processes, no fork). "
+    "> 0 switches to ThreadDataLoader "
     "(examples/vae/ddstore_dataloader.py), with that many worker threads "
     "-- forked processes can't safely own GPU state or MPI's live state, "
     "so any --num-workers > 0 goes through threads, never a fork. "

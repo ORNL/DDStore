@@ -12,17 +12,17 @@ Three layers, one file:
     (src/pyddstore.pyx) for method=1/2 to set FABRIC_IFACE if not already set.
 
 Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
-Perlmutter alike -- there is no per-system glob pattern to choose. Perlmutter
-just exposes each hsnN NIC's libfabric domain under a different name (cxiN);
-pass --fabric cxi (or set DDSTORE_FABRIC=cxi) to see that
-translated name instead of the raw kernel one.
+Perlmutter alike -- there is no per-system glob pattern to choose. The cxi
+libfabric provider names each hsnN NIC's domain cxiN instead; pass --fabric
+cxi (or set DDSTORE_FABRIC=cxi) to see that translated name instead of the
+raw kernel one.
 
 CLI:
   cpu_nic_map.py                print the full CPU -> nearest HSN NIC table
   cpu_nic_map.py 42              print only the nearest HSN NIC for cpu 42
   cpu_nic_map.py --env           print the compact DDSTORE_NIC_MAP env-var value
   cpu_nic_map.py --allocated     print this process's allocated CPUs and nearest NIC(s)
-  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names
+  cpu_nic_map.py --env --fabric cxi   show the cxi-provider (cxiN) names
 
   export DDSTORE_NIC_MAP=$(python3 cpu_nic_map.py --env)
   srun --threads-per-core=2 -n8 -c14 python cpu_nic_map.py --allocated
@@ -134,8 +134,8 @@ def build_map(pattern):
             for nic, part in zip(sorted(group), partitions):
                 nic_closest[nic] = part
 
-    # multiple NICs can share a NUMA node; pick the numerically/PCI-closest
-    # NIC as the "same-NUMA fallback owner" for cores not exactly local to any NIC
+    # multiple NICs can share a NUMA node; the first one by name is the
+    # "same-NUMA fallback owner" for cores not exactly local to any NIC
     numa_to_nics = {}
     for n, numa in nic_numa.items():
         numa_to_nics.setdefault(numa, []).append(n)
@@ -172,8 +172,8 @@ def compress_ranges(values):
 
 def translate_iface(name, provider="hsn"):
     """Translate a kernel NIC name (hsnN) to the libfabric domain name for
-    `provider`. 'cxi' -> cxiN (Perlmutter exposes hsnN's libfabric domain
-    under this name); 'hsn' (default) or anything else -> unchanged."""
+    `provider`. 'cxi' -> cxiN (the cxi provider's domain name for hsnN);
+    'hsn' (default) or anything else -> unchanged."""
     if provider == "cxi":
         m = re.match(r"hsn(\d+)$", name)
         if m:
@@ -261,11 +261,10 @@ def select_fabric_iface(nic_map=None):
     than the process environment.
 
     DDSTORE_FABRIC selects hsn (default) or cxi:
-      - hsn: Frontier's unchanged, already-proven behavior -- the kernel NIC
-        name (hsnN) is used as-is.
-      - cxi: Perlmutter's behavior, ported from dev-cxi@7cb110b. The kernel
-        NIC names are hsn0-hsn3 there too, but libfabric only exposes them
-        as cxi0-cxi3, so the result is translated hsnN -> cxiN. Also adds a
+      - hsn: the kernel NIC name (hsnN) is used as-is (tcp;ofi_rxm).
+      - cxi: the kernel NIC names are hsn0-hsn3, but the cxi provider
+        exposes them as cxi0-cxi3, so the result is translated hsnN -> cxiN
+        (Frontier and Perlmutter alike). Also adds a
         SLURM_LOCALID round-robin fallback for when hwloc can't map this
         rank's CPU affinity to a NIC (common inside srun tasks with limited
         PCI visibility).
@@ -330,7 +329,7 @@ def main():
             "  cpu_nic_map.py 42        print only the nearest HSN NIC for cpu 42\n"
             "  export DDSTORE_NIC_MAP=$(cpu_nic_map.py --env)   compute once, share via env\n"
             "  srun ... python cpu_nic_map.py --allocated   show this task's allocated CPUs + nearest NIC(s)\n"
-            "  cpu_nic_map.py --env --fabric cxi   show the Perlmutter-translated (cxiN) names\n"
+            "  cpu_nic_map.py --env --fabric cxi   show the cxi-provider (cxiN) names\n"
         ),
     )
     parser.add_argument(
@@ -345,7 +344,7 @@ def main():
         choices=["hsn", "cxi"],
         help="translate printed NIC names to this fabric's libfabric "
         "domain name (default: $DDSTORE_FABRIC, or hsn if unset) "
-        "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN (Perlmutter)",
+        "-- hsn: unchanged (e.g. hsn0); cxi: hsnN -> cxiN",
     )
     parser.add_argument(
         "--env",

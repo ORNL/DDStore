@@ -1,9 +1,10 @@
 """
-GPUDirect RDMA tests (Phase 1: host source -> GPU destination).
+GPUDirect RDMA tests: GPU destination (Phase 1), GPU source (Phase 2), both,
+negative paths, and concurrent get() from multiple threads.
 
 Positive path — run with: DDSTORE_FABRIC=cxi mpirun -n 2 pytest test/test_gpu_rdma.py -v
-requires a live cxi/Slingshot fabric and at least one visible GPU per rank
-(see run-test-gpu.sh). Negative-path tests need neither and always run.
+requires a live cxi/Slingshot fabric and at least one visible GPU per rank.
+Negative-path tests need neither and always run.
 """
 
 import threading
@@ -130,11 +131,12 @@ def test_get_into_gpu_tensor_cxi_matrix(comm, monkeypatch):
     allocation method (torch.empty, uninitialized vs torch.full, poisoned
     via a GPU compute-kernel write) crossed with readback method (.cpu()
     DMA copy vs GPU compute-kernel read + torch.cuda.synchronize()).
-    test_get_into_gpu_tensor_cxi (poison + .cpu()) reliably fails on
-    Frontier; test_get_into_gpu_tensor_cxi_compute_kernel_read (empty +
-    compute-kernel read) just passed cleanly, 200/200 iterations, diff=0.0.
-    This runs all 4 combinations back-to-back in one job to find out which
-    axis (allocation vs readback) actually matters, rather than guessing.
+    Written when test_get_into_gpu_tensor_cxi (poison + .cpu()) reliably
+    failed on Frontier while test_get_into_gpu_tensor_cxi_compute_kernel_read
+    (empty + compute-kernel read) passed; runs all 4 combinations to show
+    which axis (allocation vs readback) matters. Both now pass, since
+    PyDDStore.get() synchronizes the device before every GPU-destination
+    transfer (see test_get_into_gpu_tensor_cxi_sync_before_get).
     """
     monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
     rank = comm.Get_rank()
@@ -356,9 +358,7 @@ def test_gpu_source_rejected_on_hsn(comm, monkeypatch):
 # Phase 2: GPU-resident producer (add()) -- host/GPU destination, over cxi
 # ---------------------------------------------------------------------------
 #
-# Frontier will still fail these (the open, unrelated OLCF ROCm+CXI driver
-# issue affects get(), which every one of these tests also exercises to
-# check correctness) -- validation target is Perlmutter, same as Phase 1.
+# These pass on Frontier (ROCm + cxi).
 
 
 @gpu_required

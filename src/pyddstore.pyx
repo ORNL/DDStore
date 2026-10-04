@@ -292,8 +292,9 @@ cdef class PyDDStore:
     def update(self, str name, arr, long offset):
         if _is_cuda_tensor(arr):
             raise NotImplementedError(
-                "GPU source buffers are not yet supported by update() "
-                "(GPU-to-GPU is a future phase); pass arr.cpu().numpy() instead")
+                "update() only supports host (numpy) buffers -- the "
+                "init()/update() path is host-only; pass arr.cpu().numpy() "
+                "instead, or add() the GPU tensor directly")
         cdef np.ndarray np_arr = arr
         assert np_arr.flags.c_contiguous
         cdef long nrows = np_arr.shape[0]

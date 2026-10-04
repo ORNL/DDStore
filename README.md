@@ -128,7 +128,7 @@ Register a NumPy array as a named variable. Each rank contributes its local shar
 
 ---
 
-### `update(name, arr, offset=0)`
+### `update(name, arr, offset)`
 
 Overwrite a region of the local shard for a variable registered with `init()`. Local operation — does not require epoch or barrier.
 
@@ -170,13 +170,13 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 ### `epoch_begin()` / `epoch_end()`
 
-Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. Required around `get()` calls when using `method=0`. No-op for `method=1`.
+Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. Required around `get()` calls when using `method=0`. No-op for `method=1`/`2`.
 
 ---
 
 ### `free()`
 
-Release all MPI windows and allocated memory. Safe to call after `MPI_Finalize`.
+Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
 
 ## Backends
 
@@ -190,14 +190,14 @@ Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband
 
 **`DDSTORE_FABRIC`** selects which libfabric provider to open, for `method=1`/`2`:
 
-- `hsn` (default, unset) — Frontier: opens the `tcp;ofi_rxm` domain over Cray Slingshot.
-- `cxi` — Perlmutter: opens the native `cxi` domain over Cray Slingshot.
+- `hsn` (default, unset) — opens the `tcp;ofi_rxm` domain over Cray Slingshot (Frontier).
+- `cxi` — opens the native `cxi` domain over Cray Slingshot (Frontier and Perlmutter; Perlmutter is CXI-only). Required for [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers), and the default in the Frontier job scripts.
 
 The two are independent code paths (not runtime auto-detection), so set this explicitly per system rather than relying on a guess:
 
 ```bash
-export DDSTORE_FABRIC=hsn   # Frontier (default; usually not needed)
-export DDSTORE_FABRIC=cxi   # Perlmutter
+export DDSTORE_FABRIC=hsn   # tcp;ofi_rxm (default)
+export DDSTORE_FABRIC=cxi   # native CXI: Perlmutter, or Frontier with GPUDirect
 ```
 
 `PyDDStore` picks the network interface (`FABRIC_IFACE`) automatically for `method=1`/`2`, based on each rank's real CPU affinity (`os.sched_getaffinity`) — no changes needed in your code:
@@ -243,7 +243,7 @@ Environment variables:
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | Shared directory for handshake record files |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds to poll for core records / a join before raising a timeout |
 | `DDSTORE_NIC_MAP` | unset | CPU→NIC map for `FABRIC_IFACE` auto-selection — see [libfabric RDMA](#libfabric-rdma-method1) above |
-| `DDSTORE_FABRIC` | `hsn` | `hsn` (Frontier) or `cxi` (Perlmutter) — see [libfabric RDMA](#libfabric-rdma-method1) above |
+| `DDSTORE_FABRIC` | `hsn` | `hsn` (`tcp;ofi_rxm`) or `cxi` (native CXI) — see [libfabric RDMA](#libfabric-rdma-method1) above |
 
 See [test/test_method2_core.py](test/test_method2_core.py) / [test/test_method2_extra.py](test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](examples/vae/vae_extra_train.py) for a full DDP training example using this split.
 
@@ -282,11 +282,11 @@ On Frontier, `method=2`'s separate core/extra `srun` steps within one job have s
 
 ### `get()` has no GPU destination-buffer pool
 
-`DistDataset`/`DistDatasetReader`'s `get()` allocates a fresh GPU tensor per call on the GPU path (`--gpu-dest`), rather than reusing a pre-allocated pool. An earlier pooled design (round-robin slices of one pre-registered buffer, to amortize `fi_mr_regattr` cost) was removed after it was confirmed by direct experiment to corrupt data under `ThreadDataLoader` with `--num-workers > 1`: multiple worker threads raced for pool slots at per-sample granularity, and bounding how many batches could be in flight at once didn't bound which physical slots got overwritten, since slot-write order was determined by lock-acquisition order, not batch order. Removing the pool removes that race entirely — each call's destination is privately owned, nothing to reuse. The tradeoff: a fresh `fi_mr_regattr` per call instead of one registration shared across many. Revisit with a pool later if that registration cost matters (`--num-workers > 0` is otherwise known to work per the next section).
+`DistDataset`/`DistDatasetReader`'s `get()` allocates a fresh GPU tensor per call on the GPU path (`--gpu-dest`), rather than reusing a pre-allocated pool. An earlier pooled design (round-robin slices of one pre-registered buffer, to amortize `fi_mr_regattr` cost) was removed after it was confirmed by direct experiment to corrupt data under `ThreadDataLoader` with `--num-workers > 1`: multiple worker threads raced for pool slots at per-sample granularity, and bounding how many batches could be in flight at once didn't bound which physical slots got overwritten, since slot-write order was determined by lock-acquisition order, not batch order. Removing the pool removes that race entirely — each call's destination is privately owned, nothing to reuse. The tradeoff: a fresh `fi_mr_regattr` whenever the new tensor isn't inside the previously registered range (the receive-MR cache in `read_from_remote()` reuses the registration when PyTorch's allocator hands back the same block, which is common for same-shape `torch.empty()`), instead of one registration shared across many. Revisit with a pool later if that registration cost matters (`--num-workers > 0` is otherwise known to work per the next section).
 
 ### Thread-safety of concurrent `get()` calls
 
-`get()` is safe to call from multiple threads. For `method=1`/`2`, `DDStore::get()` serializes calls on the same variable with a per-variable mutex (`fabric_state::recv_lock` in `include/common.h`, taken via `fabric_state_lock_guard`), held for the whole RDMA read. It is required: each variable's libfabric domain is opened as `FI_THREAD_DOMAIN` (the application must serialize access), and `get()` writes per-variable fields (`recv_data`, the cached receive MR) that concurrent calls would otherwise race on — without it, concurrent `get()` calls crashed with `double free or corruption`. Different variables have separate domains/endpoints/CQs and don't contend. `method=0` doesn't use the lock.
+`get()` is safe to call from multiple threads. For `method=1`/`2`, `DDStore::get()` serializes calls on the same variable with a per-variable mutex (`fabric_state::recv_lock` in `include/common.h`, taken via `fabric_state_lock_guard`), held for the whole RDMA read. It is required: `get()` writes per-variable fields (`recv_data`, the cached receive MR) that concurrent calls would otherwise race on, and the libfabric objects aren't opened thread-safe either (`hsn` requests `FI_THREAD_DOMAIN`, i.e. the application serializes access; `cxi` takes the provider's default from a NULL-hints `fi_getinfo()`) — without the lock, concurrent `get()` calls crashed with `double free or corruption`. Different variables have separate domains/endpoints/CQs and don't contend. `method=0` doesn't use the lock.
 
 `get()` releases the GIL for the transfer on both the host and the GPU-destination path. The GPU-destination path first does a whole-device `torch.cuda.synchronize()` per call (see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers)), and that sync still dominates: releasing the GIL there made no measurable difference to `--gpu-dest` epoch time. `add()` keeps the GIL (one-time collective setup).
 
@@ -356,17 +356,19 @@ Measured with `vae-ddp.py`, `method=1`, `cxi`, 2 Frontier nodes × 8 ranks, `VAE
 
 On the host path one worker thread (background prefetch) cuts epoch time ~30%; more workers make it steadily worse as they contend for the per-variable lock and the GIL. On the GPU path threading doesn't help, because of the per-call whole-device sync. All runs finished with the same final loss. Recommended: `--num-workers=1` on the host path, `0` on the GPU path.
 
+The table predates moving batch collation into the worker thread (`ThreadDataLoader.fetch()`); with that change, the host path measured fetch ≈ 0.006 s / total ≈ 0.15 s per epoch with 1 worker and 0.044 / 0.19 with 2 (GPU path with 1 worker unchanged at 0.09 / 0.25).
+
 ```bash
-# ThreadDataLoader, 4 worker threads, host path (no GPU buffers)
-DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=4
+# ThreadDataLoader, 1 worker thread, host path (no GPU buffers) -- the recommended setting
+DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1
 
 # ThreadDataLoader + GPUDirect together
-DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=4 --gpu-dest --gpu-source
+DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1 --gpu-dest --gpu-source
 ```
 
 ### Slurm job scripts (Frontier)
 
-[examples/vae/script/job-vae-single.sh](examples/vae/script/job-vae-single.sh) and [examples/vae/script/job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh) wrap the same VAE example for `sbatch` on Frontier — `job-vae-single.sh` runs plain DDP (one `srun` step), `job-vae-core-extra.sh` runs the [method=2 core/extra split](#file-based-handshake-method2) (two independent `srun` steps). Both share `--method`/`--fabric`/`--gpudirect`, each with its own fixed default and none implicitly changing another:
+[examples/vae/script/job-vae-single.sh](examples/vae/script/job-vae-single.sh) and [examples/vae/script/job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh) wrap the same VAE example for `sbatch` on Frontier — `job-vae-single.sh` runs plain DDP (one `srun` step), `job-vae-core-extra.sh` runs the [method=2 core/extra split](#file-based-handshake-method2) (two independent `srun` steps). Both take `--fabric`/`--gpudirect`; `job-vae-single.sh` also takes `--method` (the core/extra split is always `method=2` — `vae_core_server.py` sets it and the extra side always joins via method 2):
 
 ```bash
 sbatch examples/vae/script/job-vae-single.sh                       # method=0, cxi
@@ -377,7 +379,7 @@ sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, c
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node --core-nnodes=2
 ```
 
-Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`. Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
+Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`. Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
 ## Testing
 
@@ -416,10 +418,10 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 ### Integration scripts
 
 ```bash
-# Basic functional test (MPI RMA)
+# Basic functional test (libfabric, method=1)
 mpirun -n 4 python examples/scripts/demo.py
 
-# Integration test with PyTorch DDP
+# Integration test with PyTorch DDP (libfabric, method=1)
 mpirun -n 4 python examples/scripts/test.py
 ```
 
@@ -430,6 +432,7 @@ Optional arguments for `examples/scripts/demo.py` and `examples/scripts/test.py`
 | `--num` | `1048576` | Rows per rank |
 | `--dim` | `64` | Elements per row |
 | `--nbatch` | `32` | Number of random reads |
+| `--gloo` / `--nccl` | `--gloo` | `test.py` only: `torch.distributed` backend |
 
 ### Method 2 (file-based handshake)
 

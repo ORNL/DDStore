@@ -21,10 +21,10 @@ Options:
   --fabric=X     DDSTORE_FABRIC: hsn or cxi. Default: cxi.
   --gpudirect    Test GPUDirect RDMA. Requires --method=1 or 2 and
                  --fabric=cxi.
-  --num-workers=N  DataLoader workers. 0 uses the default (forked-process)
-                 DataLoader, single-threaded. > 0 switches to
-                 ThreadDataLoader with that many worker threads (requires
-                 --method=1 or 2). Default: 0.
+  --num-workers=N  DataLoader workers. 0 uses PyTorch's standard
+                 DataLoader in the main process (no worker processes).
+                 > 0 switches to ThreadDataLoader with that many worker
+                 threads (requires --method=1 or 2). Default: 0.
   -h, --help     Show this help message and exit.
 
 Examples:

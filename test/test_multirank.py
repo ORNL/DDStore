@@ -2,7 +2,8 @@
 Multi-rank tests — run with: mpirun -n 4 pytest test/test_multirank.py -v
 
 Each rank stores a distinct value; tests verify cross-rank remote reads.
-Requires at least 2 ranks; some tests require exactly 4.
+Requires at least 2 ranks; the ddstore_width test needs at least 4
+(skipped otherwise).
 """
 
 import numpy as np

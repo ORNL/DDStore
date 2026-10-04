@@ -15,8 +15,8 @@
 #include <unistd.h>
 #include <vector>
 
-/* hsn (tcp;ofi_rxm over Slingshot) path — Frontier. Unchanged from the
- * already-proven dev-file2 implementation; only renamed (was init_fabric). */
+/* hsn (tcp;ofi_rxm over Slingshot) path — DDSTORE_FABRIC=hsn (default).
+ * The original init_fabric(), unchanged apart from the rename.             */
 static void init_fabric_hsn(struct fabric_state *fabric)
 {
     struct fi_info *hints, *info, *originfo, *useinfo;
@@ -257,9 +257,10 @@ static void init_fabric_hsn(struct fabric_state *fabric)
     fi_freeinfo(originfo);
 }
 
-/* cxi path — Perlmutter. Ported from dev-cxi@7cb110b (confirmed working on
- * Perlmutter). Kept structurally separate from init_fabric_hsn() above
- * rather than unified, so cxi support cannot change hsn's behavior. */
+/* cxi (native Slingshot) path — DDSTORE_FABRIC=cxi. First written for
+ * Perlmutter; also used on Frontier, where it is required for GPUDirect
+ * RDMA. Kept structurally separate from init_fabric_hsn() above rather
+ * than unified, so cxi support cannot change hsn's behavior. */
 static void init_fabric_cxi(struct fabric_state *fabric)
 {
     struct fi_info *info, *originfo, *useinfo;
@@ -667,37 +668,12 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         return 1;
     }
 
-    /* Cache the recv MR by registered region rather than exact pointer.
-     *
-     * The cache hits when recv_data falls within the previously registered
-     * region [recv_mr_base, recv_mr_base + recv_mr_reg_len) AND the transfer
-     * length fits within it.  This covers two cases:
-     *
-     *   1. Single buffer reused across batches (recv_data == recv_mr_base):
-     *      exact match, always hits after first call.
-     *
-     *   2. Pool of slices from one contiguous allocation: Python pre-allocates
-     *      a (POOL, disp) tensor; each __getitem__ call takes a different row
-     *      slice.  All slices share the same base allocation, so their pointers
-     *      lie within [recv_mr_base, recv_mr_base + recv_mr_reg_len).  On the
-     *      first call we register the full allocation (recv_data_len covers one
-     *      row; we extend the registration to the full pool via the stored
-     *      recv_mr_reg_len).  Actually for pool slices the caller sets
-     *      recv_data_len to the row size, and recv_data to a row pointer --
-     *      we register only that row on the first call, then on subsequent
-     *      calls we check whether the new pointer falls in the same region.
-     *      Since pool rows are contiguous and fixed-size, consecutive pointers
-     *      differ by exactly recv_data_len, so they are NOT in the same region
-     *      unless we register the whole pool.
-     *
-     * To handle the pool case efficiently, the Python side now passes the
-     * full pool allocation as recv_data/recv_data_len on the first call
-     * (via the pool base pointer and total size), and the slices are handled
-     * by the range check below.
-     *
-     * Simpler model: register recv_data..recv_data+recv_data_len on miss,
-     * and on subsequent calls re-use the MR if the new buffer is a subset of
-     * the cached region.                                                      */
+    /* Cache the recv MR by registered region rather than exact pointer:
+     * register recv_data..recv_data+recv_data_len on a miss, and reuse the
+     * MR while later buffers lie inside [recv_mr_base, recv_mr_base +
+     * recv_mr_reg_len). Hits when the caller passes the same buffer again --
+     * e.g. PyTorch's caching allocator returning the same block for a
+     * same-shape torch.empty() -- so each get() needn't re-register.        */
     char  *cur_base = fabric_state->recv_data;
     size_t cur_len  = fabric_state->recv_data_len;
     bool in_cached_region =

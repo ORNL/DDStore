@@ -78,7 +78,7 @@ class DistDataset(Dataset):
         self.total_ns = len(data)
         print("init", self.total_ns)
 
-        # WHEN READY FOR WHOLE DATA SET CHANGE THE RANGE TO range(len(data))
+        # This rank's contiguous share of the whole dataset.
         rx = list(nsplit(range(len(data)), self.ddstore_comm_size))[
             self.ddstore_comm_rank
         ]

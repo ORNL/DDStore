@@ -21,6 +21,10 @@ struct VarInfo
     bool active;
     bool fence_active;
     void *base;
+    /* true if base came from MPI_Alloc_mem() in add()/init() and free()
+     * must release it; false for a caller-owned GPU buffer (add() with
+     * hmem_iface != 0) or a joined variable (base == NULL).               */
+    bool owns_base;
     struct fabric_state *fabric_state;
 };
 typedef struct VarInfo VarInfo_t;
@@ -228,6 +232,7 @@ public:
             var.active       = true;
             var.fence_active = false;
             var.base         = base;
+            var.owns_base    = (hmem_iface == 0);
             var.fabric_state = fabric_state;
             this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
             return; /* lenlist already stored; skip the MPI_Allgather block below */
@@ -258,6 +263,7 @@ public:
         var.active = true;
         var.fence_active = false;
         var.base = base;
+        var.owns_base = (hmem_iface == 0);
         var.fabric_state = fabric_state;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
@@ -365,6 +371,7 @@ public:
             var.active       = true;
             var.fence_active = false;
             var.base         = base;
+            var.owns_base    = true;
             var.fabric_state = fabric_state;
             this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
             return;
@@ -395,6 +402,7 @@ public:
         var.active = true;
         var.fence_active = false;
         var.base = base;
+        var.owns_base = true;
         var.fabric_state = fabric_state;
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));

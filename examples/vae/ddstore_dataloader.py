@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.data.dataloader import _DatasetKind
 
 logger = logging.getLogger(__name__)
 
@@ -23,13 +22,6 @@ class ThreadDataLoader(DataLoader):
 
     def __init__(self, dataset, **kwargs):
         super().__init__(dataset, **kwargs)
-        self._dataset_fetcher = _DatasetKind.create_fetcher(
-            self._dataset_kind,
-            self.dataset,
-            self._auto_collation,
-            self.collate_fn,
-            self.drop_last,
-        )
 
         self.fs = queue.Queue()
         # Persistent across epochs -- recreating the pool in every __iter__()

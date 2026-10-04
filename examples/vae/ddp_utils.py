@@ -38,9 +38,9 @@ def init_comm_size_and_rank():
 
 def get_local_rank(rank):
     """
-    Determine which GPU on the local node this rank should use.
-    Falls back to rank % device_count when no launcher-provided local rank
-    is available (e.g. plain mpirun without per-rank GPU visibility).
+    Determine which GPU on the local node this rank should use, from the
+    launcher's local rank (OMPI_COMM_WORLD_LOCAL_RANK or SLURM_LOCALID).
+    Returns 0 when neither is set; `rank` is currently unused.
     """
     if os.getenv("OMPI_COMM_WORLD_LOCAL_RANK") is not None:
         return int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
@@ -103,7 +103,7 @@ def parse_slurm_nodelist(nodelist):
 
 
 def setup_ddp():
-    """ "Initialize DDP"""
+    """Initialize DDP"""
 
     if os.getenv("DDSTORE_BACKEND") is not None:
         backend = os.environ["DDSTORE_BACKEND"]

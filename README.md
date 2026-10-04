@@ -164,7 +164,7 @@ out = np.zeros((len(idx), 64), dtype=np.float32)
 store.get_batch("features", out, idx)
 ```
 
-`DistDataset`/`DistDatasetReader` use it through `__getitems__`, which PyTorch's `DataLoader` (and `ThreadDataLoader`) calls with a whole batch's indices; `DDSTORE_BATCH_GET=0` falls back to one `get()` per sample.
+`DistDataset`/`DistDatasetReader` use it by default through `__getitems__`, which PyTorch's `DataLoader` (and `ThreadDataLoader`) calls with a whole batch's indices, so the VAE examples and job scripts read in batches with no extra flag. Set `DDSTORE_BATCH_GET=0` to fall back to one `get()` per sample.
 
 ---
 

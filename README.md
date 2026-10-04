@@ -276,9 +276,14 @@ The sync in `get()` was re-checked by removing it: every `--gpu-dest` run of `va
 
 ## Known Limitations
 
-### Multiple `srun` steps in one job (`method=2`, `cxi`)
+### Multiple `srun` steps in one job (`method=2`, `cxi`, Frontier)
 
-On Frontier, `method=2`'s separate core/extra `srun` steps within one job have shown intermittent RDMA connectivity issues between steps, and a later step in a job with several sequential steps can occasionally fail to start. The `--network=job_vni`/`single_node_vni` `sbatch` options have not reliably fixed this. The cause isn't fully understood. If you hit this, use fewer sequential steps per job, or use `method=1` (single job step), which doesn't have this issue.
+Core and extra run as separate `srun` steps, and on Slingshot every step gets its own VNI (network isolation ID); two endpoints can only communicate on the same VNI. Two things are needed, both handled by [job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh):
+
+1. `#SBATCH --network=single_node_vni,job_vni`. `job_vni` adds a job-wide VNI to every step (`SLINGSHOT_VNIS=<step VNI>,<job VNI>`); `single_node_vni` makes single-node steps (e.g. `--layout=split-node`) get a CXI service at all — without it `fi_domain()` fails with `-38 (Function not implemented)`.
+2. In each task, keep only the job VNI: `export SLINGSHOT_VNIS=${SLINGSHOT_VNIS##*,}` before starting Python. libfabric's cxi provider uses only the first VNI listed, i.e. the per-step one, so without this the extra side's reads fail with `fi_cq_read ... prov_errno=25 (VNI_NOT_FOUND)`.
+
+Verified on Frontier (2 nodes, split-node, `method=2`, `cxi`): with both, the extra step trains against the core step's data and both shut down cleanly; with either missing, it fails as above. MPI and RCCL inside each step work on the job VNI too.
 
 ### `get()` has no GPU destination-buffer pool
 
@@ -304,7 +309,7 @@ On Frontier, the GPU synchronization performed before each RDMA call (needed for
 
 ### Troubleshooting: RDMA fails to connect (`cxi`, Frontier)
 
-If a `cxi` job fails to connect over RDMA, try adding `#SBATCH --network=single_node_vni` — this has been needed specifically for **single-node** (`-N 1`) jobs on Frontier. For jobs spanning multiple nodes, or multiple `srun` steps in one job, this hasn't reliably helped (see above); if you hit connection issues there, reducing the number of sequential steps or using `method=1` is more likely to help.
+If `fi_domain()` fails with `-38 (Function not implemented)` on `cxi`, the step has no CXI service: add `#SBATCH --network=single_node_vni` — needed whenever a step runs on a single node (a `-N 1` job, or a one-node step inside a larger job). If ranks in different `srun` steps can't reach each other (`VNI_NOT_FOUND`), see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi-frontier) above.
 
 ## Partitioned / Sub-communicator Usage
 
@@ -379,7 +384,7 @@ sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, c
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node --core-nnodes=2
 ```
 
-Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`. Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
+Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node`, `--core-nnodes`, and `--num-workers` (for the extra/training step). Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
 ## Testing
 

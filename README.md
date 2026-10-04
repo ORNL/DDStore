@@ -158,7 +158,7 @@ Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into
 
 For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is still one `fi_read` per row.
 
-For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/document/10596438/): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
+For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/document/10596438/): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator, in rounds of at most `DDSTORE_ALLTOALL_MAX_BYTES` (default 2 MiB) received per rank so large rows don't turn into one huge exchange. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
 
 ```python
 idx = np.array([2048, 7, 4096, 7])
@@ -208,6 +208,7 @@ Release every variable's MPI window (`method=0`) or libfabric endpoints and memo
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | `method=2` handshake directory when none is given (C++ API; `PyDDStore` requires `handshake_dir`, and the examples fill it from this variable). Must be on a shared filesystem. |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds a `method=2` extra member's `join()` polls for the core group's record file. |
 | `DDSTORE_PROFILE` | off | `1` turns on `get()`/`get_batch()` timing counters, read with `get_profile(name)`. See [Profiling](#profiling-get-ddstore_profile1). |
+| `DDSTORE_ALLTOALL_MAX_BYTES` | `2097152` (2 MiB) | `method=0` `get_batch()`: bytes each rank receives per exchange round. Must be equal on all ranks. |
 
 The backend itself is not an environment variable in the library: pass `method=` to `PyDDStore` (`DDSTORE_METHOD` below is how the examples choose it).
 
@@ -464,6 +465,8 @@ VAE (`vae-ddp.py`, epochs 2–8 average, s/epoch), per-sample `get()` → batche
 | 2 | 0.395 → 0.286 | 0.293 → 0.265 | 0.428 → 0.277 | 0.416 → 0.264 | 0.518 → 0.297 |
 
 The per-row GPU sync falls from 129–383 µs (with workers) to ~0.1 µs, and training compute time recovers because it no longer waits behind the workers' syncs.
+
+`method=0` collective `get_batch()` (`bench_get.py`, host, 16 ranks, µs per row, per-row `get()` → batch 128): 3 KB 28.8 → 3.0, 12.5 KB 34.9 → 7.5, 200 KB 170 → 111, 1 MB 739 → 685. Without the 2 MiB round cap, 200 KB and 1 MB rows were 1.6–2.4× *slower* than per-row reads. In the VAE (no workers), `method=0` goes from 0.421 → 0.144 s/epoch at S=1 and 0.597 → 0.310 at S=2, close to `method=1` batched (0.135 / 0.296); losses unchanged.
 
 ## Testing
 

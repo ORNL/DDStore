@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -629,51 +630,91 @@ private:
                     "Global index " + std::to_string(all[j]) +
                     " is out of range [0, " + std::to_string(total_rows) + ")");
 
-        /* 2. Rows this rank owns, packed per requester in request order. */
+        /* 2. Split the exchange into rounds of at most `cap` bytes received
+         * per rank (DDSTORE_ALLTOALL_MAX_BYTES, default 2 MiB): one huge
+         * Alltoallv of large rows is slower than per-row reads. Every rank
+         * derives the same round count from the gathered request counts;
+         * round k moves each rank's k-th slice of `per` requests.          */
+        const long cap = alltoall_max_bytes();
+        const long per = row >= (size_t)cap ? 1 : (long)(cap / (long)row);
+        long max_req = 0;
+        for (int p = 0; p < P; p++)
+            max_req = nreq[p] > max_req ? nreq[p] : max_req;
+        const long rounds = (max_req + per - 1) / per;
+
         const long my_first = me > 0 ? varinfo.lenlist[me - 1] : 0;
         const long my_end = varinfo.lenlist[me];
-        std::vector<int> scount(P, 0), sdispl(P, 0);
-        for (int p = 0; p < P; p++)
-            for (int j = rbase[p]; j < rbase[p + 1]; j++)
-                if (all[j] >= my_first && all[j] < my_end)
-                    scount[p]++;
-        for (int p = 1; p < P; p++)
-            sdispl[p] = sdispl[p - 1] + scount[p - 1];
-        const int nsend = sdispl[P - 1] + scount[P - 1];
-        std::vector<char> sendbuf((size_t)(nsend > 0 ? nsend : 1) * row);
-        {
-            size_t k = 0;
-            for (int p = 0; p < P; p++)
-                for (int j = rbase[p]; j < rbase[p + 1]; j++)
-                    if (all[j] >= my_first && all[j] < my_end)
-                        memcpy(sendbuf.data() + (k++) * row,
-                               (char *)varinfo.base + (size_t)(all[j] - my_first) * row, row);
-        }
-
-        /* 3. Where each of this rank's rows comes from. */
-        std::vector<int> owner(n > 0 ? n : 1), rcount(P, 0), rdispl(P, 0);
+        std::vector<int> owner(n > 0 ? n : 1);
         for (long i = 0; i < n; i++)
-        {
             owner[i] = sortedsearch(varinfo.lenlist, idx[i]);
-            rcount[owner[i]]++;
-        }
-        for (int p = 1; p < P; p++)
-            rdispl[p] = rdispl[p - 1] + rcount[p - 1];
-        std::vector<char> recvbuf((size_t)(n > 0 ? n : 1) * row);
 
-        /* 4. One exchange, counted in rows. */
         MPI_Datatype rowtype;
         MPI_Type_contiguous((int)row, MPI_BYTE, &rowtype);
         MPI_Type_commit(&rowtype);
-        MPI_Alltoallv(sendbuf.data(), scount.data(), sdispl.data(), rowtype,
-                      recvbuf.data(), rcount.data(), rdispl.data(), rowtype, this->coll_comm);
-        MPI_Type_free(&rowtype);
+        std::vector<int> scount(P), sdispl(P), rcount(P), rdispl(P), next(P);
+        std::vector<char> sendbuf, recvbuf;
+        for (long k = 0; k < rounds; k++)
+        {
+            /* Rows this rank owns from every requester's slice, packed per
+             * requester in request order. */
+            for (int p = 0; p < P; p++)
+            {
+                scount[p] = 0;
+                long lo = rbase[p] + k * per, hi = rbase[p] + std::min((long)nreq[p], (k + 1) * per);
+                for (long j = lo; j < hi; j++)
+                    if (all[j] >= my_first && all[j] < my_end)
+                        scount[p]++;
+            }
+            sdispl[0] = 0;
+            for (int p = 1; p < P; p++)
+                sdispl[p] = sdispl[p - 1] + scount[p - 1];
+            const long nsend = sdispl[P - 1] + scount[P - 1];
+            sendbuf.resize((size_t)(nsend > 0 ? nsend : 1) * row);
+            size_t ks = 0;
+            for (int p = 0; p < P; p++)
+            {
+                long lo = rbase[p] + k * per, hi = rbase[p] + std::min((long)nreq[p], (k + 1) * per);
+                for (long j = lo; j < hi; j++)
+                    if (all[j] >= my_first && all[j] < my_end)
+                        memcpy(sendbuf.data() + (ks++) * row,
+                               (char *)varinfo.base + (size_t)(all[j] - my_first) * row, row);
+            }
 
-        /* 5. Received rows are grouped by owner, each group in request
-         * order: put them back in this rank's request order. */
-        std::vector<int> next(rdispl);
-        for (long i = 0; i < n; i++)
-            memcpy(out + (size_t)i * row, recvbuf.data() + (size_t)(next[owner[i]]++) * row, row);
+            /* Where this rank's own slice comes from. */
+            const long ilo = std::min(n, k * per), ihi = std::min(n, (k + 1) * per);
+            std::fill(rcount.begin(), rcount.end(), 0);
+            for (long i = ilo; i < ihi; i++)
+                rcount[owner[i]]++;
+            rdispl[0] = 0;
+            for (int p = 1; p < P; p++)
+                rdispl[p] = rdispl[p - 1] + rcount[p - 1];
+            recvbuf.resize((size_t)(ihi > ilo ? ihi - ilo : 1) * row);
+
+            MPI_Alltoallv(sendbuf.data(), scount.data(), sdispl.data(), rowtype,
+                          recvbuf.data(), rcount.data(), rdispl.data(), rowtype, this->coll_comm);
+
+            /* Received rows are grouped by owner, each group in request
+             * order: put them back in this rank's request order. */
+            next = rdispl;
+            for (long i = ilo; i < ihi; i++)
+                memcpy(out + (size_t)i * row, recvbuf.data() + (size_t)(next[owner[i]]++) * row, row);
+        }
+        MPI_Type_free(&rowtype);
+    }
+
+    /* DDSTORE_ALLTOALL_MAX_BYTES: method 0 get_batch() bytes received per
+     * rank per exchange round (default 2 MiB; read once). Must be the same
+     * on every rank: the round count is derived from it.                   */
+    static long alltoall_max_bytes()
+    {
+        static long cap = -1;
+        if (cap < 0)
+        {
+            const char *e = getenv("DDSTORE_ALLTOALL_MAX_BYTES");
+            long v = e ? atol(e) : 0;
+            cap = v > 0 ? v : 2L * 1024 * 1024;
+        }
+        return cap;
     }
 
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)

@@ -74,8 +74,13 @@ class ThreadDataLoader(DataLoader):
         return 0
 
     @staticmethod
-    def fetch(dataset, ibatch, index, pin_memory=False):
+    def fetch(dataset, ibatch, index, collate_fn=None, pin_memory=False):
+        # Collate here, in the worker, before pinning: pinning per-sample
+        # tensors and collating afterwards would just torch.stack them into
+        # a new, unpinned tensor.
         batch = [dataset[i] for i in index]
+        if collate_fn is not None:
+            batch = collate_fn(batch)
         if pin_memory:
             batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
         return (ibatch, batch)
@@ -114,6 +119,7 @@ class ThreadDataLoader(DataLoader):
                 self.dataset,
                 self._next_batch_i,
                 index,
+                collate_fn=self.collate_fn,
                 pin_memory=self.pin_memory,
             )
             self.fs.put(future)
@@ -134,8 +140,6 @@ class ThreadDataLoader(DataLoader):
         ibatch, data = future.result()
         self._inflight -= 1
         self._num_yielded += 1
-        if self.collate_fn is not None:
-            data = self.collate_fn(data)
         return data
 
     def clean(self):

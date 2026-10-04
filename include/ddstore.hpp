@@ -68,11 +68,11 @@ public:
     void join(std::string name);
 
     /* DDSTORE_PROFILE=1 counters for `name` (methods 1/2), as
-     * {calls, lock_wait_ns, mr_ns, mr_miss, read_ns, cq_ns}; all zero for
-     * method 0 or when profiling is off. Takes the variable's lock.         */
-    void profile(std::string name, unsigned long long out[6])
+     * {calls, lock_wait_ns, mr_ns, mr_miss, read_ns, cq_ns, rows}; all zero
+     * for method 0 or when profiling is off. Takes the variable's lock.     */
+    void profile(std::string name, unsigned long long out[7])
     {
-        for (int i = 0; i < 6; i++)
+        for (int i = 0; i < 7; i++)
             out[i] = 0;
         const VarInfo_t &varinfo = this->varlist.at(name);
         struct fabric_state *fs = varinfo.fabric_state;
@@ -85,6 +85,7 @@ public:
         out[3] = fs->prof_mr_miss;
         out[4] = fs->prof_read_ns;
         out[5] = fs->prof_cq_ns;
+        out[6] = fs->prof_rows;
     }
 
     /* hmem_iface: 0 (FI_HMEM_SYSTEM) for a host buffer, or an fi_hmem_iface
@@ -524,6 +525,72 @@ public:
         }
     }
 
+    /* Batched get: row i of `buffer` (n contiguous rows) receives global
+     * row idx[i]; rows may come from any ranks, in any order, with repeats.
+     * Every index is validated before anything is read. Methods 1/2 take the
+     * variable's lock once and post all n fi_read()s before waiting for any
+     * (read_batch_from_remote()); method 0 loops the per-row MPI_Get path.
+     * hmem_iface as in get().                                               */
+    template <typename T>
+    void get_batch(std::string name, const long *idx, long n, T *buffer, int hmem_iface = 0)
+    {
+        const VarInfo_t& varinfo = this->varlist.at(name);
+
+        if (varinfo.itemsize != sizeof(T))
+            throw std::invalid_argument("Invalid data type");
+        if (n <= 0)
+            return;
+
+        size_t row_bytes = (size_t)varinfo.disp * varinfo.itemsize;
+        std::vector<int> target(n);
+        std::vector<uint64_t> offset(n);
+        for (long i = 0; i < n; i++)
+        {
+            int t = sortedsearch(varinfo.lenlist, idx[i]); /* throws if out of range */
+            long first = t > 0 ? varinfo.lenlist[t - 1] : 0;
+            target[i] = t;
+            offset[i] = (uint64_t)(idx[i] - first) * row_bytes;
+        }
+
+        if (this->method == 0)
+        {
+            if (hmem_iface != 0)
+                throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
+            MPI_Win win = varinfo.win;
+            for (long i = 0; i < n; i++)
+            {
+                MPI_Win_lock(MPI_LOCK_SHARED, target[i], 0, win);
+                MPI_Get((char *)buffer + i * row_bytes, (int)row_bytes, MPI_BYTE,
+                        target[i], (MPI_Aint)(offset[i] / row_bytes),
+                        (int)row_bytes, MPI_BYTE, win);
+                MPI_Win_unlock(target[i], win);
+            }
+            return;
+        }
+
+        /* Methods 1 and 2: one lock acquisition for the whole batch. */
+        const bool prof = ddstore_profile_enabled();
+        uint64_t t_wait = prof ? ddstore_now_ns() : 0;
+        fabric_state_lock_guard lock(varinfo.fabric_state);
+        if (prof)
+        {
+            varinfo.fabric_state->prof_calls++;
+            varinfo.fabric_state->prof_lock_wait_ns += ddstore_now_ns() - t_wait;
+        }
+        if (hmem_iface != 0 && !is_hmem_capable(varinfo.fabric_state))
+            throw std::runtime_error(
+                "GPU destination buffer requires DDSTORE_FABRIC=cxi "
+                "(current fabric does not support FI_HMEM)");
+        varinfo.fabric_state->recv_data = (char *)buffer;
+        varinfo.fabric_state->recv_data_len = n * row_bytes;
+        varinfo.fabric_state->recv_hmem_iface = hmem_iface;
+        int rc = read_batch_from_remote(varinfo.fabric_state, n, target.data(),
+                                        offset.data(), row_bytes);
+        if (rc != 0)
+            throw std::runtime_error(
+                "read_batch_from_remote failed with code " + std::to_string(rc) +
+                " (" + std::to_string(n) + " rows)");
+    }
 
 private:
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)

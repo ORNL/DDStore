@@ -315,17 +315,25 @@ if __name__ == "__main__":
         if rank == 0:
             n = max(tot["calls"], 1)
             us = lambda x: 1e6 * x / n
+            us_row = lambda x: 1e6 * x / max(tot["rows"], 1)
             other = tot["py_get"] - tot["py_sync"] - tot["lock_wait"] - tot["mr"] - tot["read"] - tot["cq"]
             print(
-                "[ddstore-profile] all ranks: gets={} py_gets={} mr_miss={} ({:.1%})".format(
-                    tot["calls"], tot["py_gets"], tot["mr_miss"], tot["mr_miss"] / n
+                "[ddstore-profile] all ranks: calls={} rows={} py_calls={} mr_miss={} ({:.1%})".format(
+                    tot["calls"], tot["rows"], tot["py_gets"], tot["mr_miss"], tot["mr_miss"] / n
                 )
             )
             print(
-                "[ddstore-profile] per get (us): total={:.1f} sync={:.1f} lock_wait={:.1f} "
+                "[ddstore-profile] per call (us): total={:.1f} sync={:.1f} lock_wait={:.1f} "
                 "mr={:.1f} read={:.1f} cq={:.1f} other={:.1f}".format(
                     us(tot["py_get"]), us(tot["py_sync"]), us(tot["lock_wait"]),
                     us(tot["mr"]), us(tot["read"]), us(tot["cq"]), us(other)
+                ),
+                flush=True,
+            )
+            print(
+                "[ddstore-profile] per row (us): total={:.2f} sync={:.2f} read+cq={:.2f}".format(
+                    us_row(tot["py_get"]), us_row(tot["py_sync"]),
+                    us_row(tot["read"] + tot["cq"])
                 ),
                 flush=True,
             )

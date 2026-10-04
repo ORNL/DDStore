@@ -659,23 +659,18 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     return 0;
 }
 
-int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset)
+/* Make sure recv_data..recv_data+recv_data_len is covered by a registered
+ * recv MR. Returns 0, or 1 after printing the libfabric error.
+ *
+ * The recv MR is cached by registered region rather than exact pointer:
+ * register recv_data..recv_data+recv_data_len on a miss, and reuse the
+ * MR while later buffers lie inside [recv_mr_base, recv_mr_base +
+ * recv_mr_reg_len). Hits when the caller passes the same buffer again --
+ * e.g. PyTorch's caching allocator returning the same block for a
+ * same-shape torch.empty() -- so each get() needn't re-register.        */
+static int ensure_recv_mr(struct fabric_state *fabric_state)
 {
     bool recv_is_hmem = fabric_state->recv_hmem_iface != FI_HMEM_SYSTEM;
-    if (recv_is_hmem && !is_hmem_capable(fabric_state))
-    {
-        fprintf(stderr, "GPU (HMEM) recv buffer requested but fabric is not cxi\n");
-        return 1;
-    }
-
-    /* Cache the recv MR by registered region rather than exact pointer:
-     * register recv_data..recv_data+recv_data_len on a miss, and reuse the
-     * MR while later buffers lie inside [recv_mr_base, recv_mr_base +
-     * recv_mr_reg_len). Hits when the caller passes the same buffer again --
-     * e.g. PyTorch's caching allocator returning the same block for a
-     * same-shape torch.empty() -- so each get() needn't re-register.        */
-    const bool prof = ddstore_profile_enabled();
-    uint64_t t_mr = prof ? ddstore_now_ns() : 0;
     char  *cur_base = fabric_state->recv_data;
     size_t cur_len  = fabric_state->recv_data_len;
     bool in_cached_region =
@@ -683,72 +678,147 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         (cur_base >= fabric_state->recv_mr_base) &&
         (cur_base + cur_len <= fabric_state->recv_mr_base + fabric_state->recv_mr_reg_len);
 
-    if (!in_cached_region)
-    {
-        if (prof)
-            fabric_state->prof_mr_miss++;
-        /* Close the stale registration before creating a new one. */
-        if (fabric_state->recv_mr)
-            fi_close(&fabric_state->recv_mr->fid);
+    if (in_cached_region)
+        return 0;
 
-        int mr_rc;
-        if (recv_is_hmem)
+    if (ddstore_profile_enabled())
+        fabric_state->prof_mr_miss++;
+    /* Close the stale registration before creating a new one. */
+    if (fabric_state->recv_mr)
+    {
+        fi_close(&fabric_state->recv_mr->fid);
+        fabric_state->recv_mr = NULL;
+    }
+
+    int mr_rc;
+    if (recv_is_hmem)
+    {
+        /* GPU destination buffer (ROCr on AMD, CUDA on NVIDIA -- whichever
+         * iface the caller set). No host-staged fallback exists: either
+         * fi_mr_regattr succeeds and fi_read() DMAs straight into device
+         * memory, or it fails loudly here (checked below). */
+        struct iovec iov = {cur_base, cur_len};
+        struct fi_mr_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.mr_iov    = &iov;
+        attr.iov_count = 1;
+        attr.access    = FI_READ;
+        attr.iface     = (enum fi_hmem_iface)fabric_state->recv_hmem_iface;
+        attr.device.reserved = 0; /* ROCr/CUDA both resolve the device from the pointer */
+        mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->recv_mr);
+    }
+    else
+    {
+        mr_rc = fi_mr_reg(
+            fabric_state->domain,
+            cur_base,
+            cur_len,
+            FI_READ,
+            0, 0, 0,
+            &fabric_state->recv_mr,
+            NULL);
+    }
+    if (mr_rc != FI_SUCCESS)
+    {
+        fprintf(stderr, "%s failed: %s\n",
+                recv_is_hmem ? "fi_mr_regattr" : "fi_mr_reg",
+                fi_strerror(mr_rc));
+        fabric_state->recv_mr = NULL;
+        return 1;
+    }
+
+    /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
+     * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).         */
+    if (is_mr_endpoint(fabric_state))
+    {
+        int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
+        if (rc_mr == FI_SUCCESS)
+            rc_mr = fi_mr_enable(fabric_state->recv_mr);
+        if (rc_mr != FI_SUCCESS)
         {
-            /* GPU destination buffer (ROCr on AMD, CUDA on NVIDIA -- whichever
-             * iface the caller set). No host-staged fallback exists: either
-             * fi_mr_regattr succeeds and fi_read() below DMAs straight into
-             * device memory, or it fails loudly here (checked below). */
-            struct iovec iov = {cur_base, cur_len};
-            struct fi_mr_attr attr;
-            memset(&attr, 0, sizeof(attr));
-            attr.mr_iov    = &iov;
-            attr.iov_count = 1;
-            attr.access    = FI_READ;
-            attr.iface     = (enum fi_hmem_iface)fabric_state->recv_hmem_iface;
-            attr.device.reserved = 0; /* ROCr/CUDA both resolve the device from the pointer */
-            mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->recv_mr);
-        }
-        else
-        {
-            mr_rc = fi_mr_reg(
-                fabric_state->domain,
-                cur_base,
-                cur_len,
-                FI_READ,
-                0, 0, 0,
-                &fabric_state->recv_mr,
-                NULL);
-        }
-        if (mr_rc != FI_SUCCESS)
-        {
-            fprintf(stderr, "%s failed: %s\n",
-                    recv_is_hmem ? "fi_mr_regattr" : "fi_mr_reg",
-                    fi_strerror(mr_rc));
+            fprintf(stderr, "fi_mr_bind/fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
+            fi_close(&fabric_state->recv_mr->fid);
+            fabric_state->recv_mr = NULL;
             return 1;
         }
+    }
 
-        /* CXI (FI_MR_ENDPOINT): bind and enable recv MR before use. No-op for
-         * hsn/verbs/gni/psm2 (is_mr_endpoint() is false for those).         */
-        if (is_mr_endpoint(fabric_state))
-        {
-            int rc_mr = fi_mr_bind(fabric_state->recv_mr, &fabric_state->signal->fid, 0);
-            if (rc_mr != FI_SUCCESS)
-            {
-                fprintf(stderr, "fi_mr_bind (recv) failed: %s\n", fi_strerror(rc_mr));
-                return 1;
-            }
-            rc_mr = fi_mr_enable(fabric_state->recv_mr);
-            if (rc_mr != FI_SUCCESS)
-            {
-                fprintf(stderr, "fi_mr_enable (recv) failed: %s\n", fi_strerror(rc_mr));
-                return 1;
-            }
-        }
+    /* Record the registered region for future range checks. */
+    fabric_state->recv_mr_base    = cur_base;
+    fabric_state->recv_mr_reg_len = cur_len;
+    return 0;
+}
 
-        /* Record the registered region for future range checks. */
-        fabric_state->recv_mr_base    = cur_base;
-        fabric_state->recv_mr_reg_len = cur_len;
-    } /* end !in_cached_region */
+/* Reap at most one completion from the CQ. Returns 1 for a successful
+ * completion, -1 for an error completion (printed and consumed, so it
+ * still counts as one finished read), 0 if none is ready yet, and -2 if
+ * the CQ itself failed (nothing consumed; the caller cannot keep waiting).
+ *
+ * NOTE: CQEntry.len is NOT a reliable success signal on this provider/CQ
+ * format — it reads 0 even for host-to-host transfers independently
+ * verified to deliver correct data, so it can't be used to distinguish a
+ * real silent-no-op (observed once, for an HMEM/ROCr destination) from a
+ * normal completion. A hard check on it was tried and reverted: it
+ * false-positived on the working host path. Left unchecked deliberately. */
+static int reap_one(struct fabric_state *fabric_state)
+{
+    struct fi_cq_data_entry CQEntry = {0};
+    ssize_t rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
+    if (rc == 1)
+        return 1;
+    if (rc == -FI_EAGAIN)
+        return 0;
+    if (rc == -FI_EAVAIL)
+    {
+        struct fi_cq_err_entry ee = {0};
+        fi_cq_readerr(fabric_state->cq_signal, &ee, 0);
+        /* prov_errno is provider-specific; fi_strerror() is only valid
+         * for generic fi_errno values. Use fi_cq_strerror() to get the
+         * correct provider-aware error string (provider-agnostic fix,
+         * applies to every provider, not just cxi).                      */
+        char errbuf[256];
+        const char *errstr = fi_cq_strerror(fabric_state->cq_signal,
+                                             ee.prov_errno, ee.err_data,
+                                             errbuf, sizeof(errbuf));
+        fprintf(stderr,
+                "fi_cq_read failed: err=%d (%s) prov_errno=%d (%s)\n",
+                ee.err, fi_strerror(ee.err), ee.prov_errno,
+                errstr ? errstr : "(unknown)");
+        return -1;
+    }
+    fprintf(stderr, "fi_cq_read failed: %zd (%s)\n", rc, fi_strerror((int)-rc));
+    return -2;
+}
+
+/* Read n rows of row_len bytes into recv_data (recv_data_len must be
+ * n * row_len): row i comes from rank src[i] at byte offset offset[i] of
+ * its registered buffer, into recv_data + i * row_len.
+ *
+ * All n fi_read()s are posted back to back and only then waited for, so
+ * the round trips overlap on the network; one recv MR covers the whole
+ * buffer. Returns 0, or non-zero if any read failed.
+ *
+ * Every read that was posted is waited for before returning, even after
+ * an error: a completion left in the CQ would be taken as the next call's.
+ * This also makes the call blocking, which is load-bearing for a GPU
+ * (recv_hmem_iface != FI_HMEM_SYSTEM) destination: it keeps the caller's
+ * device buffer alive (still referenced on the Python stack, so PyTorch's
+ * caching allocator cannot reuse its storage) for the whole in-flight RDMA
+ * window. If this is ever made asynchronous, GPU buffer safety must be
+ * re-examined.                                                           */
+int read_batch_from_remote(struct fabric_state *fabric_state, long n,
+                           const int *src, const uint64_t *offset, size_t row_len)
+{
+    if (fabric_state->recv_hmem_iface != FI_HMEM_SYSTEM && !is_hmem_capable(fabric_state))
+    {
+        fprintf(stderr, "GPU (HMEM) recv buffer requested but fabric is not cxi\n");
+        return 1;
+    }
+
+    const bool prof = ddstore_profile_enabled();
+    uint64_t t_mr = prof ? ddstore_now_ns() : 0;
+    if (ensure_recv_mr(fabric_state) != 0)
+        return 1;
 
     void *memory_descriptor = NULL;
     /* HMEM (device) buffers need their local descriptor passed to fi_read()
@@ -757,10 +827,8 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
      * build (is_local_mr_req() is always false here), so without this the
      * descriptor stayed NULL for HMEM too and fi_read() silently no-op'd
      * instead of DMAing into the GPU buffer.                                  */
-    if (is_local_mr_req(fabric_state) || recv_is_hmem)
-    {
+    if (is_local_mr_req(fabric_state) || fabric_state->recv_hmem_iface != FI_HMEM_SYSTEM)
         memory_descriptor = fi_mr_desc(fabric_state->recv_mr);
-    }
 
     uint64_t t_read = 0;
     if (prof)
@@ -769,34 +837,42 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         fabric_state->prof_mr_ns += t_read - t_mr;
     }
 
-    size_t rc;
-    // fprintf(stderr, "fabric_state->remote_address: %llu\n", fabric_state->remote_address[src]);
-    do
+    long posted = 0, done = 0;
+    int failed = 0;
+    for (long i = 0; i < n && !failed; i++)
     {
-        rc = fi_read(
-            fabric_state->signal,
-            fabric_state->recv_data,
-            fabric_state->recv_data_len,
-            memory_descriptor,
-            fabric_state->comm_partner[src],
-            fabric_state->remote_address[src] + offset,
-            fabric_state->remote_key[src],
-            NULL);
-    } while (rc == -EAGAIN);
-    if (rc != 0)
-    {
-        fprintf(stderr, "fi_read failed with code %zu.\n", rc);
-        return (rc);
+        for (;;)
+        {
+            ssize_t rc = fi_read(
+                fabric_state->signal,
+                fabric_state->recv_data + (size_t)i * row_len,
+                row_len,
+                memory_descriptor,
+                fabric_state->comm_partner[src[i]],
+                fabric_state->remote_address[src[i]] + offset[i],
+                fabric_state->remote_key[src[i]],
+                NULL);
+            if (rc == 0)
+            {
+                posted++;
+                break;
+            }
+            if (rc != -FI_EAGAIN)
+            {
+                fprintf(stderr, "fi_read failed: %zd (%s)\n", rc, fi_strerror((int)-rc));
+                failed = 1;
+                break;
+            }
+            /* Transmit queue full: make progress by reaping a completion. */
+            int r = reap_one(fabric_state);
+            if (r == -2)
+                return 1; /* CQ broken: cannot account for in-flight reads */
+            if (r != 0)
+                done++;
+            if (r < 0)
+                failed = 1;
+        }
     }
-
-    // (2025/09) segfault when using providers other than sockets
-    // struct fi_cq_data_entry CQEntry = {0};
-    // rc = fi_cq_sread(fabric_state->cq_signal, &CQEntry, 1, NULL, -1);
-    // if (rc < 1)
-    // {
-    //     fprintf(stderr, "Received no completion event for remote read\n");
-    //     return 1;
-    // }
 
     uint64_t t_cq = 0;
     if (prof)
@@ -805,51 +881,32 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
         fabric_state->prof_read_ns += t_cq - t_read;
     }
 
-    /* This loop blocks until the transfer completes — read_from_remote() does
-     * not return until it does. For a GPU (recv_hmem_iface != FI_HMEM_SYSTEM)
-     * destination, this is load-bearing: it's what keeps the caller's device
-     * buffer alive (still
-     * referenced on the Python stack, so PyTorch's caching allocator cannot
-     * reuse its storage) for the entire in-flight RDMA window. If this call
-     * is ever made asynchronous, GPU buffer safety must be re-examined.       */
-    for (;;)
+    /* Wait for every posted read, successful or not. */
+    while (done < posted)
     {
-        struct fi_cq_data_entry CQEntry = {0};
-        rc = fi_cq_read(fabric_state->cq_signal, &CQEntry, 1);
-        if (rc == 1)
-        {
-            if (prof)
-                fabric_state->prof_cq_ns += ddstore_now_ns() - t_cq;
-            /* NOTE: CQEntry.len is NOT a reliable success signal on this
-             * provider/CQ format — it reads 0 even for host-to-host
-             * transfers independently verified to deliver correct data, so
-             * it can't be used to distinguish a real silent-no-op (observed
-             * once, for an HMEM/ROCr destination) from a normal completion.
-             * A hard check on it was tried and reverted: it false-positived
-             * on the working host path. Left unchecked deliberately.        */
-            break;
-        }
-        if (rc == -FI_EAVAIL)
-        {
-            struct fi_cq_err_entry ee = {0};
-            fi_cq_readerr(fabric_state->cq_signal, &ee, 0);
-            /* prov_errno is provider-specific; fi_strerror() is only valid
-             * for generic fi_errno values. Use fi_cq_strerror() to get the
-             * correct provider-aware error string (provider-agnostic fix,
-             * applies to every provider, not just cxi).                      */
-            char errbuf[256];
-            const char *errstr = fi_cq_strerror(fabric_state->cq_signal,
-                                                 ee.prov_errno, ee.err_data,
-                                                 errbuf, sizeof(errbuf));
-            fprintf(stderr,
-                    "fi_cq_read failed: err=%d (%s) prov_errno=%d (%s)\n",
-                    ee.err, fi_strerror(ee.err), ee.prov_errno,
-                    errstr ? errstr : "(unknown)");
+        int r = reap_one(fabric_state);
+        if (r == -2)
             return 1;
-        }
+        if (r != 0)
+            done++;
+        if (r < 0)
+            failed = 1;
     }
 
-    return 0;
+    if (prof)
+    {
+        fabric_state->prof_cq_ns += ddstore_now_ns() - t_cq;
+        fabric_state->prof_rows += n;
+    }
+    return failed;
+}
+
+/* Single-row read into recv_data/recv_data_len from rank src at byte
+ * offset `offset`: a one-row batch. */
+int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset)
+{
+    return read_batch_from_remote(fabric_state, 1, &src, &offset,
+                                  fabric_state->recv_data_len);
 }
 
 /* =========================================================================

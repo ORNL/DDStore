@@ -7,6 +7,9 @@ from torch.utils.data import Dataset
 
 import pyddstore as dds
 
+# DDSTORE_BATCH_GET=0: __getitems__ falls back to one get() per sample.
+_BATCH_GET = os.environ.get("DDSTORE_BATCH_GET", "1") != "0"
+
 
 def nsplit(a, n):
     k, m = divmod(len(a), n)
@@ -162,6 +165,26 @@ class DistDataset(Dataset):
     def __getitem__(self, idx):
         return self.get(idx, device=self.device)
 
+    def __getitems__(self, indices):
+        """Whole-batch fetch, called by DataLoader (and ThreadDataLoader) with
+        a batch's indices: one PyDDStore.get_batch() per variable instead of
+        one get() per sample. DDSTORE_BATCH_GET=0 falls back to per-sample
+        get() (for A/B comparison)."""
+        if not _BATCH_GET:
+            return [self.get(i, device=self.device) for i in indices]
+        n = len(indices)
+        label = np.zeros(n, dtype=np.int32)
+        if self.device is not None:
+            val = torch.empty((n, self.data_disp), dtype=torch.float32, device=self.device)
+        else:
+            val = np.zeros((n, self.data_disp), dtype=np.float32)
+        self.ddstore.get_batch(f"{self.label}data", val, indices)
+        self.ddstore.get_batch(f"{self.label}labels", label, indices)
+        if self.device is None:
+            val = torch.from_numpy(val)
+        val = val.reshape(n, 1, self.side, self.side)
+        return [(val[i], label[i]) for i in range(n)]
+
 
 class DistDatasetReader(Dataset):
     """Distributed dataset class — extra (read-only) member.
@@ -224,3 +247,23 @@ class DistDatasetReader(Dataset):
 
     def __getitem__(self, idx):
         return self.get(idx, device=self.device)
+
+    def __getitems__(self, indices):
+        """Whole-batch fetch, called by DataLoader (and ThreadDataLoader) with
+        a batch's indices: one PyDDStore.get_batch() per variable instead of
+        one get() per sample. DDSTORE_BATCH_GET=0 falls back to per-sample
+        get() (for A/B comparison)."""
+        if not _BATCH_GET:
+            return [self.get(i, device=self.device) for i in indices]
+        n = len(indices)
+        label = np.zeros(n, dtype=np.int32)
+        if self.device is not None:
+            val = torch.empty((n, self.data_disp), dtype=torch.float32, device=self.device)
+        else:
+            val = np.zeros((n, self.data_disp), dtype=np.float32)
+        self.ddstore.get_batch(f"{self.label}data", val, indices)
+        self.ddstore.get_batch(f"{self.label}labels", label, indices)
+        if self.device is None:
+            val = torch.from_numpy(val)
+        val = val.reshape(n, 1, self.side, self.side)
+        return [(val[i], label[i]) for i in range(n)]

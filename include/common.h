@@ -111,7 +111,8 @@ extern "C"
          * prof_lock_wait_ns is the time spent waiting to acquire recv_lock;
          * mr = recv-MR cache check / (re)registration; read = posting
          * fi_read(); cq = polling the CQ until the read completes.          */
-        uint64_t prof_calls;
+        uint64_t prof_calls;  /* get() / get_batch() calls              */
+        uint64_t prof_rows;   /* rows read by those calls               */
         uint64_t prof_lock_wait_ns;
         uint64_t prof_mr_ns;
         uint64_t prof_mr_miss;
@@ -190,6 +191,11 @@ extern "C"
     void init_fabric(struct fabric_state *fabric);
     int handshake(struct fabric_state *fabric_state, MPI_Comm comm);
     int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset);
+    /* n rows of row_len bytes into recv_data (recv_data_len == n * row_len);
+     * row i from rank src[i] at byte offset offset[i]. All reads are posted
+     * before any is waited for. 0 on success. See common.cxx.             */
+    int read_batch_from_remote(struct fabric_state *fabric_state, long n,
+                               const int *src, const uint64_t *offset, size_t row_len);
 
     /* --- Method 2: file-based handshake ---------------------------------- */
 

@@ -109,6 +109,7 @@ cdef extern from "ddstore.hpp":
         DDStore(int method, string handshake_dir, int n_core)
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except + nogil
+        void get_batch[T](string name, const long *idx, long n, T* buffer, int hmem_iface) except + nogil
         void epoch_begin()
         void epoch_end()
         void free()
@@ -297,20 +298,75 @@ cdef class PyDDStore:
             self._prof_get_s += time.perf_counter() - t_get
             self._prof_gets += 1
 
+    def get_batch(self, str name, arr, indices):
+        """Read rows `indices` (global row ids, any order, repeats allowed)
+        into `arr`, whose first dimension must equal len(indices): row i of
+        `arr` receives row indices[i]. Same buffer rules as get(); for
+        method 1/2 all reads of the batch are in flight together, under one
+        lock acquisition and (GPU destination) one device sync."""
+        cdef double t_get = time.perf_counter() if self._prof else 0.0
+        cdef double t_sync
+        cdef np.ndarray idx = np.ascontiguousarray(indices, dtype=np.int64)
+        if idx.ndim != 1:
+            raise ValueError("indices must be one-dimensional")
+        cdef long n = idx.shape[0]
+        if arr.shape[0] != n:
+            raise ValueError(
+                "arr has %d rows but %d indices were given" % (arr.shape[0], n))
+        cdef const long *cidx = <const long *> idx.data
+        cdef size_t ptr
+        cdef int itemsize
+        cdef int iface
+        cdef bint is_gpu = _is_cuda_tensor(arr)
+        _check_dtype(arr, is_gpu)
+        if is_gpu:
+            _check_gpu_fabric_preconditions(self.method, "GPU destination buffer")
+            assert arr.is_contiguous()
+            import torch
+            # Same reason as get(), once per batch.
+            if self._prof:
+                t_sync = time.perf_counter()
+                torch.cuda.synchronize(device=arr.device)
+                self._prof_sync_s += time.perf_counter() - t_sync
+            else:
+                torch.cuda.synchronize(device=arr.device)
+            ptr = arr.data_ptr()
+            itemsize = arr.element_size()
+            iface = _hmem_iface_for(arr)
+        else:
+            assert arr.flags.c_contiguous
+            ptr = arr.ctypes.data
+            itemsize = arr.itemsize
+            iface = 0
+
+        cdef string cname = s2b(name)
+        with nogil:
+            if itemsize == 1:
+                self.c_ddstore.get_batch(cname, cidx, n, <char *> ptr, iface)
+            elif itemsize == 4:
+                self.c_ddstore.get_batch(cname, cidx, n, <int *> ptr, iface)
+            else:
+                self.c_ddstore.get_batch(cname, cidx, n, <long *> ptr, iface)
+        if self._prof:
+            self._prof_get_s += time.perf_counter() - t_get
+            self._prof_gets += 1
+
     def get_profile(self, str name):
         """DDSTORE_PROFILE=1 timing for `name` (methods 1/2), in seconds.
 
-        C++ counters for this variable: calls, lock_wait, mr (recv-MR cache
-        check/registration), mr_miss (re-registrations), read (posting
-        fi_read), cq (waiting for completion). Python counters for this
+        C++ counters for this variable: calls (get + get_batch), rows,
+        lock_wait, mr (recv-MR cache check/registration), mr_miss
+        (re-registrations), read (posting fi_read), cq (waiting for
+        completion). Python counters for this
         store, across all variables: py_gets, py_get (whole get() calls),
         py_sync (torch.cuda.synchronize on the GPU-destination path).
         """
-        cdef unsigned long long c[6]
+        cdef unsigned long long c[7]
         self.c_ddstore.profile(s2b(name), c)
         return {
             "calls": c[0], "lock_wait": c[1] * 1e-9, "mr": c[2] * 1e-9,
             "mr_miss": c[3], "read": c[4] * 1e-9, "cq": c[5] * 1e-9,
+            "rows": c[6],
             "py_gets": self._prof_gets, "py_get": self._prof_get_s,
             "py_sync": self._prof_sync_s,
         }

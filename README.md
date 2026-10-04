@@ -152,6 +152,22 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 ---
 
+### `get_batch(name, arr, indices)`
+
+Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into `arr`: row `i` of `arr` receives row `indices[i]`, so `arr.shape[0]` must equal `len(indices)` (else `ValueError`). Same buffer rules as `get()` (NumPy array or CUDA/HIP tensor). Every index is checked before anything is read; an out-of-range one raises `IndexError` and leaves the store usable.
+
+For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is still one `fi_read` per row. `method=0` loops the per-row `MPI_Get` path.
+
+```python
+idx = np.array([2048, 7, 4096, 7])
+out = np.zeros((len(idx), 64), dtype=np.float32)
+store.get_batch("features", out, idx)
+```
+
+`DistDataset`/`DistDatasetReader` use it through `__getitems__`, which PyTorch's `DataLoader` (and `ThreadDataLoader`) calls with a whole batch's indices; `DDSTORE_BATCH_GET=0` falls back to one `get()` per sample.
+
+---
+
 ### `join(name)`
 
 `method=2` extra member only. Discovers a variable published by the core group by polling the handshake directory until the combined record file (`{name}.bin`) written by core rank 0 reaches its expected size (up to `DDSTORE_HANDSHAKE_TIMEOUT_S` seconds), then registers it for `get()`.
@@ -361,6 +377,8 @@ Measured with `vae-ddp.py`, `method=1`, `cxi`, 2 Frontier nodes × 8 ranks, `VAE
 
 On the host path one worker thread (background prefetch) cuts epoch time ~30%; more workers make it steadily worse as they contend for the per-variable lock and the GIL. On the GPU path threading doesn't help, because of the per-call whole-device sync. All runs finished with the same final loss. Recommended: `--num-workers=1` on the host path, `0` on the GPU path.
 
+These numbers use one `get()` per sample. With batched get (the default now; see [get_batch](#get_batchname-arr-indices) and the measurements under [Profiling](#profiling-get-ddstore_profile1)), every configuration is faster and the GPU path no longer suffers from workers.
+
 The table predates moving batch collation into the worker thread (`ThreadDataLoader.fetch()`); with that change, the host path measured fetch ≈ 0.006 s / total ≈ 0.15 s per epoch with 1 worker and 0.044 / 0.19 with 2 (GPU path with 1 worker unchanged at 0.09 / 0.25).
 
 ```bash
@@ -407,6 +425,17 @@ Measured on Frontier (`method=1`, `cxi`, 2 nodes × 8 ranks):
 - `bench_get.py`, one thread, µs per single-row `get()`: 3 KB — host 8.6, GPU 19.5 (12.2 reusing the buffer); 12.5 KB — host 9.9, GPU 20.5; 200 KB — host 53, GPU 37; 1 MB — host 206–276, GPU 134. GPUDirect wins from somewhere between 12.5 KB and 200 KB per row; below that its fixed per-call overhead (sync, allocation) dominates.
 - A second thread adds no per-rank throughput: the per-variable lock serializes the transfers (lock wait ≈ transfer time at large rows).
 
+With `get_batch()` (`bench_get.py --batch 128`, µs per row, 1 thread): 3 KB — host 0.68, GPU 0.78 (from 9.0 / 20.9 with one row per call); 12.5 KB — host 1.82, GPU 1.38; 200 KB — host 27.5, GPU 19.6; 1 MB — host 189, GPU 99 (~10.6 GB/s per rank). The GPU sync drops to ~0.06 µs per row, and GPUDirect now beats host from 12.5 KB rows up. (Host-destination batches of 1 MB rows are slower than single reads; not investigated.)
+
+VAE (`vae-ddp.py`, epochs 2–8 average, s/epoch), per-sample `get()` → batched (`DDSTORE_BATCH_GET` 0 → 1); losses identical (8.8960 at S=1, 30.0178 at S=2):
+
+| `--image-scale` | host, 0 workers | host, 1 worker | GPU, 0 workers | GPU, 1 worker | GPU, 2 workers |
+|---|---|---|---|---|---|
+| 1 | 0.247 → 0.132 | 0.156 → 0.126 | 0.263 → 0.135 | 0.259 → 0.127 | 0.403 → 0.134 |
+| 2 | 0.395 → 0.286 | 0.293 → 0.265 | 0.428 → 0.277 | 0.416 → 0.264 | 0.518 → 0.297 |
+
+The per-row GPU sync falls from 129–383 µs (with workers) to ~0.1 µs, and training compute time recovers because it no longer waits behind the workers' syncs.
+
 ## Testing
 
 ### Unit tests (pytest)
@@ -440,6 +469,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_single.py` | 1 | All dtypes, `add`/`get`, `init`/`update`/`get`, error handling, double `free()` |
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
+| `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads; method 0, plus method 1 over `cxi` inside a Slurm step |
 
 ### Integration scripts
 

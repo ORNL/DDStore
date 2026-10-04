@@ -69,8 +69,12 @@ class ThreadDataLoader(DataLoader):
     def fetch(dataset, ibatch, index, collate_fn=None, pin_memory=False):
         # Collate here, in the worker, before pinning: pinning per-sample
         # tensors and collating afterwards would just torch.stack them into
-        # a new, unpinned tensor.
-        batch = [dataset[i] for i in index]
+        # a new, unpinned tensor. Use the dataset's whole-batch fetch when it
+        # has one, like torch's own map-style fetcher.
+        if getattr(dataset, "__getitems__", None):
+            batch = dataset.__getitems__(index)
+        else:
+            batch = [dataset[i] for i in index]
         if collate_fn is not None:
             batch = collate_fn(batch)
         if pin_memory:

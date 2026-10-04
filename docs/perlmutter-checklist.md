@@ -48,3 +48,20 @@ Notes:
 - If colocate fails the same way as on Frontier, the README's limitation
   applies to both machines; if it works, note which `SwitchParameters`
   Perlmutter uses.
+
+## Results (job 59332134, 2026-10-04)
+
+- VNIs per step: `<own>,<job>` with the job VNI last; the wrapper rule holds.
+- NICs: ranks spread over `cxi0`–`cxi3`.
+- Tests: test_single 14/14, test_multirank 5/5, test_get_batch 20/20 on 8
+  ranks, test_gpu_rdma 14/14 (first CUDA GPUDirect run of this branch).
+- VAE: identical losses for every variant (S=1 15.3781, S=2 54.7914);
+  batched reads 1.9–3.9x faster per epoch (method 0 0.849 → 0.219 s).
+- core/extra split-node (host and `--gpu-dest`): pass, with or without the
+  `--network` flags (single-node steps fall back to a default CXI service).
+- colocate: works only with `job_vni` + the VNI wrapper + `srun --overlap`.
+  (Frontier fails the same setup with `Error configuring interconnect`.)
+- bench: host beats GPU destinations at every row size on Perlmutter
+  (1 MB rows: 75 vs 142 us/row at batch 128); on Frontier GPU wins from 12.5 KB.
+- The first version of the script printed empty loss columns (`srun -l`
+  pads rank labels only with >= 10 ranks); fixed.

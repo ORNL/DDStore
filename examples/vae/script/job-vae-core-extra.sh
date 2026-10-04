@@ -35,8 +35,11 @@ Options:
                  (needed for --gpu-source; the baseline core step doesn't
                  use one).
   --layout=X     Process distribution: colocate (core and extra both span
-                 every allocated node) or split-node (core gets 1 node,
-                 extra gets the rest). Default: colocate.
+                 every allocated node, steps run with --overlap) or
+                 split-node (core gets --core-nnodes nodes, extra the rest).
+                 Colocate works on Perlmutter but not on Frontier, where the
+                 second step fails with "Error configuring interconnect";
+                 use split-node there. Default: colocate.
   --core-nnodes=N  Number of nodes for the core step in split-node layout.
                  Ignored in colocate layout. Default: 1.
   --num-workers=N  DataLoader workers for the extra (training) step. 0 uses
@@ -105,6 +108,8 @@ sleep 2
 if [ "$LAYOUT" == "colocate" ]; then
     CORE_NNODES=$SLURM_NNODES
     EXTRA_NNODES=$SLURM_NNODES
+    # Both steps share the nodes; Perlmutter needs --overlap for that.
+    OVERLAP=--overlap
 else
     CORE_NNODES="${CORE_NNODES_OPT:-1}"
     EXTRA_NNODES=$((SLURM_NNODES - CORE_NNODES))
@@ -118,12 +123,12 @@ echo "DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYO
 echo "CORE_NNODES=$CORE_NNODES CORE_NTASKS=$CORE_NTASKS CORE_GPUS_PER_TASK=$CORE_GPUS_PER_TASK CORE_EXTRA_ARGS=\"$CORE_EXTRA_ARGS\" REPLICATE=$REPLICATE IMAGE_SCALE=$IMAGE_SCALE"
 echo "EXTRA_NNODES=$EXTRA_NNODES EXTRA_NTASKS=$EXTRA_NTASKS EXTRA_EXTRA_ARGS=\"$EXTRA_EXTRA_ARGS\" NUM_WORKERS=$NUM_WORKERS"
 
-MASTER_PORT=8889 srun -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-task=$CORE_GPUS_PER_TASK --cpu-bind=verbose,core -l \
+MASTER_PORT=8889 srun ${OVERLAP:-} -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-task=$CORE_GPUS_PER_TASK --cpu-bind=verbose,core -l \
     bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_core_server.py ddstore_hs_vae --replicate=$REPLICATE --image-scale=$IMAGE_SCALE $CORE_EXTRA_ARGS \
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /') &
 sleep 5
 
-MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun -N$EXTRA_NNODES -n$EXTRA_NTASKS -c6 --gpus-per-task=1 --cpu-bind=verbose,core -l \
+MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun ${OVERLAP:-} -N$EXTRA_NNODES -n$EXTRA_NTASKS -c6 --gpus-per-task=1 --cpu-bind=verbose,core -l \
     bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS $EXTRA_EXTRA_ARGS \
     > >(sed 's/^/[extr] /') 2> >(sed 's/^/[extr] /')
 sleep 5

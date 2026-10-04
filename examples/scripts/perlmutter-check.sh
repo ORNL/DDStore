@@ -75,7 +75,8 @@ vae() {  # tag, env..., -- args...
   rm -rf ddstore_hs*
   env "${envs[@]}" $SRUN -l python -u examples/vae/vae-ddp.py --epochs 8 "$@" > $OUT/vae-$tag.log 2>&1
   local rc=$?
-  local loss=$(grep -h ' 0: ====> Epoch: 8 Average' $OUT/vae-$tag.log | awk '{print $NF}')
+  # srun -l pads the rank label only with >= 10 ranks: match ' 0:' and '0:'
+  local loss=$(grep -hE '^ *0: ====> Epoch: 8 Average' $OUT/vae-$tag.log | awk '{print $NF}')
   local ep=$(grep -h '\[profile\]' $OUT/vae-$tag.log | awk '{f=$5;c=$6;sub("fetch=","",f);sub("s","",f);sub("compute=","",c);sub("s","",c);F+=f;C+=c;n++} END{if(n)printf "fetch=%.3f compute=%.3f total=%.3f",F/n,C/n,(F+C)/n}')
   say "$(printf '%-22s' $tag) rc=$rc loss8=$loss $ep errors=$(grep -ciE 'traceback|error|abort' $OUT/vae-$tag.log)"
 }
@@ -106,14 +107,15 @@ corextra() {  # tag, core srun opts, extra srun opts, extra-args
       > $OUT/ce-$tag-extra.log 2>&1
   local erc=$?
   wait $cpid; local crc=$?
-  say "$(printf '%-22s' $tag) extra rc=$erc epoch3=$(grep -h ' 0: ====> Epoch: 3 Average' $OUT/ce-$tag-extra.log | awk '{print $NF}') core rc=$crc core_done=$(grep -c 'core rank [0-9]*\] done' $OUT/ce-$tag-core.log)/$NR errors=$(cat $OUT/ce-$tag-*.log | grep -ciE 'traceback|error|abort|VNI_NOT|PTLTE|interconnect')"
+  say "$(printf '%-22s' $tag) extra rc=$erc epoch3=$(grep -hE '^ *0: ====> Epoch: 3 Average' $OUT/ce-$tag-extra.log | awk '{print $NF}') core rc=$crc core_done=$(grep -c 'core rank [0-9]*\] done' $OUT/ce-$tag-core.log)/$NR errors=$(cat $OUT/ce-$tag-*.log | grep -ciE 'traceback|error|abort|VNI_NOT|PTLTE|interconnect')"
   grep -hoE "Error configuring interconnect|VNI_NOT_FOUND|fi_domain\(\) has failed" $OUT/ce-$tag-*.log | sort | uniq -c | sed 's/^/    /' | tee -a "$SUM"
 }
 corextra split_host   "-N1 -n$NR --relative=0 -c$CPT --gpus-per-task=0" "-N1 -n$NR --relative=1 -c$CPT --gpus-per-task=1" "--num-workers=1"
 corextra split_gpudest "-N1 -n$NR --relative=0 -c$CPT --gpus-per-task=0" "-N1 -n$NR --relative=1 -c$CPT --gpus-per-task=1" "--num-workers=1 --gpu-dest"
-# colocate: both steps on both nodes at once (fails on Frontier with job_vni).
+# colocate: both steps on both nodes at once. Needs --overlap on Perlmutter
+# (works there with job_vni + the wrapper); fails on Frontier either way.
 # Core ranks split as NR/2 per node so --n-core still equals NR.
-corextra colocate_host "-N2 -n$NR -c8 --gpus-per-task=0" "-N2 -n$NR -c16 --gpus-per-task=1" "--num-workers=1"
+corextra colocate_host "--overlap -N2 -n$NR -c8 --gpus-per-task=0" "--overlap -N2 -n$NR -c16 --gpus-per-task=1" "--num-workers=1"
 
 # ---------------------------------------------------------------- bench
 section "bench_get.py (method 1, host/GPU, 1 row vs 128 rows per call; us/row)"

@@ -228,7 +228,7 @@ The backend itself is not an environment variable in the library: pass `method=`
 
 | Variable | Effect |
 |---|---|
-| `SLINGSHOT_VNIS` | Set by Slurm per step. With `--network=job_vni`, keep only the last (job-wide) entry before starting Python so separate `srun` steps can reach each other — see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi-frontier). |
+| `SLINGSHOT_VNIS` | Set by Slurm per step. With `--network=job_vni`, keep only the last (job-wide) entry before starting Python so separate `srun` steps can reach each other — see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi). |
 | `GPU_MAX_HW_QUEUES` | ROCm hardware queues per GPU per process (default 4); raise it if data-loading threads use their own streams — see [HIP streams](#hip-streams-and-hardware-queues-amdrocm). |
 
 ## Backends
@@ -322,7 +322,7 @@ The sync in `get()` was re-checked by removing it: every `--gpu-dest` run of `va
 
 ## Known Limitations
 
-### Multiple `srun` steps in one job (`method=2`, `cxi`, Frontier)
+### Multiple `srun` steps in one job (`method=2`, `cxi`)
 
 Core and extra run as separate `srun` steps, and on Slingshot every step gets its own VNI (network isolation ID); two endpoints can only communicate on the same VNI. Two things are needed, both handled by [job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh):
 
@@ -330,6 +330,17 @@ Core and extra run as separate `srun` steps, and on Slingshot every step gets it
 2. In each task, keep only the job VNI: `export SLINGSHOT_VNIS=${SLINGSHOT_VNIS##*,}` before starting Python. libfabric's cxi provider uses only the first VNI listed, i.e. the per-step one, so without this the extra side's reads fail with `fi_cq_read ... prov_errno=25 (VNI_NOT_FOUND)`.
 
 Verified on Frontier (2 nodes, split-node, `method=2`, `cxi`): with both, the extra step trains against the core step's data and both shut down cleanly; with either missing, it fails as above. MPI and RCCL inside each step work on the job VNI too.
+
+On Perlmutter the VNI order is the same (`<step VNI>,<job VNI>`), so the same wrapper works. Single-node steps there run even without `single_node_vni` (they get no `SLINGSHOT_*` variables but cxi falls back to a default CXI service), so split-node works with or without the flags; with them it behaves as on Frontier.
+
+**Colocate** (core and extra steps on the same nodes at once):
+
+| | `job_vni` + wrapper | `job_vni` + wrapper + `srun --overlap` | no `--network` |
+|---|---|---|---|
+| Frontier | second step fails to launch: `Error configuring interconnect` | same failure | steps launch, but each has only its own VNI: extra cannot reach core |
+| Perlmutter | second step does not start (timeout) | **works** | extra cannot reach core (timeout) |
+
+`job-vae-core-extra.sh --layout=colocate` therefore runs both steps with `--overlap`; on Frontier use `--layout=split-node`.
 
 ### `get()` has no GPU destination-buffer pool
 
@@ -353,9 +364,9 @@ HIP maps streams onto a small pool of hardware queues per GPU per process — `G
 
 On Frontier, the GPU synchronization performed before each RDMA call (needed for correctness) can outweigh the benefit of skipping the host copy for small, per-sample transfers — GPU-to-GPU has not shown a speed advantage there yet, though results are correct either way. Larger, batched transfers should benefit more; that usage pattern isn't built yet.
 
-### Troubleshooting: RDMA fails to connect (`cxi`, Frontier)
+### Troubleshooting: RDMA fails to connect (`cxi`)
 
-If `fi_domain()` fails with `-38 (Function not implemented)` on `cxi`, the step has no CXI service: add `#SBATCH --network=single_node_vni` — needed whenever a step runs on a single node (a `-N 1` job, or a one-node step inside a larger job). If ranks in different `srun` steps can't reach each other (`VNI_NOT_FOUND`), see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi-frontier) above.
+If `fi_domain()` fails with `-38 (Function not implemented)` on `cxi`, the step has no CXI service: add `#SBATCH --network=single_node_vni` — needed on Frontier whenever a step runs on a single node (a `-N 1` job, or a one-node step inside a larger job). If ranks in different `srun` steps can't reach each other (`VNI_NOT_FOUND`), see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi) above.
 
 ## Partitioned / Sub-communicator Usage
 
@@ -455,7 +466,9 @@ Measured on Frontier (`method=1`, `cxi`, 2 nodes × 8 ranks):
 - `bench_get.py`, one thread, µs per single-row `get()`: 3 KB — host 8.6, GPU 19.5 (12.2 reusing the buffer); 12.5 KB — host 9.9, GPU 20.5; 200 KB — host 53, GPU 37; 1 MB — host 206–276, GPU 134. GPUDirect wins from somewhere between 12.5 KB and 200 KB per row; below that its fixed per-call overhead (sync, allocation) dominates.
 - A second thread adds no per-rank throughput: the per-variable lock serializes the transfers (lock wait ≈ transfer time at large rows).
 
-With `get_batch()` (`bench_get.py --batch 128`, µs per row, 1 thread): 3 KB — host 0.68, GPU 0.78 (from 9.0 / 20.9 with one row per call); 12.5 KB — host 1.82, GPU 1.38; 200 KB — host 27.5, GPU 19.6; 1 MB — host 189, GPU 99 (~10.6 GB/s per rank). The GPU sync drops to ~0.06 µs per row, and GPUDirect now beats host from 12.5 KB rows up. (Host-destination batches of 1 MB rows are slower than single reads; not investigated.)
+With `get_batch()` (`bench_get.py --batch 128`, µs per row, 1 thread): 3 KB — host 0.68, GPU 0.78 (from 9.0 / 20.9 with one row per call); 12.5 KB — host 1.82, GPU 1.38; 200 KB — host 27.5, GPU 19.6; 1 MB — host 189, GPU 99 (~10.6 GB/s per rank). The GPU sync drops to ~0.06 µs per row, and GPUDirect now beats host from 12.5 KB rows up on Frontier. (Host-destination batches of 1 MB rows are slower than single reads there; not investigated.)
+
+The crossover is platform-dependent. On Perlmutter (A100, 2 nodes × 4 ranks, batch 128, µs per row): 3 KB — host 0.82, GPU 0.99; 12.5 KB — host 1.19, GPU 1.80; 1 MB — host 75, GPU 142 (~14 vs ~7.4 GB/s per rank). There host destinations are faster at every size; with batching the two are close for small rows on both machines. VAE on Perlmutter (8 ranks, s/epoch, per-sample → batched): method 1 host 0.398 → 0.208, method 1 GPU 0.508 → 0.204, GPU with 2 workers 0.678 → 0.183, method 0 0.849 → 0.219; losses identical across all variants.
 
 VAE (`vae-ddp.py`, epochs 2–8 average, s/epoch), per-sample `get()` → batched (`DDSTORE_BATCH_GET` 0 → 1); losses identical (8.8960 at S=1, 30.0178 at S=2):
 

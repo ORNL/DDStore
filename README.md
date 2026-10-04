@@ -274,6 +274,16 @@ On Frontier, `method=2`'s separate core/extra `srun` steps within one job have s
 
 With `--loader=default`, `--num-workers > 1` forks worker processes that each inherit the parent's live MPI state (mpi4py/`MPI_Init` has already run before the `DataLoader` is constructed). Forking after `MPI_Init` is a known MPI hazard — the child processes don't get a clean, independent MPI runtime — and in practice this hangs rather than erroring out cleanly once DDStore is in the picture. Use `--num-workers=1` (or 0) with `--loader=default`, or switch to `--loader=threaded` (real threads, no fork, no MPI conflict) for `--num-workers > 1`.
 
+### `ThreadDataLoader` with GPU buffers and `--num-workers > 1`
+
+Confirmed by direct experiment on Frontier: `--loader=threaded` together with `--gpu-dest`/`--gpu-source` and `--num-workers > 1` **silently corrupts data** — not a crash, wrong pixel values at a low but nonzero rate (observed ~0.2-1% of samples per epoch across several configurations). `vae-ddp.py`/`vae_extra_train.py` raise a clear `RuntimeError` for this combination rather than letting it run quietly wrong; **use `--num-workers=1` with GPU buffers**.
+
+Root cause: `DistDataset`/`DistDatasetReader`'s GPU destination-buffer pool (`examples/vae/distdataset.py`) hands out slots via a round-robin index shared across all `get()` calls, at **per-sample** granularity. Multiple `ThreadDataLoader` worker threads race for the lock protecting that index, so the order samples are physically written into pool slots is determined by lock-acquisition order, not by which batch submitted them or which batch gets consumed first. Bounding how many *batches* can be in flight at once (and sizing the pool accordingly) was tried and measurably helped (cut the corruption rate by roughly 50-99% across configurations) but didn't eliminate it, because the bound is on a batch *count*, while the actual hazard is at the individual-sample level — a batch count staying within budget doesn't guarantee a specific physical slot isn't reused by another batch's thread before the batch that currently owns it has been read. A complete fix needs `get()` to accept a caller-supplied destination buffer, so the loader can allocate one dedicated, exclusively-owned region per in-flight batch instead of sharing a flat per-sample pool — not implemented.
+
+This only affects the GPU-buffer path (`_val_pool` is unused on the host path, which was separately confirmed safe with `--num-workers > 1` under the lock — see the `threading.Lock` in `DistDataset`/`DistDatasetReader`'s `get()`, also confirmed necessary by direct experiment: disabling it crashed with `double free or corruption` under concurrent access).
+
+[examples/vae/stress_threaded_loader.py](examples/vae/stress_threaded_loader.py) is the diagnostic script used to find and confirm both issues above (checks every batch against ground-truth MNIST values, not just whether training runs) — kept in the repo for revisiting the per-batch-region fix later rather than re-deriving a repro from scratch.
+
 ### GPU-to-GPU RDMA performance on AMD/ROCm
 
 On Frontier, the GPU synchronization performed before each RDMA call (needed for correctness) can outweigh the benefit of skipping the host copy for small, per-sample transfers — GPU-to-GPU has not shown a speed advantage there yet, though results are correct either way. Larger, batched transfers should benefit more; that usage pattern isn't built yet.
@@ -318,11 +328,14 @@ mpirun -n 4 python examples/vae/vae-ddp.py
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --gpu-dest --gpu-source
 ```
 
-In `vae-ddp.py`, `--num-workers` (default 1) controls the training `DataLoader`'s parallelism. By default (`--loader=default`), it's passed straight through to PyTorch's normal `DataLoader`, which forks worker processes — forced back to 0 whenever `--gpu-dest`/`--gpu-source` is set (forked processes can't safely own GPU state), and capped at 1 otherwise: `--num-workers > 1` with `--loader=default` raises a clear error rather than hanging, since forking after MPI has already initialized is a known hazard with DDStore (see [Known Limitations](#default-forked-process-dataloader-with---num-workers--1-and-ddstore)). The applied value is printed at startup either way: `train_loader: DataLoader, num_workers=N`. `--loader=threaded` switches to [examples/vae/ddstore_dataloader.py](examples/vae/ddstore_dataloader.py)'s `ThreadDataLoader` instead, which parallelizes fetches across a thread pool — real threads, no fork, so both the GPU-state and MPI hazards above don't apply, and `--num-workers > 1` is safe together with `--gpu-dest`/`--gpu-source`. Concurrent `get()` calls from multiple threads are serialized internally by a lock in `DistDataset`/`DistDatasetReader` (the underlying RDMA transfer has no locking of its own), so threads gain overlap on everything except the RDMA call itself. `--loader=threaded` requires `DDSTORE_METHOD` 1 or 2 (libfabric). `vae_extra_train.py` has the same `--loader`/`--num-workers` flags, but its default loader always uses `num_workers=0` unconditionally (no `--num-workers` override) — only its `--loader=threaded` path is parallel:
+In `vae-ddp.py`, `--num-workers` (default 1) controls the training `DataLoader`'s parallelism. By default (`--loader=default`), it's passed straight through to PyTorch's normal `DataLoader`, which forks worker processes — forced back to 0 whenever `--gpu-dest`/`--gpu-source` is set (forked processes can't safely own GPU state), and capped at 1 otherwise: `--num-workers > 1` with `--loader=default` raises a clear error rather than hanging, since forking after MPI has already initialized is a known hazard with DDStore (see [Known Limitations](#default-forked-process-dataloader-with---num-workers--1-and-ddstore)). The applied value is printed at startup either way: `train_loader: DataLoader, num_workers=N`. `--loader=threaded` switches to [examples/vae/ddstore_dataloader.py](examples/vae/ddstore_dataloader.py)'s `ThreadDataLoader` instead, which parallelizes fetches across a thread pool — real threads, no fork, so the MPI hazard above doesn't apply, and `--num-workers > 1` is safe on the **host** path. It is **not** currently safe together with `--gpu-dest`/`--gpu-source` — `--num-workers > 1` with GPU buffers raises a clear error rather than running silently wrong (see [Known Limitations](#threaddataloader-with-gpu-buffers-and---num-workers--1)). Concurrent `get()` calls from multiple threads are serialized internally by a lock in `DistDataset`/`DistDatasetReader` (the underlying RDMA transfer has no locking of its own; confirmed necessary by direct experiment), so threads gain overlap on everything except the RDMA call itself. `--loader=threaded` requires `DDSTORE_METHOD` 1 or 2 (libfabric). `vae_extra_train.py` has the same `--loader`/`--num-workers` flags, but its default loader always uses `num_workers=0` unconditionally (no `--num-workers` override) — only its `--loader=threaded` path is parallel:
 
 ```bash
-# vae-ddp.py, threaded loader, 4 worker threads, together with GPUDirect
-DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --loader=threaded --num-workers=4 --gpu-dest --gpu-source
+# vae-ddp.py, threaded loader, 4 worker threads, host path (no GPU buffers)
+DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --loader=threaded --num-workers=4
+
+# threaded loader + GPUDirect together -- num-workers must stay at 1
+DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --loader=threaded --num-workers=1 --gpu-dest --gpu-source
 ```
 
 ### Slurm job scripts (Frontier)
@@ -333,12 +346,12 @@ DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py -
 sbatch examples/vae/script/job-vae-single.sh                       # method=0, cxi
 sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect
 sbatch examples/vae/script/job-vae-single.sh --method=1 --thread --num-workers=4           # threaded loader, 4 worker threads
-sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect --thread --num-workers=4  # threaded loader + GPUDirect
+sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect --thread --num-workers=1  # threaded loader + GPUDirect (num-workers must stay 1)
 sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, cxi, colocate layout
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node --core-nnodes=2
 ```
 
-Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--thread` (switch to `ThreadDataLoader`, see above) and `--num-workers` (default 1; must stay <= 1 for the default loader, forced to 0 there when `--gpudirect` is set — use `--thread` for real parallelism). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`. Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
+Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--thread` (switch to `ThreadDataLoader`, see above) and `--num-workers` (default 1; must stay <= 1 for the default loader and, with `--thread`, must also stay <= 1 whenever `--gpudirect` is set — real multi-worker parallelism with GPU buffers is not yet safe, see Known Limitations). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node` and `--core-nnodes`. Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
 ## Testing
 

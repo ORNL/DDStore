@@ -23,13 +23,13 @@ Options:
                  --fabric=cxi.
   --thread       Use ThreadDataLoader (thread-pool DataLoader) instead of the
                  default forked-process DataLoader. Needed for
-                 --num-workers > 0 together with --gpudirect. Requires
-                 --method=1 or 2.
+                 --num-workers > 1. Requires --method=1 or 2.
   --num-workers=N  Worker processes for the default loader (must stay <= 1
                  -- forking after MPI_Init hangs with DDStore for N > 1;
                  use --thread instead), or worker threads with --thread.
-                 Forced to 0 for the default loader when --gpudirect is
-                 set (fork-safety guard). Default: 1.
+                 With --gpudirect, must stay <= 1 even with --thread --
+                 confirmed unsafe above that (silent data corruption, not
+                 a crash; see README Known Limitations). Default: 1.
   -h, --help     Show this help message and exit.
 
 Examples:
@@ -37,7 +37,8 @@ Examples:
   $(basename "$0") --method=1 --gpudirect       # GPUDirect over libfabric
   $(basename "$0") --method=2 --gpudirect       # GPUDirect over file-based handshake
   $(basename "$0") --fabric=hsn                 # baseline over hsn instead
-  $(basename "$0") --method=1 --gpudirect --thread --num-workers=4
+  $(basename "$0") --method=1 --thread --num-workers=4        # threaded loader, no GPU buffers
+  $(basename "$0") --method=1 --gpudirect --thread --num-workers=1  # GPUDirect, threaded loader
 EOF
 }
 

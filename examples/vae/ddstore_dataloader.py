@@ -88,22 +88,57 @@ class ThreadDataLoader(DataLoader):
         self._num_yielded = 0
         self._sampler_iter = iter(self._index_sampler)
         self.fs_iter = iter(self.fs.get, None)
-        for i in range(len(self._index_sampler)):
-            index = next(self._sampler_iter)
+        self._next_batch_i = 0
+        self._inflight = 0
+        self._sampler_exhausted = False
+        # Bound how many batches can be in flight (submitted but not yet
+        # consumed via __next__) at once, instead of submitting the whole
+        # epoch up front. GPU-resident consumers (DistDataset/
+        # DistDatasetReader's buffer pool) only have a bounded number of
+        # slots; submitting far ahead of consumption lets a slower
+        # consumer's batch get overwritten by the pool's round-robin reuse
+        # before it's actually read. Mirrors torch's own prefetch_factor
+        # (default 2 per worker).
+        self._max_inflight = max(1, (self.num_workers or 1) * (self.prefetch_factor or 2))
+        self._refill()
+        return self
+
+    def _refill(self):
+        while self._inflight < self._max_inflight:
+            try:
+                index = next(self._sampler_iter)
+            except StopIteration:
+                if not self._sampler_exhausted:
+                    self._sampler_exhausted = True
+                    self.fs.put(None)
+                return
             future = self.executor.submit(
                 self.fetch,
                 self.dataset,
-                i,
+                self._next_batch_i,
                 index,
                 pin_memory=self.pin_memory,
             )
             self.fs.put(future)
-        self.fs.put(None)
-        return self
+            self._next_batch_i += 1
+            self._inflight += 1
 
     def __next__(self):
+        # Refill *before* popping this call's batch, not after: the caller
+        # (outside this class) hasn't read the batch we're about to return
+        # yet, and won't until this call returns and its loop body runs.
+        # Refilling here uses the slot freed by the *previous* call's
+        # batch, which -- by ordinary for-loop semantics -- the caller's
+        # loop body has already fully consumed by the time it asks for the
+        # next item (i.e. calls __next__ again). Refilling after popping
+        # (the previous version of this code) let a new fetch reuse that
+        # slot before the caller had read it, corrupting ~0.3-0.6% of
+        # samples per epoch even with max_inflight/pool_size otherwise
+        # correctly bounded -- confirmed empirically before this fix.
+        self._refill()
         future = next(self.fs_iter)
         ibatch, data = future.result()
+        self._inflight -= 1
         self._num_yielded += 1
         if self.collate_fn is not None:
             data = self.collate_fn(data)

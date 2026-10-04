@@ -25,6 +25,7 @@ class DistDataset(Dataset):
         ddstore_width=None,
         device=None,
         add_device=None,
+        pool_size=None,
     ):
         super().__init__()
 
@@ -131,21 +132,34 @@ class DistDataset(Dataset):
         #
         # Solution: pre-allocate a contiguous (POOL, 784) tensor so all slices
         # share one MR registration.  Slices are handed out round-robin so
-        # all batch_size concurrent live tensors have distinct pointers (no
-        # aliasing) while staying inside the single registered region.
-        # POOL must be >= the DataLoader's batch_size; 256 covers the default
-        # 128 with headroom.  Only used when device is not None (GPU path).
-        # Only safe with num_workers=0 (single-threaded DataLoader).
+        # all concurrently-live tensors have distinct pointers (no aliasing)
+        # while staying inside the single registered region.
+        #
+        # Sizing: POOL must be >= the number of samples that can be "in
+        # flight" (returned by get() but not yet consumed by collate) at
+        # once. With the default num_workers=0 DataLoader, that's at most
+        # one batch, so 256 safely covers the default batch_size=128. With
+        # ThreadDataLoader (examples/vae/ddstore_dataloader.py), multiple
+        # batches can be in flight simultaneously -- it bounds this to
+        # num_workers * prefetch_factor batches -- so POOL must be sized
+        # accordingly via `pool_size`; pass it in (e.g.
+        # `pool_size = num_workers * prefetch_factor * batch_size`) when
+        # using ThreadDataLoader, or get() silently hands out a slice that's
+        # still live in another batch (confirmed by direct experiment: this
+        # produced ~99.5% wrong-data rate with 8 workers / 256-slot pool /
+        # batch_size=64, well before exhausting the pool's raw capacity).
+        #
         # Guards pool-slice selection/increment + the ddstore.get() calls in
         # get() below -- needed once a caller (e.g. ThreadDataLoader) can
         # invoke get() from multiple threads concurrently. The underlying
         # DDStore::get() releases the GIL for its blocking transfer but has
         # no internal locking of its own, so concurrent calls here would
         # race on both the pool round-robin index and DDStore's CQ/MR-cache
-        # state.
+        # state (confirmed by direct experiment: disabling this lock crashed
+        # with "double free or corruption" under concurrent access).
         self._lock = threading.Lock()
 
-        _POOL = 256
+        _POOL = pool_size if pool_size is not None else 256
         if device is not None:
             self._val_pool = torch.empty(
                 (_POOL, 28 * 28), dtype=torch.float32, device=device
@@ -204,7 +218,7 @@ class DistDatasetReader(Dataset):
     core rank's memory.
     """
 
-    def __init__(self, label, handshake_dir, n_core, device=None):
+    def __init__(self, label, handshake_dir, n_core, device=None, pool_size=None):
         super().__init__()
         self.label = label
         # See DistDataset.__init__ for what `device` does.
@@ -227,10 +241,11 @@ class DistDatasetReader(Dataset):
                 "which is not a perfect square (expected a flattened square image)"
             )
 
-        # See DistDataset.__init__ for what this guards.
+        # See DistDataset.__init__ for what this guards, and for the
+        # `pool_size` sizing requirement when using ThreadDataLoader.
         self._lock = threading.Lock()
 
-        _POOL = 256
+        _POOL = pool_size if pool_size is not None else 256
         if device is not None:
             self._val_pool = torch.empty(
                 (_POOL, self.data_disp), dtype=torch.float32, device=device

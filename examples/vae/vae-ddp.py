@@ -81,11 +81,12 @@ parser.add_argument(
     default="default",
     help="DataLoader implementation for the training set. 'threaded' uses "
     "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
-    "thread-pool-based loader that allows --num-workers > 0 together "
-    "with --gpu-dest/--gpu-source (the default loader forks worker "
-    "processes, which cannot safely own GPU state, so it stays "
-    "single-threaded for those flags). Requires DDSTORE_METHOD 1 or 2. "
-    "Default: default.",
+    "thread-pool-based loader that allows --num-workers > 1 (the default "
+    "loader forks worker processes, which hangs with DDStore above 1). "
+    "With --gpu-dest/--gpu-source, --num-workers must stay <= 1 even with "
+    "--loader=threaded -- confirmed unsafe above that (silent data "
+    "corruption, not a crash; see README Known Limitations). Requires "
+    "DDSTORE_METHOD 1 or 2. Default: default.",
 )
 parser.add_argument(
     "--num-workers",
@@ -161,10 +162,38 @@ if args.loader == "default" and args.num_workers > 1:
         "after MPI_Init, which hangs with DDStore. Use --num-workers=1, or "
         "--loader=threaded for real parallelism."
     )
+# --loader=threaded + (--gpu-dest or --gpu-source) + --num-workers > 1 is
+# confirmed unsafe by direct experiment: it silently corrupts data (not a
+# crash -- wrong pixel values at a low but nonzero rate). Root cause: the
+# GPU buffer pool in distdataset.py hands out slots via a per-SAMPLE
+# round-robin index shared across threads; slot write order is determined
+# by lock-acquisition order, not batch submission/consumption order, so a
+# bounded in-flight *batch count* doesn't actually bound which physical
+# slots can get overwritten while unread. A real fix needs get() to accept
+# a caller-supplied destination buffer so ThreadDataLoader can allocate one
+# dedicated region per in-flight batch (not per sample) -- not done yet.
+# num_workers<=1 has no concurrent writers, so it's unaffected.
+if args.loader == "threaded" and (args.gpu_dest or args.gpu_source) and args.num_workers > 1:
+    raise RuntimeError(
+        "--loader=threaded with --gpu-dest/--gpu-source and --num-workers > 1 "
+        "is known to silently corrupt data (confirmed by direct experiment -- "
+        "see README Known Limitations). Use --num-workers=1 with GPU buffers, "
+        "or drop --gpu-dest/--gpu-source for real multi-worker parallelism."
+    )
 if args.gpu_dest or args.gpu_source:
     kwargs = {}
 else:
     kwargs = {"num_workers": args.num_workers} if args.num_workers > 0 else {}
+
+# ThreadDataLoader bounds in-flight batches to num_workers * prefetch_factor
+# (default prefetch_factor=2, matching torch's own default); the GPU pool
+# must hold at least that many batches' worth of samples or get() hands out
+# a slice that's still "live" in an unconsumed batch -- see the pool-sizing
+# comment in distdataset.py. +1 batch of headroom.
+if args.loader == "threaded":
+    pool_size = (args.num_workers * 2 + 1) * args.batch_size
+else:
+    pool_size = None
 
 trainset = DistDataset(
     datasets.MNIST("data", train=True, download=True, transform=transforms.ToTensor()),
@@ -172,6 +201,7 @@ trainset = DistDataset(
     comm,
     device=device if args.gpu_dest else None,
     add_device=device if args.gpu_source else None,
+    pool_size=pool_size,
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 comm.Barrier()

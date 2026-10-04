@@ -105,10 +105,12 @@ parser.add_argument(
     default="default",
     help="DataLoader implementation for the training set. 'threaded' uses "
     "ThreadDataLoader (examples/vae/ddstore_dataloader.py), a "
-    "thread-pool-based loader that allows --num-workers > 0 together "
-    "with --gpu-dest (the default loader forks worker processes, "
-    "which cannot safely own GPU state, so it stays single-threaded "
-    "for that flag). Default: default.",
+    "thread-pool-based loader that allows --num-workers > 1 (the default "
+    "loader forks worker processes, which hangs with DDStore above 1). "
+    "With --gpu-dest, --num-workers must stay <= 1 even with "
+    "--loader=threaded -- confirmed unsafe above that (silent data "
+    "corruption, not a crash; see README Known Limitations). "
+    "Default: default.",
 )
 parser.add_argument(
     "--num-workers",
@@ -158,11 +160,32 @@ kwargs = {}
 if args.gpu_dest:
     assert kwargs.get("num_workers", 0) == 0
 
+# --loader=threaded + --gpu-dest + --num-workers > 1 is confirmed unsafe by
+# direct experiment (silent data corruption, not a crash) -- see the
+# matching guard and comment in vae-ddp.py and the README Known Limitations
+# entry for the root cause. num_workers<=1 has no concurrent writers.
+if args.loader == "threaded" and args.gpu_dest and args.num_workers > 1:
+    raise RuntimeError(
+        "--loader=threaded with --gpu-dest and --num-workers > 1 is known "
+        "to silently corrupt data (see README Known Limitations). Use "
+        "--num-workers=1 with --gpu-dest, or drop --gpu-dest for real "
+        "multi-worker parallelism."
+    )
+
+# See the matching comment in vae-ddp.py: ThreadDataLoader bounds in-flight
+# batches to num_workers * prefetch_factor (default 2); the GPU pool must
+# be sized to match or get() hands out a slice that's still live elsewhere.
+if args.loader == "threaded":
+    pool_size = (args.num_workers * 2 + 1) * args.batch_size
+else:
+    pool_size = None
+
 trainset = DistDatasetReader(
     "train",
     args.handshake_dir,
     args.n_core,
     device=device if args.gpu_dest else None,
+    pool_size=pool_size,
 )
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 

@@ -471,8 +471,6 @@ If you use DDStore in your research, please cite:
 }
 ```
 
-The batched `method=0` path (`get_batch()` with `MPI_Allgatherv` + `MPI_Alltoallv`) follows the collective data loader of MDLoader; if you use it, please also cite:
-
 ```bibtex
 @inproceedings{bae2024mdloader,
   title={MDLoader: A Hybrid Model-Driven Data Loader for Distributed Graph Neural Network Training},

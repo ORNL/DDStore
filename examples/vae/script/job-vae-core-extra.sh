@@ -39,7 +39,7 @@ Options:
                  split-node (core gets --core-nnodes nodes, extra the rest).
                  Colocate works on Perlmutter but not on Frontier, where the
                  second step fails with "Error configuring interconnect";
-                 use split-node there. Default: colocate.
+                 use split-node there. Default: split-node.
   --core-nnodes=N  Number of nodes for the core step in split-node layout.
                  Ignored in colocate layout. Default: 1.
   --num-workers=N  DataLoader workers for the extra (training) step. 0 uses
@@ -80,7 +80,7 @@ for arg in "$@"; do
         --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
     esac
 done
-LAYOUT="${LAYOUT:-colocate}"
+LAYOUT="${LAYOUT:-split-node}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 REPLICATE="${REPLICATE:-1}"
 IMAGE_SCALE="${IMAGE_SCALE:-1}"

@@ -439,11 +439,11 @@ sbatch examples/vae/script/job-vae-single.sh                       # method=0, c
 sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect
 sbatch examples/vae/script/job-vae-single.sh --method=1 --num-workers=4           # ThreadDataLoader, 4 worker threads
 sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect --num-workers=4  # ThreadDataLoader + GPUDirect
-sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, cxi, colocate layout
+sbatch examples/vae/script/job-vae-core-extra.sh                   # method=2, cxi, split-node layout (1 core node)
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --layout=split-node --core-nnodes=2
 ```
 
-Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=colocate|split-node`, `--core-nnodes`, and `--num-workers` (for the extra/training step). Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
+Run `--help` on either script for the full option list. `job-vae-single.sh` additionally has `--method` and `--num-workers` (default 0; `> 0` switches to `ThreadDataLoader`, see above). `job-vae-core-extra.sh` additionally has `--layout=split-node|colocate` (default split-node; colocate works on Perlmutter only, see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi)), `--core-nnodes`, and `--num-workers` (for the extra/training step). Note `--layout=colocate` together with `--gpudirect` will over-request GPUs per node (core and extra each ask for a full node's worth of GPUs on the same nodes) — use `--layout=split-node` when testing GPUDirect on `job-vae-core-extra.sh`.
 
 ### Larger VAE cases
 

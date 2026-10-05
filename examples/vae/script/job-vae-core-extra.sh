@@ -17,6 +17,11 @@
 # without it fi_domain() fails with -38 (ENOSYS). libfabric's cxi provider
 # uses only the FIRST VNI listed, so each task below restricts
 # SLINGSHOT_VNIS to the job VNI (last entry) so core and extra share it.
+#
+# Runs on Frontier and Perlmutter; the rank layout is picked from the machine
+# (see PLATFORM below). The #SBATCH lines above are for Frontier. On
+# Perlmutter, override them on the command line:
+#   sbatch -A <account> -C gpu --gpus-per-node=4 examples/vae/script/job-vae-core-extra.sh
 
 usage() {
     cat <<EOF
@@ -114,12 +119,28 @@ else
     CORE_NNODES="${CORE_NNODES_OPT:-1}"
     EXTRA_NNODES=$((SLURM_NNODES - CORE_NNODES))
 fi
-CORE_NR=8
-EXTRA_NR=8
+# Perlmutter: the extra (training) ranks see all 4 GPUs of their node and
+# vae_extra_train.py picks cuda:$SLURM_LOCALID. With --gpus-per-task=1 NCCL
+# (2.29, pytorch/2.13.0) fails in DDP init with "Cuda failure 101 'invalid
+# device ordinal'". The core step does no NCCL, so --gpus-per-task is fine
+# there; 4 core ranks per node fit the 4 GPUs with --gpudirect.
+PLATFORM="${NERSC_HOST:-${LMOD_SYSTEM_NAME:-frontier}}"
+case "$PLATFORM" in
+    perlmutter)
+        CORE_NR=4
+        EXTRA_NR=4
+        EXTRA_CPUS_PER_TASK=16
+        EXTRA_GPU_ARGS="--gpus-per-node=4" ;;
+    *)
+        CORE_NR=8
+        EXTRA_NR=8
+        EXTRA_CPUS_PER_TASK=6
+        EXTRA_GPU_ARGS="--gpus-per-task=1" ;;
+esac
 CORE_NTASKS=$((CORE_NNODES * CORE_NR))
 EXTRA_NTASKS=$((EXTRA_NNODES * EXTRA_NR))
 
-echo "DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYOUT GPUDIRECT=$GPUDIRECT"
+echo "PLATFORM=$PLATFORM DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYOUT GPUDIRECT=$GPUDIRECT"
 echo "CORE_NNODES=$CORE_NNODES CORE_NTASKS=$CORE_NTASKS CORE_GPUS_PER_TASK=$CORE_GPUS_PER_TASK CORE_EXTRA_ARGS=\"$CORE_EXTRA_ARGS\" REPLICATE=$REPLICATE IMAGE_SCALE=$IMAGE_SCALE"
 echo "EXTRA_NNODES=$EXTRA_NNODES EXTRA_NTASKS=$EXTRA_NTASKS EXTRA_EXTRA_ARGS=\"$EXTRA_EXTRA_ARGS\" NUM_WORKERS=$NUM_WORKERS"
 
@@ -128,7 +149,7 @@ MASTER_PORT=8889 srun ${OVERLAP:-} -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /') &
 sleep 5
 
-MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun ${OVERLAP:-} -N$EXTRA_NNODES -n$EXTRA_NTASKS -c6 --gpus-per-task=1 --cpu-bind=verbose,core -l \
+MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun ${OVERLAP:-} -N$EXTRA_NNODES -n$EXTRA_NTASKS -c$EXTRA_CPUS_PER_TASK $EXTRA_GPU_ARGS --cpu-bind=verbose,core -l \
     bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS $EXTRA_EXTRA_ARGS \
     > >(sed 's/^/[extr] /') 2> >(sed 's/^/[extr] /')
 sleep 5

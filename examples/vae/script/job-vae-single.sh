@@ -7,7 +7,10 @@
 #SBATCH -t 30:00
 #SBATCH -q debug
 #
-# Baseline VAE DDP run.
+# Baseline VAE DDP run. Runs on Frontier and Perlmutter; the rank layout is
+# picked from the machine (see PLATFORM below). The #SBATCH lines above are
+# for Frontier. On Perlmutter, override them on the command line:
+#   sbatch -A <account> -C gpu --gpus-per-node=4 examples/vae/script/job-vae-single.sh
 
 usage() {
     cat <<EOF
@@ -29,6 +32,8 @@ Options:
                  same per-sample cost). Default: 1.
   --image-scale=S  Upscale images to (28*S)x(28*S): S^2 larger samples.
                  Default: 1.
+  --ranks-per-node=N  Default: 8 on Frontier, 4 on Perlmutter.
+  --cpus-per-task=N   Default: 7 on Frontier, 32 on Perlmutter.
   -h, --help     Show this help message and exit.
 
 Examples:
@@ -59,6 +64,8 @@ GPUDIRECT_ARGS=""
 NUM_WORKERS=
 REPLICATE=
 IMAGE_SCALE=
+RANKS_PER_NODE=
+CPUS_PER_TASK=
 for arg in "$@"; do
     case "$arg" in
         --method=*) METHOD="${arg#--method=}" ;;
@@ -67,6 +74,8 @@ for arg in "$@"; do
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
         --replicate=*) REPLICATE="${arg#--replicate=}" ;;
         --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
+        --ranks-per-node=*) RANKS_PER_NODE="${arg#--ranks-per-node=}" ;;
+        --cpus-per-task=*) CPUS_PER_TASK="${arg#--cpus-per-task=}" ;;
     esac
 done
 
@@ -80,6 +89,25 @@ EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --
 
 echo "DDSTORE_METHOD=$METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
 
-DDSTORE_METHOD=$METHOD srun -N$SLURM_NNODES -n$((SLURM_NNODES*8)) -c7 --gpus-per-task=1 -l \
+# Perlmutter: every rank sees all 4 GPUs of its node and vae-ddp.py picks
+# cuda:$SLURM_LOCALID. With --gpus-per-task=1 each rank sees only its own GPU
+# and NCCL (2.29, pytorch/2.13.0) fails in DDP init with "Cuda failure 101
+# 'invalid device ordinal'" (transport/p2p.cc).
+PLATFORM="${NERSC_HOST:-${LMOD_SYSTEM_NAME:-frontier}}"
+case "$PLATFORM" in
+    perlmutter)
+        RANKS_PER_NODE="${RANKS_PER_NODE:-4}"
+        CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
+        GPU_ARGS="--gpus-per-node=4" ;;
+    *)
+        RANKS_PER_NODE="${RANKS_PER_NODE:-8}"
+        CPUS_PER_TASK="${CPUS_PER_TASK:-7}"
+        GPU_ARGS="--gpus-per-task=1" ;;
+esac
+NNODES="${SLURM_NNODES:-1}"
+
+echo "PLATFORM=$PLATFORM NNODES=$NNODES RANKS_PER_NODE=$RANKS_PER_NODE CPUS_PER_TASK=$CPUS_PER_TASK GPU_ARGS=$GPU_ARGS"
+
+DDSTORE_METHOD=$METHOD srun -N$NNODES -n$((NNODES*RANKS_PER_NODE)) -c$CPUS_PER_TASK $GPU_ARGS -l \
     python -u examples/vae/vae-ddp.py --epochs 3 $EXTRA_ARGS \
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /')

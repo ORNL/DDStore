@@ -6,6 +6,11 @@ Efficient distributed data loading for distributed data-parallel (DDP) training.
 
 Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a global index space so any rank can read any sample via one-sided remote memory access — either MPI RMA (default) or libfabric RDMA — without coordinator synchronization.
 
+- **Batched reads**: [`get_batch()`](#get_batchname-arr-indices) fetches a whole training batch in one call (one-sided RDMA reads in flight together, or an MPI collective for `method=0`).
+- **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory ([details](#gpudirect-rdma-gpu-resident-buffers)).
+- **PyTorch integration**: [`pyddstore.torch`](#pytorch-dataset-integration) turns any map-style dataset into a distributed one (`DistDataset`) and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers.
+- **Thread-safe** reads, a [profiler](#performance) for where read time goes, and a split mode (`method=2`) where a separate job reads data published by another.
+
 <img src="https://github.com/allaffa/DDStore/assets/2488656/88a3b139-062d-41e8-a8d7-40c1a144d897" alt="DDStore architecture" width="300" />
 
 ## Prerequisites
@@ -16,6 +21,7 @@ Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a glo
 | libfabric | Required for the RDMA backends (`method=1` and `method=2`) |
 | Python ≥ 3.6 | |
 | NumPy, mpi4py, Cython | Python build dependencies |
+| PyTorch (optional) | For `pyddstore.torch` and GPU buffers (CUDA or ROCm build) |
 
 ## Installation
 
@@ -23,11 +29,12 @@ Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a glo
 # Install Python build dependencies
 pip install numpy mpi4py Cython
 
-# Build in-place (use with PYTHONPATH=$PWD:$PYTHONPATH)
+# Build in-place (use with PYTHONPATH=$PWD/src:$PYTHONPATH)
 CC=mpicc CXX=mpicxx python setup.py build_ext --inplace
 
 # Or install into the active virtual environment
 CC=mpicc CXX=mpicxx pip install .
+CC=mpicc CXX=mpicxx pip install ".[torch]"     # also pulls PyTorch, for pyddstore.torch
 
 # Or install in editable/development mode
 CC=mpicc CXX=mpicxx pip install -e .
@@ -47,6 +54,8 @@ If that fails with `ModuleNotFoundError: No module named 'distutils.msvccompiler
 ```bash
 SETUPTOOLS_USE_DISTUTILS=stdlib CC=cc CXX=CC pip install --no-build-isolation --no-deps -e .
 ```
+
+The package is `pyddstore` (compiled core `pyddstore._core`, plus `pyddstore.torch`). After updating from a 1.x checkout, rebuild; an old `src/pyddstore.cpython-*.so` left behind is unused and can be deleted.
 
 ## Quick Start
 
@@ -78,6 +87,8 @@ Run with:
 ```bash
 mpirun -n 4 python my_script.py
 ```
+
+With PyTorch, [`pyddstore.torch.DistDataset`](#pytorch-dataset-integration) does the sharding, `add()` and batched reads for you.
 
 ## API Reference
 
@@ -210,16 +221,20 @@ Release every variable's MPI window (`method=0`) or libfabric endpoints and memo
 | `DDSTORE_PROFILE` | off | `1` turns on `get()`/`get_batch()` timing counters, read with `get_profile(name)`. See [Performance](#performance). |
 | `DDSTORE_ALLTOALL_MAX_BYTES` | `2097152` (2 MiB) | `method=0` `get_batch()`: bytes each rank receives per exchange round. Must be equal on all ranks. |
 
-The backend itself is not an environment variable in the library: pass `method=` to `PyDDStore` (`DDSTORE_METHOD` below is how the examples choose it).
+**Read by `pyddstore.torch`** (defaults for arguments not given):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `DDSTORE_METHOD` | `0` | `DistDataset`'s backend when `method=` isn't passed: `0` MPI RMA, `1` libfabric, `2` file-based handshake. (`PyDDStore` itself takes `method=` only.) |
+| `DDSTORE_BATCH_GET` | `1` | `DistDataset.__getitems__` reads a whole batch with one `get_batch()` per field; `0` reads one sample at a time. |
+| `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S` | `./ddstore_hs`, `300` | `method=2` directory, and how long `DistDatasetReader` waits for the core group to publish. |
+| `DDSTORE_N_CORE` | unset | `DistDatasetReader`'s number of core ranks when `n_core=` isn't passed (the examples default it to 4). |
+| `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` | `0` / `0` | `ThreadDataLoader`: pin worker thread *i* to CPUs `[offset + i·width, offset + (i+1)·width)` of the process's affinity; width `0` = no pinning. |
 
 **Read by the examples** (`examples/vae/`, `examples/scripts/`, job scripts):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DDSTORE_METHOD` | `0` (`bench_get.py`: `1`) | Backend passed as `method=`: `0` MPI RMA, `1` libfabric, `2` file-based handshake. `--num-workers > 0` in `vae-ddp.py` needs `1` or `2`. |
-| `DDSTORE_BATCH_GET` | `1` | `DistDataset.__getitems__` reads a whole batch with one `get_batch()`; `0` falls back to one `get()` per sample. |
-| `DDSTORE_N_CORE` | `4` | `vae_extra_train.py`, `test_method2_*.py`: number of core ranks that published the data (`--n-core` overrides). |
-| `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` | `0` / `0` | `ThreadDataLoader`: pin worker thread *i* to CPUs `[offset + i·width, offset + (i+1)·width)` of the process's affinity; width `0` = no pinning. |
 | `DDSTORE_BACKEND` | auto | `torch.distributed` backend for the examples' DDP setup (`nccl`, `gloo`, `xccl`). |
 | `VAE_PROFILE` | off | `1`: `vae-ddp.py` prints per-epoch fetch vs compute time. |
 | `MASTER_PORT` | `2345` | DDP rendezvous port; the core/extra job script gives each step its own. |
@@ -440,6 +455,12 @@ mpirun -n 1 python -m pytest test/test_single.py -v
 mpirun -n 4 python -m pytest test/test_multirank.py -v
 ```
 
+**Batched reads and the PyTorch layer** — method 0 everywhere; method 1, method 2 and GPU cases run inside a Slurm step with a CXI device (provider from `DDSTORE_FABRIC`, default `cxi`):
+
+```bash
+mpirun -n 4 python -m pytest test/test_get_batch.py test/test_torch.py -v
+```
+
 **GPUDirect RDMA** — requires a live `cxi` fabric and a CUDA/HIP GPU per rank (skipped automatically otherwise); see [GPUDirect RDMA](#gpudirect-rdma-gpu-resident-buffers):
 
 ```bash
@@ -452,6 +473,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
 | `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads; method 0, plus method 1 over `cxi` inside a Slurm step |
+| `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
 ### Integration scripts
 

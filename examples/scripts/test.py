@@ -1,9 +1,3 @@
-import mpi4py
-
-## (2024/12): got an assert error on osx without the following line
-mpi4py.rc.thread_level = "serialized"
-mpi4py.rc.threads = False
-
 import numpy as np
 from mpi4py import MPI
 import argparse

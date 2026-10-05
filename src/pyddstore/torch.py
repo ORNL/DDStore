@@ -715,10 +715,48 @@ class ThreadDataLoader(DataLoader):
     match ``DataLoader``'s. ``DDSTORE_AFFINITY_WIDTH`` /
     ``DDSTORE_AFFINITY_OFFSET`` pin worker thread *i* to CPUs
     ``[offset + i*width, offset + (i+1)*width)`` of the process's affinity.
+
+    ``reuse_buffers=True`` (dataset with ``alloc()``, e.g. ``DistDataset``):
+    read every batch into one of a fixed pool of ``num_workers`` buffer sets
+    from ``dataset.alloc(batch_size)``, registered once, instead of fresh
+    buffers that are registered on every read. A worker takes a set, reads
+    and collates the batch, and returns the set, so the collate must copy:
+    needs ``batch_size`` and the default ``collate_fn``, or
+    ``collate_copies=True`` to declare that a custom ``collate_fn`` copies.
+    ``close()`` (or deleting the loader) waits for running fetches and
+    unregisters the pool.
     """
 
-    def __init__(self, dataset, **kwargs):
+    def __init__(self, dataset, reuse_buffers=False, collate_copies=False, **kwargs):
         super().__init__(dataset, **kwargs)
+
+        # Fixed pool of registered read buffers, one set per worker thread,
+        # owned by this loader (see reuse_buffers in the class docstring).
+        self._pool, self._pool_sets = None, []
+        if reuse_buffers:
+            if not hasattr(dataset, "alloc"):
+                raise TypeError(
+                    "reuse_buffers needs a dataset with alloc() (DistDataset, "
+                    "DistDatasetReader)"
+                )
+            if self.batch_size is None:
+                raise ValueError(
+                    "reuse_buffers needs batch_size: without auto-collation the "
+                    "batch is not copied out of the reused buffer"
+                )
+            if (
+                self.collate_fn is not torch.utils.data.default_collate
+                and not collate_copies
+            ):
+                raise ValueError(
+                    "reuse_buffers with a custom collate_fn: pass collate_copies=True "
+                    "if it copies the samples (the buffer is reused right after it)"
+                )
+            self._pool = queue.Queue()
+            for _ in range(self.num_workers or 1):
+                bufs = dataset.alloc(self.batch_size)
+                self._pool_sets.append(bufs)
+                self._pool.put(bufs)
 
         # Persistent across epochs -- recreating the pool in every __iter__()
         # would leak OS threads since the old pool is never shut down.
@@ -762,8 +800,27 @@ class ThreadDataLoader(DataLoader):
 
     @staticmethod
     def fetch(
-        dataset, ibatch, index, collate_fn=None, pin_memory=False, auto_collation=True
+        dataset,
+        ibatch,
+        index,
+        collate_fn=None,
+        pin_memory=False,
+        auto_collation=True,
+        pool=None,
     ):
+        if pool is not None:
+            # Read into one of the loader's registered buffer sets; collate
+            # copies the batch out, then the set goes back to the pool. For a
+            # GPU buffer, get_batch() synchronizes the device before reading,
+            # so the collate's copy has finished before the set is refilled.
+            bufs = pool.get()
+            try:
+                batch = collate_fn(dataset.__getitems__(index, out=bufs))
+            finally:
+                pool.put(bufs)
+            if pin_memory:
+                batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
+            return (ibatch, batch)
         # Collate here, in the worker, before pinning: pinning per-sample
         # tensors and collating afterwards would just torch.stack them into
         # a new, unpinned tensor. Use the dataset's whole-batch fetch when it
@@ -788,10 +845,22 @@ class ThreadDataLoader(DataLoader):
         loader don't interfere, as with ``DataLoader``."""
         return _ThreadLoaderIter(self)
 
-    def __del__(self):
+    def close(self):
+        """Stop the worker threads; with ``reuse_buffers``, wait for running
+        fetches first, then unregister the buffer pool. Called on deletion."""
         executor = getattr(self, "executor", None)
+        sets = getattr(self, "_pool_sets", [])
         if executor is not None:
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=bool(sets), cancel_futures=True)
+        for bufs in sets:
+            try:
+                self.dataset.release(bufs)
+            except (ValueError, KeyError):
+                pass  # the store was freed first: nothing left to unregister
+        self._pool_sets = []
+
+    def __del__(self):
+        self.close()
 
 
 class _ThreadLoaderIter:
@@ -844,6 +913,7 @@ class _ThreadLoaderIter:
                 collate_fn=loader.collate_fn,
                 pin_memory=loader.pin_memory,
                 auto_collation=loader._auto_collation,
+                pool=loader._pool,
             )
             self.fs.put(future)
             self._next_batch_i += 1

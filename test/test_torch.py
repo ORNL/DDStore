@@ -391,6 +391,52 @@ def test_row_of_concat(comm, monkeypatch):
     assert all_ok(comm, ok)
 
 
+@pytest.mark.parametrize("method", METHODS)
+def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
+    """reuse_buffers: two epochs equal the plain source, no registration per
+    read (method 1, DDSTORE_PROFILE=1), setups that can't copy are refused,
+    and close() unregisters the pool."""
+    src = TupleSource()
+    ds = make(comm, monkeypatch, src, method)
+    nw = 1 if method == 0 else 2
+    ref = list(DataLoader(src, batch_size=8))  # last batch is short (37 = 4*8 + 5)
+    loader = ThreadDataLoader(ds, batch_size=8, num_workers=nw, reuse_buffers=True)
+    ok = len(loader._pool_sets) == nw
+    prof = os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0") and method != 0
+    miss0 = [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var] if prof else None
+    for _ in range(2):
+        got = list(loader)
+        ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
+    if prof:
+        ok &= [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var] == miss0
+    sets = loader._pool_sets
+    loader.close()
+    if method != 0:  # unregistered: releasing again raises
+        for bufs in sets:
+            with pytest.raises(ValueError):
+                ds.release(bufs)
+
+    with pytest.raises(ValueError):  # no auto-collation: nothing copies
+        ThreadDataLoader(ds, batch_size=None, reuse_buffers=True)
+    with pytest.raises(ValueError):  # custom collate not declared as copying
+        ThreadDataLoader(ds, batch_size=8, collate_fn=lambda b: b, reuse_buffers=True)
+    with pytest.raises(TypeError):  # dataset without alloc()
+        ThreadDataLoader(src, batch_size=8, reuse_buffers=True)
+    copying = ThreadDataLoader(
+        ds, batch_size=8, num_workers=nw, reuse_buffers=True, collate_copies=True,
+        collate_fn=lambda b: [tuple(x.clone() if isinstance(x, torch.Tensor) else
+                                    np.array(x, copy=True) for x in s) for s in b],
+    )
+    got = [s for b in copying for s in b]
+    ok &= len(got) == N and all(
+        same_values(g[0], src[i][0]) and same_values(g[2], src[i][2])
+        for i, g in enumerate(got)
+    )
+    copying.close()
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
 def test_per_sample_fallback(comm, monkeypatch):
     monkeypatch.setenv("DDSTORE_BATCH_GET", "0")
     src = TupleSource()
@@ -466,6 +512,27 @@ def test_gpu_device_and_add_device(comm, monkeypatch):
         batch[0][2], np.ndarray
     )  # tensors on GPU, numpy stays host
     ok &= all(same(b, src[i]) for b, i in zip(batch, idx))
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.skipif(
+    not (HAVE_CXI and HAVE_GPU and FABRIC == "cxi"),
+    reason="requires the cxi provider and a GPU",
+)
+def test_gpu_reuse_buffers(comm, monkeypatch):
+    """reuse_buffers with GPU read buffers: the collate's GPU copy must finish
+    before a buffer is refilled (several epochs, 2 threads, small pool)."""
+    src = TupleSource()
+    ds = make(comm, monkeypatch, src, 1, device="cuda")
+    ref = list(DataLoader(src, batch_size=4))
+    loader = ThreadDataLoader(ds, batch_size=4, num_workers=2, reuse_buffers=True)
+    ok = True
+    for _ in range(3):
+        got = list(loader)
+        ok &= got[0][0].is_cuda and len(got) == len(ref)
+        ok &= all(same(g, r) for g, r in zip(got, ref))
+    loader.close()
     finish(comm, ds)
     assert all_ok(comm, ok)
 

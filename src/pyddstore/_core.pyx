@@ -110,6 +110,8 @@ cdef extern from "ddstore.hpp":
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except + nogil
         void get_batch[T](string name, const long *idx, long n, T* buffer, int hmem_iface) except + nogil
+        void register_recv(string name, void *buffer, size_t len, int hmem_iface) except +
+        void unregister_recv(string name, void *buffer) except +
         void epoch_begin()
         void epoch_end()
         void free()
@@ -134,6 +136,7 @@ cdef class PyDDStore:
     # lifetime-contract comment) -- this dict keeps the Python reference
     # alive for as long as the variable stays registered.
     cdef dict _gpu_owned_buffers
+    cdef dict _recv_buffers
     # DDSTORE_PROFILE=1: Python-side get() timing (see get_profile()).
     cdef bint _prof
     cdef double _prof_get_s
@@ -160,6 +163,7 @@ cdef class PyDDStore:
         cdef MPI.Comm mpi_comm
         self.method = method
         self._gpu_owned_buffers = {}
+        self._recv_buffers = {}
         self._prof = os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0")
         self._prof_get_s = 0.0
         self._prof_sync_s = 0.0
@@ -199,6 +203,7 @@ cdef class PyDDStore:
             del self.c_ddstore
             self.c_ddstore = NULL
         self._gpu_owned_buffers.clear()
+        self._recv_buffers.clear()
 
     def add(self, str name, arr):
         cdef size_t ptr
@@ -356,6 +361,43 @@ cdef class PyDDStore:
             self._prof_get_s += time.perf_counter() - t_get
             self._prof_gets += 1
 
+    def register_recv(self, str name, arr):
+        """Register `arr` (contiguous host numpy array or GPU tensor) once as
+        a destination for get()/get_batch() of `name`: reads into it, or into
+        any slice of it, then skip memory registration. Use for buffers that
+        are reused across reads (e.g. a per-thread pool); several can be
+        registered per variable and none is evicted. The store keeps `arr`
+        alive until unregister_recv() or free(). No-op for method 0."""
+        cdef size_t ptr
+        cdef size_t nbytes
+        cdef int iface
+        cdef bint is_gpu = _is_cuda_tensor(arr)
+        if is_gpu:
+            _check_gpu_fabric_preconditions(self.method, "GPU destination buffer")
+            assert arr.is_contiguous()
+            ptr = arr.data_ptr()
+            nbytes = arr.numel() * arr.element_size()
+            iface = _hmem_iface_for(arr)
+        else:
+            assert arr.flags.c_contiguous
+            ptr = arr.ctypes.data
+            nbytes = arr.nbytes
+            iface = 0
+        if nbytes == 0:
+            return
+        self.c_ddstore.register_recv(s2b(name), <void *> ptr, nbytes, iface)
+        self._recv_buffers[(name, ptr)] = arr
+
+    def unregister_recv(self, str name, arr):
+        """Undo register_recv(name, arr)."""
+        cdef size_t ptr = arr.data_ptr() if _is_cuda_tensor(arr) else arr.ctypes.data
+        if (name, ptr) not in self._recv_buffers:
+            if self.method == 0:
+                return
+            raise ValueError("buffer is not registered for %r" % name)
+        self.c_ddstore.unregister_recv(s2b(name), <void *> ptr)
+        del self._recv_buffers[(name, ptr)]
+
     def get_profile(self, str name):
         """DDSTORE_PROFILE=1 timing for `name` (methods 1/2), in seconds.
 
@@ -385,6 +427,7 @@ cdef class PyDDStore:
     def free(self):
         self.c_ddstore.free()
         self._gpu_owned_buffers.clear()
+        self._recv_buffers.clear()
 
     def init(self, str name, long nrows, int disp, int itemsize=1):
         self.c_ddstore.init(s2b(name), nrows, disp, itemsize)

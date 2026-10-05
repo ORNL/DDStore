@@ -204,6 +204,7 @@ void DDStore::free()
         else if (var.fabric_state)
         {
             struct fabric_state *fs = var.fabric_state;
+            close_recv_regions(fs);
             if (fs->recv_mr)   fi_close(&fs->recv_mr->fid);
             if (fs->mr)        fi_close(&fs->mr->fid);
             if (fs->signal)    fi_close(&fs->signal->fid);

@@ -518,7 +518,7 @@ public:
                     "GPU destination buffer requires DDSTORE_FABRIC=cxi "
                     "(current fabric does not support FI_HMEM)");
             varinfo.fabric_state->recv_data = (char *)buffer;
-            varinfo.fabric_state->recv_data_len = varinfo.disp * varinfo.itemsize * count;
+            varinfo.fabric_state->recv_data_len = (size_t)varinfo.disp * varinfo.itemsize * count;
             varinfo.fabric_state->recv_hmem_iface = hmem_iface;
             int rc = read_from_remote(varinfo.fabric_state, target, (start - offset) * varinfo.disp * varinfo.itemsize);
             if (rc != 0)
@@ -526,6 +526,37 @@ public:
                     "read_from_remote failed with code " + std::to_string(rc) +
                     " (target=" + std::to_string(target) + ")");
         }
+    }
+
+    /* Register `len` bytes at `buffer` once as a destination for get() /
+     * get_batch() of `name` (hmem_iface as in get()), so reads into it or
+     * any part of it skip memory registration. Several buffers can be
+     * registered per variable (e.g. one per loader thread); none is ever
+     * evicted. The caller keeps the buffer alive until unregister_recv() or
+     * free(). No-op for method 0.                                          */
+    void register_recv(std::string name, void *buffer, size_t len, int hmem_iface = 0)
+    {
+        const VarInfo_t &varinfo = this->varlist.at(name);
+        if (this->method == 0)
+            return;
+        if (hmem_iface != 0 && !is_hmem_capable(varinfo.fabric_state))
+            throw std::runtime_error(
+                "GPU destination buffer requires DDSTORE_FABRIC=cxi "
+                "(current fabric does not support FI_HMEM)");
+        fabric_state_lock_guard lock(varinfo.fabric_state);
+        if (register_recv_region(varinfo.fabric_state, (char *)buffer, len, hmem_iface) != 0)
+            throw std::runtime_error("register_recv failed for " + name);
+    }
+
+    /* Undo register_recv() for the buffer starting at `buffer`.            */
+    void unregister_recv(std::string name, void *buffer)
+    {
+        const VarInfo_t &varinfo = this->varlist.at(name);
+        if (this->method == 0)
+            return;
+        fabric_state_lock_guard lock(varinfo.fabric_state);
+        if (unregister_recv_region(varinfo.fabric_state, (char *)buffer) != 0)
+            throw std::invalid_argument("buffer is not registered for " + name);
     }
 
     /* Batched get: row i of `buffer` (n contiguous rows) receives global

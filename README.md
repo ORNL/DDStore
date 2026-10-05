@@ -167,7 +167,7 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into `arr`: row `i` of `arr` receives row `indices[i]`, so `arr.shape[0]` must equal `len(indices)` (else `ValueError`). Same buffer rules as `get()` (NumPy array or CUDA/HIP tensor). Every index is checked before anything is read; an out-of-range one raises `IndexError` and leaves the store usable.
 
-For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is still one `fi_read` per row.
+For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is one `fi_read` per row, or several for a row longer than `DDSTORE_MAX_READ_BYTES` (default 1 GiB).
 
 For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/abstract/document/10820758) (see [Citation](#citation)): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator, in rounds of at most `DDSTORE_ALLTOALL_MAX_BYTES` (default 2 MiB) received per rank so large rows don't turn into one huge exchange. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
 
@@ -178,6 +178,19 @@ store.get_batch("features", out, idx)
 ```
 
 `DistDataset`/`DistDatasetReader` use it by default through `__getitems__`, which PyTorch's `DataLoader` (and `ThreadDataLoader`) calls with a whole batch's indices, so the VAE examples and job scripts read in batches with no extra flag. Set `DDSTORE_BATCH_GET=0` to fall back to one `get()` per sample.
+
+---
+
+### `register_recv(name, arr)` / `unregister_recv(name, arr)`
+
+Register `arr` (a C-contiguous NumPy array or CUDA/HIP tensor) once as a destination for `get()`/`get_batch()` of `name`. Reads into `arr` or any slice of it then skip memory registration, which otherwise happens whenever the destination isn't the buffer registered by the previous read. For large rows, registration can cost more than the transfer. Use it for buffers you reuse, such as a pool per loader thread: several can be registered per variable and none is evicted. The store holds a reference to `arr` until `unregister_recv()` or `free()`. No-op for `method=0`.
+
+```python
+pool = np.empty((batch_size, ncols), dtype=np.float32)
+store.register_recv("features", pool)
+for idx in batches:
+    store.get_batch("features", pool[: len(idx)], idx)   # no registration
+```
 
 ---
 
@@ -219,6 +232,7 @@ Release every variable's MPI window (`method=0`) or libfabric endpoints and memo
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | `method=2` handshake directory when none is given (C++ API; `PyDDStore` requires `handshake_dir`, and the examples fill it from this variable). Must be on a shared filesystem. |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds a `method=2` extra member's `join()` polls for the core group's record file. |
 | `DDSTORE_PROFILE` | off | `1` turns on `get()`/`get_batch()` timing counters, read with `get_profile(name)`. See [Performance](#performance). |
+| `DDSTORE_MAX_READ_BYTES` | `1073741824` (1 GiB) | `method=1`/`2`: largest single `fi_read`; longer rows are read in pieces (on Perlmutter's `cxi` one 5 GB read fails with `EMSGSIZE`, 2.5 GB works, and the provider doesn't report the limit). Lowered to the endpoint's `max_msg_size` when the provider reports one. |
 | `DDSTORE_ALLTOALL_MAX_BYTES` | `2097152` (2 MiB) | `method=0` `get_batch()`: bytes each rank receives per exchange round. Must be equal on all ranks. |
 
 **Read by `pyddstore.torch`** (defaults for arguments not given):
@@ -400,6 +414,7 @@ This keeps sample fetches inside a node at the cost of replicating the data per 
 ## Performance
 
 - Use **batched reads** (the default with `DistDataset`, or `get_batch()` directly). They cut per-sample cost by 10–27× for small rows and make the GPU path insensitive to worker threads; in the VAE every configuration got 1.2–3.9× faster per epoch.
+- **Reuse destination buffers** and [`register_recv()`](#register_recvname-arr--unregister_recvname-arr) them. Reading into a fresh buffer every time re-registers memory on every read; `get_profile(name)["mr_miss"]` counts those registrations.
 - `method=1` (one-sided `fi_read`) is the fastest backend; `method=0` with batching (collective) comes close for small rows.
 - `DDSTORE_PROFILE=1` + `get_profile(name)` shows where `get()`/`get_batch()` time goes: lock wait, memory registration, posting and completing `fi_read`, GPU sync. `vae-ddp.py` prints an all-rank summary when it is set. [examples/scripts/bench_get.py](examples/scripts/bench_get.py) measures per-row latency and throughput vs row size, destination, batch size and threads.
 
@@ -472,7 +487,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_single.py` | 1 | All dtypes, `add`/`get`, `init`/`update`/`get`, error handling, double `free()` |
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
-| `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads; method 0, plus method 1 over `cxi` inside a Slurm step |
+| `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads, registered destination buffers, wide rows (with `DDSTORE_MAX_READ_BYTES=4096` they are read in pieces); method 0, plus method 1 over `cxi` inside a Slurm step |
 | `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
 ### Integration scripts

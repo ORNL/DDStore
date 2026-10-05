@@ -205,3 +205,125 @@ def test_batch_concurrent_threads(comm, monkeypatch, method):
     finish(store)
     assert not errors, f"worker thread(s) raised: {errors}"
     assert all_passed(comm, not bad)
+
+
+def _mr_miss(store):
+    """recv registrations so far (None unless DDSTORE_PROFILE was set at start)."""
+    if os.environ.get("DDSTORE_PROFILE", "0") in ("", "0"):
+        return None
+    return store.get_profile("x")["mr_miss"]
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_register_recv_pool(comm, monkeypatch, method):
+    """Reads into registered buffers, from several threads, each with its own
+    buffer: every row correct and (method 1) no registration per read."""
+    size = comm.Get_size()
+    store = make_store(comm, method, monkeypatch)
+    nthreads, batch = 2, 16
+    pools = [np.zeros((4 * batch, NCOLS), dtype=np.float32) for _ in range(nthreads)]
+    for pool in pools:
+        store.register_recv("x", pool)
+    store.register_recv("x", pools[0])  # registering twice is a no-op
+    miss0 = _mr_miss(store)
+    errors, bad = [], []
+
+    def worker(t):
+        rng = np.random.default_rng(1000 * comm.Get_rank() + t)
+        pool = pools[t]
+        try:
+            for it in range(40):
+                k = it % 4
+                out = pool[k * batch : (k + 1) * batch]  # a slice of the pool
+                idx = rng.integers(0, NROWS * size, size=batch)
+                store.get_batch("x", out, idx)
+                if not np.array_equal(out, expected_rows(idx)):
+                    bad.append((t, "batch"))
+                one = pool[k * batch : k * batch + 1]
+                store.get("x", one, int(idx[0]))
+                if not np.array_equal(one, expected_rows(idx[:1])):
+                    bad.append((t, "get"))
+        except Exception as exc:  # noqa: BLE001 - surface any thread exception
+            errors.append(exc)
+
+    if method == 0:  # get_batch is collective there: one thread at a time
+        for t in range(nthreads):
+            worker(t)
+    else:
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(nthreads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    ok = not errors and not bad
+    if method != 0 and miss0 is not None:
+        ok &= _mr_miss(store) == miss0
+    for pool in pools:
+        store.unregister_recv("x", pool)
+    if method != 0:
+        with pytest.raises(ValueError):
+            store.unregister_recv("x", pools[0])
+    # unregistered buffers still work (through the one-slot cache)
+    idx = np.arange(batch) % (NROWS * size)
+    store.get_batch("x", pools[1][:batch], idx)
+    ok &= np.array_equal(pools[1][:batch], expected_rows(idx))
+    comm.Barrier()
+    finish(store)
+    assert not errors, f"worker thread(s) raised: {errors}"
+    assert all_passed(comm, ok), bad
+
+
+@pytest.mark.skipif(
+    not (HAVE_CXI and HAVE_GPU and FABRIC == "cxi"),
+    reason="requires the cxi provider and a GPU",
+)
+def test_register_recv_gpu(comm, monkeypatch):
+    size = comm.Get_size()
+    store = make_store(comm, 1, monkeypatch)
+    pool = torch.empty((64, NCOLS), dtype=torch.float32, device="cuda")
+    store.register_recv("x", pool)
+    miss0 = _mr_miss(store)
+    rng = np.random.default_rng(200 + comm.Get_rank())
+    ok = True
+    for it in range(20):
+        k = it % 4
+        out = pool[k * 16 : (k + 1) * 16]
+        idx = rng.integers(0, NROWS * size, size=16)
+        store.get_batch("x", out, idx)
+        diff = (out - torch.from_numpy(expected_rows(idx)).cuda()).abs().sum().item()
+        ok &= diff == 0.0
+    if miss0 is not None:
+        ok &= _mr_miss(store) == miss0
+    store.unregister_recv("x", pool)
+    comm.Barrier()
+    finish(store)
+    assert all_passed(comm, ok)
+
+
+WIDE = 3001  # float32 columns: 12004-byte rows
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_wide_rows(comm, monkeypatch, method):
+    """Rows of 12004 bytes. Run with DDSTORE_MAX_READ_BYTES=4096 (method 1)
+    to check that rows longer than one read are split, remainder included."""
+    size = comm.Get_size()
+    if method != 0:
+        monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    rank = comm.Get_rank()
+    store = dds.PyDDStore(comm, method=method)
+    first = rank * 4
+    rows = np.arange(first, first + 4)[:, None] * 10000.0 + np.arange(WIDE)
+    store.add("w", rows.astype(np.float32))
+    store.epoch_begin()
+    idx = np.array([(rank + 1) % size * 4 + 3, 0, size * 4 - 1])
+    out = np.zeros((len(idx), WIDE), dtype=np.float32)
+    store.get_batch("w", out, idx)
+    want = (idx[:, None] * 10000.0 + np.arange(WIDE)).astype(np.float32)
+    ok = np.array_equal(out, want)
+    one = np.zeros((1, WIDE), dtype=np.float32)
+    store.get("w", one, int(idx[0]))
+    ok &= np.array_equal(one, want[:1])
+    comm.Barrier()
+    finish(store)
+    assert all_passed(comm, ok)

@@ -36,6 +36,15 @@ extern "C"
 {
 #endif
 
+    /* One caller-registered recv buffer (see fabric_state::pinned). */
+    struct recv_region
+    {
+        struct fid_mr *mr;
+        char *base;
+        size_t len;
+        int hmem_iface;
+    };
+
     struct fabric_state
     {
         struct fi_context *ctx;
@@ -81,6 +90,14 @@ extern "C"
          * Initialised to NULL/0 so the first call always registers.          */
         char  *recv_mr_base;
         size_t recv_mr_reg_len;
+        /* Caller-registered recv regions (register_recv_region()), checked
+         * before the one-slot cache above and never evicted: the caller owns
+         * these buffers and keeps them alive until unregister / free().     */
+        struct recv_region *pinned;
+        int n_pinned;
+        /* Largest single fi_read() the endpoint accepts (FI_OPT_MAX_MSG_SIZE
+         * or ep_attr->max_msg_size); 0 if unknown. Longer rows are split.   */
+        size_t max_msg_size;
         uint64_t key;
         uint64_t *remote_key;
         uint64_t *remote_address;
@@ -196,6 +213,16 @@ extern "C"
      * before any is waited for. 0 on success. See common.cxx.             */
     int read_batch_from_remote(struct fabric_state *fabric_state, long n,
                                const int *src, const uint64_t *offset, size_t row_len);
+    /* Register [base, base + len) once as a recv buffer (hmem_iface as for
+     * recv_hmem_iface); reads into it then skip registration. Registering a
+     * region already registered is a no-op. 0 on success. Caller holds
+     * recv_lock and keeps the buffer alive until unregister / free.        */
+    int register_recv_region(struct fabric_state *fs, char *base, size_t len, int hmem_iface);
+    /* Undo register_recv_region() for the region starting at base. 0 on
+     * success, 1 if no such region. Caller holds recv_lock.               */
+    int unregister_recv_region(struct fabric_state *fs, char *base);
+    /* Close every registered recv region (free()).                         */
+    void close_recv_regions(struct fabric_state *fs);
 
     /* --- Method 2: file-based handshake ---------------------------------- */
 

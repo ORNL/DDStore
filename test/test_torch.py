@@ -202,6 +202,39 @@ def test_loaders_match_plain_source(comm, monkeypatch, method, loader):
     assert all_ok(comm, ok)
 
 
+def test_thread_loader_iterators(comm):
+    """iter(loader) is a separate iterator, as with DataLoader: iterating it
+    again continues the epoch (list(it), islice), two iterators over one
+    loader are independent, and an epoch stopped early doesn't leak into the
+    next one."""
+    import itertools
+
+    src = TupleSource()
+    ref = list(DataLoader(src, batch_size=4))
+    loader = ThreadDataLoader(src, batch_size=4, num_workers=2)
+
+    def eq(got, want):
+        return len(got) == len(want) and all(same(g, r) for g, r in zip(got, want))
+
+    it = iter(loader)
+    ok = iter(it) is it and len(it) == len(ref)
+    first = next(it)
+    two = list(itertools.islice(it, 2))
+    rest = list(it)  # continues, does not restart
+    ok &= eq([first] + two + rest, ref)
+    a, b = iter(loader), iter(loader)
+    got_a, got_b = [], []
+    for x, y in zip(a, b):  # interleaved
+        got_a.append(x)
+        got_b.append(y)
+    ok &= eq(got_a, ref) and eq(got_b, ref)
+    for i, _ in enumerate(loader):  # stop early
+        if i == 1:
+            break
+    ok &= eq(list(loader), ref)
+    assert all_ok(comm, ok)
+
+
 def test_per_sample_fallback(comm, monkeypatch):
     monkeypatch.setenv("DDSTORE_BATCH_GET", "0")
     src = TupleSource()

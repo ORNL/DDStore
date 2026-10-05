@@ -45,6 +45,29 @@ extensions = [
     extending,
 ]
 
+# The generated _core.cpp depends on the NumPy headers it was generated
+# against: one generated with NumPy 2 does not compile against NumPy 1.x
+# headers (PyDataType_ELSIZE). An editable or in-place build keeps it in
+# src/, shared by every environment that builds from this checkout, so
+# regenerate it whenever the NumPy major version differs from last time.
+numpy_major = np.__version__.split(".")[0]
+stamp = join("src", "pyddstore", "_core.numpy-version")
+try:
+    with open(stamp) as f:
+        regenerate = f.read().strip() != numpy_major
+except OSError:
+    regenerate = True
+with open(stamp, "w") as f:
+    f.write(numpy_major + "\n")
+
+# Left over from the layout before pyddstore became a package.
+for old in ("src/pyddstore.cpp",) + tuple(
+    join("src", f) for f in os.listdir("src")
+    if f.startswith("pyddstore.") and f.endswith(".so")
+):
+    if os.path.exists(old):
+        print(f"warning: stale build output {old} from the old layout; remove it")
+
 setup(
     name="PyDDStore",
     version="2.0",
@@ -52,5 +75,5 @@ setup(
     package_dir={"": "src"},
     packages=["pyddstore"],
     py_modules=["cpu_nic_map"],
-    ext_modules=cythonize(extensions),
+    ext_modules=cythonize(extensions, force=regenerate),
 )

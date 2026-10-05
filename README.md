@@ -55,7 +55,9 @@ If that fails with `ModuleNotFoundError: No module named 'distutils.msvccompiler
 SETUPTOOLS_USE_DISTUTILS=stdlib CC=cc CXX=CC pip install --no-build-isolation --no-deps -e .
 ```
 
-The package is `pyddstore` (compiled core `pyddstore._core`, plus `pyddstore.torch`). After updating from a 1.x checkout, rebuild; an old `src/pyddstore.cpython-*.so` left behind is unused and can be deleted.
+The package is `pyddstore` (compiled core `pyddstore._core`, plus `pyddstore.torch`). After updating from a 1.x checkout, rebuild; an old `src/pyddstore.cpython-*.so` or `src/pyddstore.cpp` left behind is unused and can be deleted (the build warns about them).
+
+Editable and in-place builds keep the generated `src/pyddstore/_core.cpp` in the checkout, shared by every environment that builds from it. `setup.py` regenerates it whenever the NumPy major version differs from the previous build's, because a file generated against NumPy 2 doesn't compile against NumPy 1.x headers.
 
 ## Quick Start
 

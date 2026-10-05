@@ -545,7 +545,6 @@ class ThreadDataLoader(DataLoader):
     def __init__(self, dataset, **kwargs):
         super().__init__(dataset, **kwargs)
 
-        self.fs = queue.Queue()
         # Persistent across epochs -- recreating the pool in every __iter__()
         # would leak OS threads since the old pool is never shut down.
         self._counter = mp.Value("i", 0)
@@ -609,16 +608,30 @@ class ThreadDataLoader(DataLoader):
         return (ibatch, batch)
 
     def __iter__(self):
-        # Drop what an earlier epoch left behind (it may have stopped early)
-        self.clean()
+        """A new iterator over one epoch. Each has its own sampler position
+        and queue (the thread pool is shared), so several iterators over one
+        loader don't interfere, as with ``DataLoader``."""
+        return _ThreadLoaderIter(self)
 
-        self._num_yielded = 0
-        self._sampler_iter = iter(self._index_sampler)
+    def __del__(self):
+        executor = getattr(self, "executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+
+class _ThreadLoaderIter:
+    """One epoch of a ThreadDataLoader; ``__iter__`` returns itself."""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self._sampler_iter = iter(loader._index_sampler)
         # torch's DataLoader iterator draws a base seed from the global RNG
         # here, every epoch; draw it too, so the training loop's later random
         # draws are the same as with DataLoader
-        torch.empty((), dtype=torch.int64).random_(generator=self.generator)
+        torch.empty((), dtype=torch.int64).random_(generator=loader.generator)
+        self.fs = queue.Queue()
         self.fs_iter = iter(self.fs.get, None)
+        self._num_yielded = 0
         self._next_batch_i = 0
         self._inflight = 0
         self._sampler_exhausted = False
@@ -628,12 +641,18 @@ class ThreadDataLoader(DataLoader):
         # regardless of dataset size. Mirrors torch's own prefetch_factor
         # (default 2 per worker).
         self._max_inflight = max(
-            1, (self.num_workers or 1) * (self.prefetch_factor or 2)
+            1, (loader.num_workers or 1) * (loader.prefetch_factor or 2)
         )
         self._refill()
+
+    def __iter__(self):
         return self
 
+    def __len__(self):
+        return len(self.loader)
+
     def _refill(self):
+        loader = self.loader
         while self._inflight < self._max_inflight:
             try:
                 index = next(self._sampler_iter)
@@ -642,14 +661,14 @@ class ThreadDataLoader(DataLoader):
                     self._sampler_exhausted = True
                     self.fs.put(None)
                 return
-            future = self.executor.submit(
-                self.fetch,
-                self.dataset,
+            future = loader.executor.submit(
+                loader.fetch,
+                loader.dataset,
                 self._next_batch_i,
                 index,
-                collate_fn=self.collate_fn,
-                pin_memory=self.pin_memory,
-                auto_collation=self._auto_collation,
+                collate_fn=loader.collate_fn,
+                pin_memory=loader.pin_memory,
+                auto_collation=loader._auto_collation,
             )
             self.fs.put(future)
             self._next_batch_i += 1
@@ -670,7 +689,8 @@ class ThreadDataLoader(DataLoader):
         self._num_yielded += 1
         return data
 
-    def clean(self):
+    def close(self):
+        """Cancel the batches still queued (an epoch stopped early)."""
         # Without blocking: the end marker (None) is queued only once the
         # sampler is exhausted, so an epoch that stopped early has none, and
         # waiting for it (iter(self.fs.get, None)) would block forever. Only
@@ -681,5 +701,5 @@ class ThreadDataLoader(DataLoader):
                 future.cancel()
 
     def __del__(self):
-        self.clean()
-        self.executor.shutdown(wait=False)
+        if hasattr(self, "fs"):
+            self.close()

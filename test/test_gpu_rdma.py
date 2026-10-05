@@ -316,7 +316,7 @@ def test_gpu_buffer_rejected_on_hsn(comm, monkeypatch):
     # Set up with cxi so that add() and init_fabric succeed (hsn is not
     # available on all machines, e.g. Perlmutter which is CXI-only).
     # Then switch DDSTORE_FABRIC to hsn before get() — the Python-level check
-    # in pyddstore.pyx reads the env var at get() time and rejects GPU buffers
+    # in pyddstore/_core.pyx reads the env var at get() time and rejects GPU buffers
     # with a clear error before touching the fabric.
     monkeypatch.setenv("DDSTORE_FABRIC", "cxi")
     store = dds.PyDDStore(comm, method=1)
@@ -489,7 +489,7 @@ def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
 
 def test_concurrent_get_thread_safety(comm, monkeypatch):
     """DDStore::get() releases the GIL for its blocking transfer (see the
-    `with nogil:` block in pyddstore.pyx), so multiple Python threads can
+    `with nogil:` block in pyddstore/_core.pyx), so multiple Python threads can
     genuinely be inside DDStore::get() at the same time. Without
     synchronization, concurrent calls on the same variable would race on
     the CQ poll loop and the recv-MR region cache in common.cxx (confirmed

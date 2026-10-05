@@ -28,14 +28,14 @@ target_include_directories(demo PUBLIC ddstore)
 # option(BUILD_PYTHON_BINDINGS "Build Python bindings using cython" ON)
 # find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
 # add_custom_command(
-#     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore.cpp
-#     COMMAND ${Python3_EXECUTABLE} -m cython -3 --cplus ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore.pyx
+#     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore/_core.cpp
+#     COMMAND ${Python3_EXECUTABLE} -m cython -3 --cplus ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore/_core.pyx
 #     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src
 #     DEPENDS
-#         ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore.pyx
+#         ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore/_core.pyx
 # )
 # add_library(pyddstore SHARED
-#     ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore.cpp
+#     ${CMAKE_CURRENT_SOURCE_DIR}/src/pyddstore/_core.cpp
 # )
 # set_target_properties(pyddstore PROPERTIES PREFIX "")
 # set_target_properties(pyddstore PROPERTIES POSITION_INDEPENDENT_CODE ON)

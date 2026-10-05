@@ -1,6 +1,6 @@
 # DDStore measurements and findings
 
-Measurements behind the recommendations in the [README](../README.md),
+Measurements behind the recommendations in the [documentation](index.md),
 collected on the `check-thread` branch in October 2026. Unless noted:
 `method=1`, `DDSTORE_FABRIC=cxi`, `vae-ddp.py` with `VAE_PROFILE=1`, epoch
 times averaged over all epochs but the first. Epochs are short (0.1–0.6 s),

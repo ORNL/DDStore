@@ -9,3 +9,5 @@ pyddstore.cpython-*.so
 _core.cpython-*.so
 __pycache__/
 *.pyc
+# Sphinx output
+docs/_build/

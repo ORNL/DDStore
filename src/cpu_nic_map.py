@@ -9,7 +9,7 @@ Three layers, one file:
   - allocated_nics(): affinity-aware wrapper — which NIC(s) is *this
     process*, given its actual pinning (os.sched_getaffinity), closest to.
   - select_fabric_iface(): called automatically by PyDDStore.__cinit__
-    (src/pyddstore.pyx) for method=1/2 to set FABRIC_IFACE if not already set.
+    (src/pyddstore/_core.pyx) for method=1/2 to set FABRIC_IFACE if not already set.
 
 Kernel NIC names are always hsnN under /sys/class/net, on Frontier and
 Perlmutter alike -- there is no per-system glob pattern to choose. The cxi
@@ -253,7 +253,7 @@ def select_fabric_iface(nic_map=None):
     else DDSTORE_NIC_MAP when set, or a live hwloc-calc/lstopo query
     (build_map) against this process's real CPU affinity when neither is.
 
-    Called automatically by PyDDStore.__cinit__ (src/pyddstore.pyx) for
+    Called automatically by PyDDStore.__cinit__ (src/pyddstore/_core.pyx) for
     method=1/2.
 
     nic_map: an explicit precomputed map string (serialize_env()/--env

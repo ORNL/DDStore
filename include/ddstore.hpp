@@ -102,7 +102,7 @@ public:
      * caller's own device pointer directly. The caller must keep that GPU
      * allocation alive (not garbage-collected, not reused) for as long as
      * this variable stays registered, i.e. until free() or this DDStore's
-     * destruction. pyddstore.pyx enforces this for Python callers via a
+     * destruction. pyddstore/_core.pyx enforces this for Python callers via a
      * keepalive dict; direct C++ callers must manage it themselves.         */
     template <typename T>
     void add(std::string name, T *buffer, long nrows, int disp, int hmem_iface = 0)
@@ -449,7 +449,7 @@ public:
     /* hmem_iface: 0 (FI_HMEM_SYSTEM) for a host buffer, or an fi_hmem_iface
      * value (FI_HMEM_CUDA, FI_HMEM_ROCR, ...) identifying what kind of GPU
      * memory `buffer` is. Left as a plain int (not the enum) so the Cython
-     * binding (pyddstore.pyx) can pass it without cimporting the enum;
+     * binding (pyddstore/_core.pyx) can pass it without cimporting the enum;
      * read_from_remote() in common.cxx casts it back before use.               */
     template <typename T>
     void get(std::string name, long start, long count, T *buffer, int hmem_iface = 0)

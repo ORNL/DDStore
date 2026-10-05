@@ -139,3 +139,22 @@ queue runs in order. With the default stream kept busy, 12 of 16 new streams
 were independent of it by default (every 4th collided, including the first
 created), 14 of 16 with `GPU_MAX_HW_QUEUES=8`, 15 of 16 with `16`. Relevant if
 data-loading threads get their own streams.
+
+## Perlmutter validation (2 nodes × 4 A100, CUDA 13, cxi)
+
+One 2-node debug job covering what Frontier could not:
+
+- **Tests**: `test_single` 14/14, `test_multirank` 5/5, `test_get_batch`
+  20/20 on 8 ranks, `test_gpu_rdma` 14/14 (CUDA GPUDirect, `FI_HMEM_CUDA`).
+- **VAE**: identical losses for every variant (method 0/1, host/GPU, 0/2
+  workers, per-sample/batched): 15.3781 at S=1, 54.7914 at S=2.
+- **Slingshot**: each step's `SLINGSHOT_VNIS` is `<own VNI>,<job VNI>`, job
+  VNI last, as on Frontier, so the same wrapper works. Ranks spread over
+  `cxi0`–`cxi3`. Single-node steps work even without `--network` flags (no
+  `SLINGSHOT_*` variables; cxi falls back to a default CXI service).
+- **core/extra**: split-node passes (host and `--gpu-dest`); colocate works
+  only with `job_vni` + the wrapper + `srun --overlap`.
+- **DDP setup**: training ranks must see all 4 GPUs of their node
+  (`--gpus-per-node=4`, each picks `cuda:$SLURM_LOCALID`); with
+  `--gpus-per-task=1`, NCCL 2.29 fails in DDP setup with "Cuda failure 101
+  'invalid device ordinal'". The job scripts handle this.

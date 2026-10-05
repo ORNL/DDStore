@@ -332,7 +332,7 @@ DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py -
 
 ### Slurm job scripts
 
-[job-vae-single.sh](examples/vae/script/job-vae-single.sh) runs `vae-ddp.py` as one `srun` step; [job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh) runs the core/extra split as two steps. Run either with `--help` for all options. Their `#SBATCH` lines target Frontier (`-A FUS184`, 8 ranks × 7 cores per node); adjust for other machines.
+[job-vae-single.sh](examples/vae/script/job-vae-single.sh) runs `vae-ddp.py` as one `srun` step; [job-vae-core-extra.sh](examples/vae/script/job-vae-core-extra.sh) runs the core/extra split as two steps. Run either with `--help` for all options. Their `#SBATCH` lines target Frontier (`-A FUS184`, 8 ranks × 7 cores per node); see below for Perlmutter.
 
 ```bash
 sbatch examples/vae/script/job-vae-single.sh --method=1 --num-workers=1
@@ -341,7 +341,13 @@ sbatch examples/vae/script/job-vae-core-extra.sh                       # split-n
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --core-nnodes=2
 ```
 
-`job-vae-core-extra.sh` sets up Slingshot networking for its two steps (see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi)). `--layout=colocate` (both steps on the same nodes) works on Perlmutter only. On Perlmutter, [examples/scripts/perlmutter-check.sh](examples/scripts/perlmutter-check.sh) runs the whole check-list in one job ([docs/perlmutter-checklist.md](docs/perlmutter-checklist.md)).
+`job-vae-core-extra.sh` sets up Slingshot networking for its two steps (see [Multiple `srun` steps](#multiple-srun-steps-in-one-job-method2-cxi)). `--layout=colocate` (both steps on the same nodes) works on Perlmutter only.
+
+Both scripts also run on Perlmutter: they detect the machine (`NERSC_HOST`) and use 4 ranks per node, with the training ranks seeing all 4 GPUs of their node (NCCL needs that there). Override the Frontier `#SBATCH` lines when submitting:
+
+```bash
+sbatch -A <account> -C gpu --gpus-per-node=4 examples/vae/script/job-vae-single.sh --method=1
+```
 
 ## Partitioned / Sub-communicator Usage
 

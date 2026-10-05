@@ -100,7 +100,7 @@ PyDDStore(comm, method=2, handshake_dir="/path")      # method 2, core member (n
 PyDDStore(None, method=2, handshake_dir="/path", n_core=N)  # method 2, extra member (no comm)
 ```
 
-Note: grouping ranks into independent stores (the "sub-communicator" pattern below) is done by splitting `comm` yourself before constructing `PyDDStore` — there is no `ddstore_width` constructor parameter. `DistDataset` in [examples/vae/distdataset.py](examples/vae/distdataset.py) shows the pattern (`comm.Split()` then `PyDDStore(sub_comm)`).
+Note: grouping ranks into independent stores (the "sub-communicator" pattern below) is done by splitting `comm` yourself before constructing `PyDDStore` — there is no `ddstore_width` constructor parameter. `pyddstore.torch.DistDataset` does this for you (`ddstore_width`) and shows the pattern (`comm.Split()` then `PyDDStore(sub_comm)`).
 
 ---
 
@@ -317,18 +317,38 @@ Examples: [test/test_gpu_rdma.py](test/test_gpu_rdma.py), and `--gpu-dest`/`--gp
 
 ## PyTorch Dataset Integration
 
-[examples/vae/distdataset.py](examples/vae/distdataset.py) wraps a store as a `torch.utils.data.Dataset`, and [examples/vae/vae-ddp.py](examples/vae/vae-ddp.py) trains a VAE with DDP on top of it:
+`pyddstore.torch` (needs PyTorch: `pip install .[torch]` or an existing PyTorch) turns any map-style dataset into a distributed one:
+
+```python
+import torch                                        # import torch before MPI starts
+from mpi4py import MPI
+from pyddstore.torch import DistDataset, ThreadDataLoader
+
+trainset = DistDataset(my_dataset, "train", MPI.COMM_WORLD)   # each rank loads only its share
+sampler = torch.utils.data.distributed.DistributedSampler(trainset)
+loader = ThreadDataLoader(trainset, batch_size=128, sampler=sampler, num_workers=1)
+for x, y in loader:
+    ...
+```
+
+- **`DistDataset(source, name, comm=None, ddstore_width=None, device=None, add_device=None, method=None, handshake_dir=None)`**: each rank loads its contiguous share of `source` (anything with `len()` and `[i]`) into DDStore; every rank can then read every sample. Samples keep the source's structure (a tensor, numpy array or number; a tuple or list of them; or a dict of them), with each field's shape and dtype. Fields must have the same shape and dtype in every sample; supported dtypes are bool, uint8, int32, int64, float32 and float64. `ds.shapes` / `ds.dtypes` describe the fields, `ds.ddstore` is the underlying `PyDDStore`.
+  - `method` (default `DDSTORE_METHOD` or 0) picks the backend; `ddstore_width` splits `comm` into independent stores (see [Partitioned usage](#partitioned--sub-communicator-usage)).
+  - `device` puts tensor fields of read samples on a GPU and `add_device` keeps each rank's share there ([GPUDirect](#gpudirect-rdma-gpu-resident-buffers)).
+  - **Batched by default**: `__getitems__` reads a whole batch with one [`get_batch()`](#get_batchname-arr-indices) per field, which `DataLoader` and `ThreadDataLoader` call automatically; `DDSTORE_BATCH_GET=0` reads one sample at a time. With `method=0` batched reads are collective, so every rank must iterate the same number of batches from one thread (`DistributedSampler` does).
+- **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None)`**: the same dataset read by a separate `method=2` extra job; it learns the fields from a `{name}.meta.json` file the core group writes next to the handshake records.
+- **`ThreadDataLoader(dataset, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
+
+[examples/vae/vae-ddp.py](examples/vae/vae-ddp.py) trains a VAE with DDP on top of it:
 
 ```bash
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1 --gpu-dest --gpu-source
 ```
 
-- **Batched by default.** `DistDataset.__getitems__` reads each training batch with one [`get_batch()`](#get_batchname-arr-indices) call; `DDSTORE_BATCH_GET=0` falls back to one `get()` per sample.
-- **`--num-workers`** (default 0): `0` uses PyTorch's standard `DataLoader` in the main process; `> 0` uses [`ThreadDataLoader`](examples/vae/ddstore_dataloader.py), which fetches and collates batches in worker *threads* (no fork, so it is safe with MPI and GPU buffers). It needs `method=1`/`2`. One or two workers are enough: reads on one variable are serialized by its lock, and a single batched call already keeps the network busy.
-- **`--gpu-dest` / `--gpu-source`**: fetched batches land directly on the training GPU / each rank's shard is stored on its GPU (see [GPUDirect](#gpudirect-rdma-gpu-resident-buffers)).
+- **`--num-workers`** (default 0): `0` uses PyTorch's standard `DataLoader`; `> 0` uses `ThreadDataLoader` (needs `method=1`/`2`).
+- **`--gpu-dest` / `--gpu-source`**: `DistDataset`'s `device` / `add_device`.
 - **`--replicate R`** repeats the training set R times (longer epochs); **`--image-scale S`** upscales images to (28·S)² so each row is S² larger. Both default to 1, the original example.
-- The [method=2 split](#file-based-handshake-method2) variant is [vae_core_server.py](examples/vae/vae_core_server.py) (holds the data) + [vae_extra_train.py](examples/vae/vae_extra_train.py) (trains), with the same options.
+- The [method=2 split](#file-based-handshake-method2) variant is [vae_core_server.py](examples/vae/vae_core_server.py) (a `DistDataset` core group) + [vae_extra_train.py](examples/vae/vae_extra_train.py) (a `DistDatasetReader`), with the same options.
 
 ### Slurm job scripts
 

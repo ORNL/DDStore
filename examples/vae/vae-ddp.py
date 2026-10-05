@@ -14,9 +14,7 @@ import torch.distributed as dist
 
 from mpi4py import MPI
 
-import distdataset
-from distdataset import DistDataset
-from ddstore_dataloader import ThreadDataLoader
+from pyddstore.torch import DistDataset, ThreadDataLoader
 
 from ddp_utils import setup_ddp, get_local_rank
 from vae_model import VAE, loss_function, mnist_transform
@@ -79,7 +77,7 @@ parser.add_argument(
     help="Number of DataLoader workers. 0 uses PyTorch's standard "
     "DataLoader in the main process (no worker processes, no fork). "
     "> 0 switches to ThreadDataLoader "
-    "(examples/vae/ddstore_dataloader.py), with that many worker threads "
+    "(pyddstore.torch), with that many worker threads "
     "-- forked processes can't safely own GPU state or MPI's live state, "
     "so any --num-workers > 0 goes through threads, never a fork. "
     "Requires DDSTORE_METHOD 1 or 2 when > 0. Default: 0.",

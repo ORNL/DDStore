@@ -39,8 +39,7 @@ import torch.distributed as dist
 from mpi4py import MPI
 
 from ddp_utils import setup_ddp, get_local_rank
-from distdataset import DistDatasetReader
-from ddstore_dataloader import ThreadDataLoader
+from pyddstore.torch import DistDatasetReader, ThreadDataLoader
 from vae_model import VAE, loss_function, mnist_transform
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example - extra (reader) group")
@@ -103,7 +102,7 @@ parser.add_argument(
     help="Number of DataLoader workers. 0 uses PyTorch's standard "
     "DataLoader in the main process (no worker processes, no fork). "
     "> 0 switches to ThreadDataLoader "
-    "(examples/vae/ddstore_dataloader.py), with that many worker threads "
+    "(pyddstore.torch), with that many worker threads "
     "-- forked processes can't safely own GPU state, so any "
     "--num-workers > 0 goes through threads, never a fork. Default: 0.",
 )
@@ -144,7 +143,7 @@ trainset = DistDatasetReader(
 
 # Image size comes from the core side's published data (vae_core_server.py
 # --image-scale); the model and test set must match it.
-side = trainset.side
+side = trainset.shapes[0][-1]  # samples are (image (1, side, side), label)
 image_scale = side // 28
 model = VAE(input_dim=side * side, hidden=400 * image_scale).to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)

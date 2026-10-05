@@ -35,7 +35,7 @@ import os
 import sys
 import time
 
-## torch (pulled in below via torchvision/distdataset) must finish loading
+## torch (pulled in below via torchvision/pyddstore.torch) must finish loading
 ## before mpi4py triggers MPI_Init, or - if GPU/NCCL use is ever added here -
 ## their static destructors run in the wrong order at interpreter exit and
 ## corrupt the heap. Do not reorder these imports.
@@ -44,7 +44,7 @@ from torchvision import datasets, transforms
 
 from mpi4py import MPI
 
-from distdataset import DistDataset
+from pyddstore.torch import DistDataset
 from vae_model import mnist_transform
 
 
@@ -79,7 +79,7 @@ if gpu_source:
 if rank == 0:
     os.makedirs(hs_dir, exist_ok=True)
     for fname in os.listdir(hs_dir):
-        if fname.endswith(".bin") or fname == "done_extra":
+        if fname.endswith((".bin", ".meta.json")) or fname == "done_extra":
             os.remove(os.path.join(hs_dir, fname))
     print(f"[core] handshake_dir={hs_dir}", flush=True)
 comm.Barrier()
@@ -128,7 +128,7 @@ dds_trainset.ddstore.free()
 
 if rank == 0:
     for fname in os.listdir(hs_dir):
-        if fname.endswith(".bin"):
+        if fname.endswith((".bin", ".meta.json")):
             try:
                 os.remove(os.path.join(hs_dir, fname))
             except OSError:

@@ -1,6 +1,10 @@
 # Cython build output
 build/
 src/pyddstore.cpp
+src/pyddstore/_core.cpp
 # built module
 PyDDStore.egg-info/
 pyddstore.cpython-*.so
+_core.cpython-*.so
+__pycache__/
+*.pyc

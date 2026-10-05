@@ -32,8 +32,8 @@ include_dirs.append(np.get_include())
 include_dirs.append("include")
 
 extending = Extension(
-    "pyddstore",
-    sources=["src/pyddstore.pyx", "src/ddstore.cxx", "src/common.cxx"],
+    "pyddstore._core",
+    sources=["src/pyddstore/_core.pyx", "src/ddstore.cxx", "src/common.cxx"],
     include_dirs=include_dirs,
     extra_compile_args=["-std=c++11"],
     define_macros=defs,
@@ -50,6 +50,7 @@ setup(
     version="2.0",
     description="Distributed Data Store",
     package_dir={"": "src"},
+    packages=["pyddstore"],
     py_modules=["cpu_nic_map"],
     ext_modules=cythonize(extensions),
 )

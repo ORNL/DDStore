@@ -429,7 +429,7 @@ def test_add_from_gpu_tensor_gpu_dest_cxi(comm, monkeypatch):
 def test_add_from_gpu_tensor_gpu_dest_cxi_method2(comm, monkeypatch, tmp_path):
     """Same as test_add_from_gpu_tensor_gpu_dest_cxi but method=2
     (file-based handshake, core+extra split) -- the transport
-    examples/vae/distdataset.py's DistDatasetReader actually uses. Includes
+    pyddstore.torch's DistDatasetReader actually uses. Includes
     a self-read check (core rank both add()s and get()s its own data,
     mirroring test_method2_core.py's self-check pattern) to verify the
     independent send_hmem_iface/mr vs recv_hmem_iface/recv_mr fields don't

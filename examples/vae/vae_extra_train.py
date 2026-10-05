@@ -36,15 +36,11 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import torch.distributed as dist
 
-import mpi4py
-
-mpi4py.rc.thread_level = "serialized"
-mpi4py.rc.threads = False
 from mpi4py import MPI
 
 from ddp_utils import setup_ddp, get_local_rank
-from distdataset import DistDatasetReader
-from vae_model import VAE, loss_function
+from pyddstore.torch import DistDatasetReader, ThreadDataLoader
+from vae_model import VAE, loss_function, mnist_transform
 
 parser = argparse.ArgumentParser(description="VAE MNIST Example - extra (reader) group")
 parser.add_argument(
@@ -89,6 +85,27 @@ parser.add_argument(
     default=int(os.environ.get("DDSTORE_N_CORE", "4")),
     help="number of core ranks that published the data",
 )
+parser.add_argument(
+    "--gpu-dest",
+    action="store_true",
+    default=False,
+    help="Allocate the DDStore get() destination buffer directly on the "
+    "training device (GPUDirect RDMA, Phase 1), skipping the "
+    "host->device copy. Requires DDSTORE_FABRIC=cxi and a "
+    "libfabric-backed method (already the case for this script).",
+)
+parser.add_argument(
+    "--num-workers",
+    type=int,
+    default=0,
+    metavar="N",
+    help="Number of DataLoader workers. 0 uses PyTorch's standard "
+    "DataLoader in the main process (no worker processes, no fork). "
+    "> 0 switches to ThreadDataLoader "
+    "(pyddstore.torch), with that many worker threads "
+    "-- forked processes can't safely own GPU state, so any "
+    "--num-workers > 0 goes through threads, never a fork. Default: 0.",
+)
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
@@ -115,26 +132,48 @@ elif use_mps:
 else:
     device = torch.device("cpu")
 
-print("DDP setup:", comm_size, rank, device)
+print("DDP setup:", comm_size, rank, device, "gpu_dest:", args.gpu_dest)
 
-model = VAE().to(device)
+trainset = DistDatasetReader(
+    "train",
+    args.handshake_dir,
+    args.n_core,
+    device=device if args.gpu_dest else None,
+)
+
+# Image size comes from the core side's published data (vae_core_server.py
+# --image-scale); the model and test set must match it.
+side = trainset.shapes[0][-1]  # samples are (image (1, side, side), label)
+image_scale = side // 28
+model = VAE(input_dim=side * side, hidden=400 * image_scale).to(device)
 model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-kwargs = {}
-
-trainset = DistDatasetReader("train", args.handshake_dir, args.n_core)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-train_loader = torch.utils.data.DataLoader(
-    trainset, batch_size=args.batch_size, shuffle=False, **kwargs, sampler=sampler
+if args.num_workers > 0:
+    # DistDatasetReader always joins via method=2 (file-based handshake),
+    # so no DDSTORE_METHOD=0 guard is needed here (unlike vae-ddp.py).
+    train_loader = ThreadDataLoader(
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+    )
+else:
+    train_loader = torch.utils.data.DataLoader(
+        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
+    )
+
+print(
+    f"train_loader: {type(train_loader).__name__}, num_workers={train_loader.num_workers}"
 )
 
 testset = datasets.MNIST(
-    "data", train=False, download=True, transform=transforms.ToTensor()
+    "data", train=False, download=True, transform=mnist_transform(image_scale)
 )
 test_loader = torch.utils.data.DataLoader(
-    testset, batch_size=args.batch_size, shuffle=False, **kwargs
+    testset, batch_size=args.batch_size, shuffle=False
 )
 
 
@@ -183,7 +222,7 @@ def test(epoch):
             if i == 0:
                 n = min(data.size(0), 8)
                 comparison = torch.cat(
-                    [data[:n], recon_batch.view(args.batch_size, 1, 28, 28)[:n]]
+                    [data[:n], recon_batch.view(-1, 1, side, side)[:n]]
                 )
                 save_image(
                     comparison.cpu(),
@@ -203,7 +242,7 @@ if __name__ == "__main__":
             sample = torch.randn(64, 20).to(device)
             sample = model.module.decode(sample).cpu()
             save_image(
-                sample.view(64, 1, 28, 28),
+                sample.view(64, 1, side, side),
                 "results/extra_sample_" + str(epoch) + ".png",
             )
 

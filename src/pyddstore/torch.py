@@ -498,6 +498,11 @@ class DistDatasetReader(_StoreDataset):
 
         hs = _handshake_dir(handshake_dir)
         if n_core is None:
+            if "DDSTORE_N_CORE" not in os.environ:
+                raise ValueError(
+                    "DistDatasetReader needs the number of core ranks: pass n_core= "
+                    "or set DDSTORE_N_CORE"
+                )
             n_core = int(os.environ["DDSTORE_N_CORE"])
         timeout = float(os.environ.get("DDSTORE_HANDSHAKE_TIMEOUT_S", "300"))
         path = _meta_path(hs, name)

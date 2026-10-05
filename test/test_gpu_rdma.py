@@ -178,6 +178,9 @@ def test_get_into_gpu_tensor_cxi_matrix(comm, monkeypatch):
     gathered = comm.gather(results, root=0)
     if rank == 0:
         print(f"[rank 0] ALL RESULTS: {gathered}", flush=True)
+    # gather() doesn't hold back non-root ranks; wait for every rank's reads
+    # before tearing down (see test_get_into_gpu_tensor_cxi_compute_kernel_read).
+    comm.Barrier()
     store.free()
     # Fail loudly with the full matrix visible in the log even if only one
     # combination is wrong -- this test is diagnostic, not a pass/fail gate.
@@ -220,6 +223,8 @@ def test_get_into_gpu_tensor_cxi_sync_before_get(comm, monkeypatch):
     print(f"[rank {rank}] sync-before-get: ok={ok} got={snapshot.tolist()}", flush=True)
 
     store.epoch_end()
+    # Wait for every rank's reads before tearing down (PTLTE_NOT_FOUND otherwise).
+    comm.Barrier()
     store.free()
     assert all_passed(comm, ok)
 

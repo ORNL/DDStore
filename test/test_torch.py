@@ -235,6 +235,38 @@ def test_thread_loader_iterators(comm):
     assert all_ok(comm, ok)
 
 
+def test_thread_loader_keeps_prefetch_full(comm):
+    """While the caller holds a batch, num_workers * prefetch_factor more are
+    being fetched (as with DataLoader), not one fewer."""
+    import threading
+    import time
+
+    class Counting(Dataset):
+        def __init__(self):
+            self.lock, self.batches = threading.Lock(), 0
+
+        def __len__(self):
+            return 64
+
+        def __getitems__(self, idx):
+            with self.lock:
+                self.batches += 1
+            return [torch.tensor(i) for i in idx]
+
+    src = Counting()
+    loader = ThreadDataLoader(src, batch_size=4, num_workers=2, prefetch_factor=1)
+    it = iter(loader)
+    next(it)  # held by the "training step"
+    want = 1 + 2 * 1
+    deadline = time.time() + 10
+    while src.batches < want and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)  # nothing beyond the bound should start
+    ok = src.batches == want
+    it.close()
+    assert all_ok(comm, ok), f"{src.batches} batches fetched, want {want}"
+
+
 def test_per_sample_fallback(comm, monkeypatch):
     monkeypatch.setenv("DDSTORE_BATCH_GET", "0")
     src = TupleSource()

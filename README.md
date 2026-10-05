@@ -169,7 +169,7 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into `arr`: row `i` of `arr` receives row `indices[i]`, so `arr.shape[0]` must equal `len(indices)` (else `ValueError`). Same buffer rules as `get()` (NumPy array or CUDA/HIP tensor). Every index is checked before anything is read; an out-of-range one raises `IndexError` and leaves the store usable.
 
-For `method=1`/`2` the whole batch is one call: one lock acquisition, one memory registration, and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is one `fi_read` per row, or several for a row longer than `DDSTORE_MAX_READ_BYTES` (default 1 GiB).
+For `method=1`/`2` the whole batch is one call: one lock acquisition, at most one memory registration (none into a [registered](#register_recvname-arr--unregister_recvname-arr) buffer), and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is one `fi_read` per row, or several for a row longer than `DDSTORE_MAX_READ_BYTES` (default 1 GiB).
 
 For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/abstract/document/10820758) (see [Citation](#citation)): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator, in rounds of at most `DDSTORE_ALLTOALL_MAX_BYTES` (default 2 MiB) received per rank so large rows don't turn into one huge exchange. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
 
@@ -220,7 +220,7 @@ Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. 
 
 ### `free()`
 
-Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
+Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations, including [`register_recv()`](#register_recvname-arr--unregister_recvname-arr) buffers (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
 
 ## Environment variables
 
@@ -368,7 +368,7 @@ for x, y in loader:
   - `chunk_size` loads each rank's share that many samples at a time, writing each chunk into the store before reading the next: peak memory is about the share plus one chunk, instead of about three times the share (400 MiB share: 461 vs 1202 MiB). Host storage only (not with `add_device`).
   - **Batched by default**: `__getitems__` reads a whole batch with one [`get_batch()`](#get_batchname-arr-indices) per field, which `DataLoader` and `ThreadDataLoader` call automatically; `DDSTORE_BATCH_GET=0` reads one sample at a time. With `method=0` batched reads are collective, so every rank must iterate the same number of batches from one thread (`DistributedSampler` does).
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None)`**: the same dataset read by a separate `method=2` extra job; it learns the fields from a `{name}.meta.json` file the core group writes next to the handshake records.
-- **`ThreadDataLoader(dataset, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
+- **`ThreadDataLoader(dataset, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
 
 [examples/vae/vae-ddp.py](examples/vae/vae-ddp.py) trains a VAE with DDP on top of it:
 
@@ -490,7 +490,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
 | `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads, registered destination buffers, wide rows (with `DDSTORE_MAX_READ_BYTES=4096` they are read in pieces); method 0, plus method 1 over `cxi` inside a Slurm step |
-| `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
+| `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, `ThreadDataLoader` iterators and prefetch depth, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
 ### Integration scripts
 

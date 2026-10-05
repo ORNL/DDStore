@@ -675,18 +675,16 @@ class _ThreadLoaderIter:
             self._inflight += 1
 
     def __next__(self):
-        # Refill *before* popping this call's batch, not after: refilling
-        # here only uses capacity freed by the *previous* call's batch,
-        # which -- by ordinary for-loop semantics -- the caller's loop body
-        # has already fully consumed by the time it asks for the next item
-        # (i.e. calls __next__ again). Bounds how far the executor can race
-        # ahead of consumption (memory, not correctness -- each batch is read
-        # into its own freshly allocated buffers).
-        self._refill()
+        # Submit the replacement as soon as this batch is taken, as torch's
+        # DataLoader does, so num_workers * prefetch_factor batches are being
+        # fetched while the caller's training step runs (plus the one it
+        # holds). Refilling at the start of the *next* call instead would leave
+        # one slot idle during every step.
         future = next(self.fs_iter)
         ibatch, data = future.result()
         self._inflight -= 1
         self._num_yielded += 1
+        self._refill()
         return data
 
     def close(self):

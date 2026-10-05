@@ -66,8 +66,9 @@ class ThreadDataLoader(DataLoader):
         return 0
 
     @staticmethod
-    def fetch(dataset, ibatch, index, collate_fn=None, pin_memory=False,
-              auto_collation=True):
+    def fetch(
+        dataset, ibatch, index, collate_fn=None, pin_memory=False, auto_collation=True
+    ):
         # Collate here, in the worker, before pinning: pinning per-sample
         # tensors and collating afterwards would just torch.stack them into
         # a new, unpinned tensor. Use the dataset's whole-batch fetch when it
@@ -105,7 +106,9 @@ class ThreadDataLoader(DataLoader):
         # epoch up front -- keeps memory use (GPU tensors included) bounded
         # regardless of dataset size. Mirrors torch's own prefetch_factor
         # (default 2 per worker).
-        self._max_inflight = max(1, (self.num_workers or 1) * (self.prefetch_factor or 2))
+        self._max_inflight = max(
+            1, (self.num_workers or 1) * (self.prefetch_factor or 2)
+        )
         self._refill()
         return self
 

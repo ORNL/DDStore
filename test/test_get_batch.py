@@ -22,7 +22,10 @@ import pyddstore as dds
 # fabric); also require running inside a Slurm job step.
 HAVE_CXI = bool(glob.glob("/dev/cxi*")) and "SLURM_STEP_ID" in os.environ
 FABRIC = os.environ.get("DDSTORE_FABRIC", "cxi")
-METHODS = [0, pytest.param(1, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))]
+METHODS = [
+    0,
+    pytest.param(1, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")),
+]
 
 try:
     import torch
@@ -46,7 +49,9 @@ def make_store(comm, method, monkeypatch, dtype=np.float32):
     store = dds.PyDDStore(comm, method=method)
     # row r (global) holds r*100 + column, so every element is identifiable
     first = rank * NROWS
-    data = (np.arange(first, first + NROWS)[:, None] * 100 + np.arange(NCOLS)).astype(dtype)
+    data = (np.arange(first, first + NROWS)[:, None] * 100 + np.arange(NCOLS)).astype(
+        dtype
+    )
     store.add("x", data)
     store.epoch_begin()
     return store
@@ -109,7 +114,9 @@ def test_batch_single_row(comm, monkeypatch, method):
 
 
 @pytest.mark.parametrize("method", METHODS)
-@pytest.mark.parametrize("dtype", [np.uint8, np.int32, np.float32, np.int64, np.float64])
+@pytest.mark.parametrize(
+    "dtype", [np.uint8, np.int32, np.float32, np.int64, np.float64]
+)
 def test_batch_dtypes(comm, monkeypatch, method, dtype):
     size = comm.Get_size()
     store = make_store(comm, method, monkeypatch, dtype=dtype)
@@ -142,8 +149,10 @@ def test_batch_errors_leave_store_usable(comm, monkeypatch, method):
     assert all_passed(comm, ok)
 
 
-@pytest.mark.skipif(not (HAVE_CXI and HAVE_GPU and FABRIC == "cxi"),
-                    reason="requires the cxi provider and a GPU")
+@pytest.mark.skipif(
+    not (HAVE_CXI and HAVE_GPU and FABRIC == "cxi"),
+    reason="requires the cxi provider and a GPU",
+)
 def test_batch_into_gpu_tensor(comm, monkeypatch):
     size = comm.Get_size()
     store = make_store(comm, 1, monkeypatch)
@@ -161,7 +170,10 @@ def test_batch_into_gpu_tensor(comm, monkeypatch):
     assert all_passed(comm, ok)
 
 
-@pytest.mark.parametrize("method", [pytest.param(1, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))])
+@pytest.mark.parametrize(
+    "method",
+    [pytest.param(1, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))],
+)
 def test_batch_concurrent_threads(comm, monkeypatch, method):
     """get_batch from several threads at once on one variable: the
     per-variable lock must keep each batch's rows and completions apart."""
@@ -181,7 +193,10 @@ def test_batch_concurrent_threads(comm, monkeypatch, method):
         except Exception as exc:  # noqa: BLE001 - surface any thread exception
             errors.append(exc)
 
-    threads = [threading.Thread(target=worker, args=(1000 * comm.Get_rank() + t,)) for t in range(4)]
+    threads = [
+        threading.Thread(target=worker, args=(1000 * comm.Get_rank() + t,))
+        for t in range(4)
+    ]
     for t in threads:
         t.start()
     for t in threads:

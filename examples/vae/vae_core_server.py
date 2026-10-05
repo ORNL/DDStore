@@ -97,8 +97,13 @@ comm.Barrier()
 
 if rank == 0:
     print(
-        "gpu_source:", gpu_source, "replicate:", replicate,
-        "image_scale:", image_scale, flush=True,
+        "gpu_source:",
+        gpu_source,
+        "replicate:",
+        replicate,
+        "image_scale:",
+        image_scale,
+        flush=True,
     )
 
 if rank == 0:

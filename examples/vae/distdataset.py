@@ -175,7 +175,9 @@ class DistDataset(Dataset):
         n = len(indices)
         label = np.zeros(n, dtype=np.int32)
         if self.device is not None:
-            val = torch.empty((n, self.data_disp), dtype=torch.float32, device=self.device)
+            val = torch.empty(
+                (n, self.data_disp), dtype=torch.float32, device=self.device
+            )
         else:
             val = np.zeros((n, self.data_disp), dtype=np.float32)
         self.ddstore.get_batch(f"{self.label}data", val, indices)
@@ -258,7 +260,9 @@ class DistDatasetReader(Dataset):
         n = len(indices)
         label = np.zeros(n, dtype=np.int32)
         if self.device is not None:
-            val = torch.empty((n, self.data_disp), dtype=torch.float32, device=self.device)
+            val = torch.empty(
+                (n, self.data_disp), dtype=torch.float32, device=self.device
+            )
         else:
             val = np.zeros((n, self.data_disp), dtype=np.float32)
         self.ddstore.get_batch(f"{self.label}data", val, indices)

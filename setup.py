@@ -47,7 +47,7 @@ extensions = [
 
 setup(
     name="PyDDStore",
-    version="3.0",
+    version="2.0",
     description="Distributed Data Store",
     package_dir={"": "src"},
     py_modules=["cpu_nic_map"],

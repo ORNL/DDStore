@@ -367,6 +367,23 @@ for x, y in loader:
   - `device` puts tensor fields of read samples on a GPU and `add_device` keeps each rank's share there ([GPUDirect](#gpudirect-rdma-gpu-resident-buffers)).
   - `chunk_size` loads each rank's share that many samples at a time, writing each chunk into the store before reading the next: peak memory is about the share plus one chunk, instead of about three times the share (400 MiB share: 461 vs 1202 MiB). Host storage only (not with `add_device`).
   - **Batched by default**: `__getitems__` reads a whole batch with one [`get_batch()`](#get_batchname-arr-indices) per field, which `DataLoader` and `ThreadDataLoader` call automatically; `DDSTORE_BATCH_GET=0` reads one sample at a time. With `method=0` batched reads are collective, so every rank must iterate the same number of batches from one thread (`DistributedSampler` does).
+- **Reading rows and reusing buffers** (`DistDataset` and `DistDatasetReader`):
+  - `ds.read_rows(rows, fields=None, out=None)` reads stored rows `rows` (any order, repeats allowed) of the selected fields (default all), one `get_batch()` per field, and returns a dict of values shaped `(len(rows), *field_shape)`. Keys are the sample's: dict keys, tuple/list positions, or `0` for a single value. With `method=0` it is collective, like `get_batch()`.
+  - `ds.alloc(n, fields=None)` returns buffers for `n` rows, one per field and keyed the same way, each [registered](#register_recvname-arr--unregister_recvname-arr) once. Pass them as `out=` to `read_rows()` or `ds.__getitems__(idx, out=)`: reads then skip memory registration, and the results are views into the buffers, so you decide when a buffer can be reused. `ds.release(bufs)` unregisters them; `free()` does too.
+- **`WindowedDataset(ds, window, stride=1, dilation=1, starts=None, fields=None)`**: samples made of several stored rows of `ds` (time windows, clips, sequences), each stored row held once. Sample `i` is rows `s, s + dilation, …, s + (window - 1)·dilation` with `s = i·stride`, or `s = starts[i]` when `starts` is given; use `starts` to keep only windows that don't cross a trajectory or file boundary. Fields come back stacked, `(window, *field_shape)`, in the structure of `ds`'s samples (a dict when `fields` is given). A batch of windows is one `read_rows()`.
+- **`row_of(concat, source, index)`**: with several sources in one store (a `DistDataset` over a `torch.utils.data.ConcatDataset`), the row of sample `index` of source `source`, e.g. to map (file, trajectory, step) to `starts`:
+
+```python
+from torch.utils.data import ConcatDataset
+from pyddstore.torch import DistDataset, WindowedDataset, row_of
+
+files = ConcatDataset([StepsOf(f) for f in paths])     # one sample per time step
+frames = DistDataset(files, "frames", comm, method=1)
+starts = [row_of(files, k, t) for k, f in enumerate(paths)       # windows inside each file
+          for t in range(0, len(files.datasets[k]) - 2 * dt)]
+pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+dt, t+2dt)
+```
+
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None)`**: the same dataset read by a separate `method=2` extra job; it learns the fields from a `{name}.meta.json` file the core group writes next to the handshake records.
 - **`ThreadDataLoader(dataset, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
 
@@ -490,7 +507,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
 | `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads, registered destination buffers, wide rows (with `DDSTORE_MAX_READ_BYTES=4096` they are read in pieces); method 0, plus method 1 over `cxi` inside a Slurm step |
-| `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, `ThreadDataLoader` iterators and prefetch depth, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
+| `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, `ThreadDataLoader` iterators and prefetch depth, `read_rows`/`alloc` buffers, `WindowedDataset`, `row_of`, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
 ### Integration scripts
 

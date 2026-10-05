@@ -12,6 +12,9 @@
   handshake directory.
 - ``ThreadDataLoader``: a ``DataLoader`` whose workers are threads instead of
   forked processes (safe with MPI and GPU-resident buffers).
+- ``WindowedDataset``: samples made of several stored rows (time windows,
+  clips), read with ``read_rows()``; ``row_of()`` maps a sample of one source
+  in a ``ConcatDataset`` to its row.
 
 Fields must have the same shape and dtype in every sample (fixed-shape).
 Supported dtypes: bool, uint8, int32, int64, float32, float64.
@@ -35,7 +38,13 @@ from torch.utils.data import DataLoader, Dataset
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DistDataset", "DistDatasetReader", "ThreadDataLoader"]
+__all__ = [
+    "DistDataset",
+    "DistDatasetReader",
+    "ThreadDataLoader",
+    "WindowedDataset",
+    "row_of",
+]
 
 _SUPPORTED = {
     np.dtype(np.bool_),
@@ -243,6 +252,89 @@ class _StoreDataset(Dataset):
             return row[0]
         return row[0].item()
 
+    def _batch_value(self, buf, j):
+        """All rows of field j in buf as one value of shape (n, *shape) (a
+        view, no copy). Scalar fields give a 1-D array."""
+        f = self.schema["fields"][j]
+        n = buf.shape[0]
+        shape = (n,) + tuple(f["shape"])
+        if f["kind"] == "torch":
+            t = buf if isinstance(buf, torch.Tensor) else torch.from_numpy(buf)
+            return t.reshape(shape)
+        if f["kind"] == "record":
+            return buf.view(self._record[j]).reshape(n)
+        if f["kind"] in ("structarray", "recarray"):
+            arr = buf.view(self._record[j]).reshape(shape)
+            return arr.view(np.recarray) if f["kind"] == "recarray" else arr
+        return buf.reshape(shape)
+
+    def _key(self, j):
+        """Field j's key as in a sample: dict key, tuple/list position, or 0."""
+        k = self.schema["keys"][j]
+        return k if self.schema["structure"] == "dict" else int(k)
+
+    def _field_ids(self, fields):
+        if fields is None:
+            return list(range(len(self._var)))
+        index = {self._key(j): j for j in range(len(self._var))}
+        try:
+            return [index[k] for k in fields]
+        except KeyError as exc:
+            raise KeyError(
+                f"{self.name}: no field {exc.args[0]!r} (fields: {list(index)})"
+            ) from None
+
+    def alloc(self, n, fields=None):
+        """Buffers for reads of `n` rows: a dict keyed like the sample (dict
+        key, or tuple/list position, or 0 for a single value) of one buffer
+        per field, each registered once with ``register_recv()`` so reads
+        into it skip memory registration. Pass to ``read_rows(out=)`` or
+        ``__getitems__(out=)``; reads may use the first rows only. Samples
+        read into these buffers are views into them: the caller decides when
+        a buffer can be reused. ``release()`` unregisters them."""
+        bufs = {}
+        for j in self._field_ids(fields):
+            buf = self._alloc(n, j)
+            self.ddstore.register_recv(self._var[j], buf)
+            bufs[self._key(j)] = buf
+        return bufs
+
+    def release(self, bufs):
+        """Unregister buffers from ``alloc()`` (``free()`` does it too)."""
+        for j in self._field_ids(list(bufs)):
+            self.ddstore.unregister_recv(self._var[j], bufs[self._key(j)])
+
+    def _read_field(self, j, idx, out):
+        n = len(idx)
+        if out is None:
+            buf = self._alloc(n, j)
+        else:
+            buf = out[self._key(j)]
+            if buf.shape[0] < n or tuple(buf.shape[1:]) != (self._size[j],):
+                raise ValueError(
+                    f"{self.name}: out[{self._key(j)!r}] has shape {tuple(buf.shape)}, "
+                    f"need at least ({n}, {self._size[j]}) (use alloc())"
+                )
+            buf = buf[:n]
+        self.ddstore.get_batch(self._var[j], buf, idx)
+        return buf
+
+    def read_rows(self, rows, fields=None, out=None):
+        """Read stored rows `rows` (global sample indices; any order, repeats
+        allowed) of the selected fields (default: all) with one
+        ``get_batch()`` per field. Returns a dict keyed like ``alloc()`` of
+        values shaped ``(len(rows), *field_shape)``; scalar fields give 1-D
+        arrays. `out`: buffers from ``alloc()`` (at least ``len(rows)``
+        rows); the values are then views into them.
+
+        With ``method=0`` this is collective, like ``get_batch()``: every
+        rank calls it the same number of times, in the same order."""
+        idx = np.asarray(rows, dtype=np.int64).reshape(-1)
+        return {
+            self._key(j): self._batch_value(self._read_field(j, idx, out), j)
+            for j in self._field_ids(fields)
+        }
+
     def __len__(self):
         return self.total_ns
 
@@ -260,16 +352,17 @@ class _StoreDataset(Dataset):
     def __getitem__(self, idx):
         return self.get(idx)
 
-    def __getitems__(self, indices):
+    def __getitems__(self, indices, out=None):
         """A whole batch: one get_batch() per field (DDSTORE_BATCH_GET=0:
-        one get() per sample). Called by DataLoader and ThreadDataLoader."""
-        if not self._batch_get:
+        one get() per sample). Called by DataLoader and ThreadDataLoader.
+        `out`: buffers from ``alloc()``; the samples are then views into
+        them."""
+        if not self._batch_get and out is None:
             return [self.get(i) for i in indices]
         idx = np.asarray(indices, dtype=np.int64)
         columns = []
-        for j, var in enumerate(self._var):
-            buf = self._alloc(len(idx), j)
-            self.ddstore.get_batch(var, buf, idx)
+        for j in range(len(self._var)):
+            buf = self._read_field(j, idx, out)
             columns.append([self._value(buf[i], j) for i in range(len(idx))])
         return [self._rebuild([col[i] for col in columns]) for i in range(len(idx))]
 
@@ -520,6 +613,88 @@ class DistDatasetReader(_StoreDataset):
         self.ddstore = PyDDStore(None, method=2, handshake_dir=hs, n_core=n_core)
         for var in self._var:
             self.ddstore.join(var)
+
+
+class WindowedDataset(Dataset):
+    """Samples made of several stored rows of `ds` (a ``DistDataset`` or
+    ``DistDatasetReader``): time windows, clips, sequences. Each stored row
+    is held once, however many windows use it.
+
+    Sample ``i`` is rows ``s, s + dilation, ..., s + (window - 1) * dilation``
+    with ``s = starts[i]`` if `starts` is given, else ``s = i * stride``.
+    Use `starts` to keep only windows that don't cross a boundary between
+    trajectories or files. Each field comes back stacked, shaped
+    ``(window, *field_shape)``, in the structure of `ds`'s samples, or as a
+    dict of the selected `fields`.
+
+    ``__getitems__`` reads a whole batch of windows with one
+    ``read_rows()`` (one ``get_batch()`` per field), so with ``method=0`` the
+    same collective rule applies as for ``ds``.
+    """
+
+    def __init__(self, ds, window, stride=1, dilation=1, starts=None, fields=None):
+        if window < 1 or stride < 1 or dilation < 1:
+            raise ValueError("window, stride and dilation must be >= 1")
+        self.ds = ds
+        self.window = int(window)
+        self.dilation = int(dilation)
+        self.fields = None if fields is None else list(fields)
+        self._offsets = np.arange(self.window, dtype=np.int64) * self.dilation
+        span = int(self._offsets[-1]) + 1
+        if starts is not None:
+            self.starts = np.asarray(starts, dtype=np.int64).reshape(-1)
+            bad = (self.starts < 0) | (self.starts + span > len(ds))
+            if bad.any():
+                raise IndexError(
+                    f"start {int(self.starts[bad][0])} + window span {span} is out "
+                    f"of range for {len(ds)} rows"
+                )
+        else:
+            n = (len(ds) - span) // int(stride) + 1 if len(ds) >= span else 0
+            self.starts = np.arange(n, dtype=np.int64) * int(stride)
+
+    def __len__(self):
+        return len(self.starts)
+
+    def _rows(self, indices):
+        return (self.starts[np.asarray(indices, dtype=np.int64)][:, None]
+                + self._offsets).reshape(-1)
+
+    def _sample(self, values):
+        if self.fields is not None:
+            return values
+        ds = self.ds
+        return ds._rebuild([values[ds._key(j)] for j in range(len(ds._var))])
+
+    def __getitem__(self, i):
+        if not -len(self) <= i < len(self):
+            raise IndexError(f"window {i} out of range ({len(self)} windows)")
+        return self._sample(self.ds.read_rows(self._rows([i]), self.fields))
+
+    def __getitems__(self, indices):
+        cols = self.ds.read_rows(self._rows(indices), self.fields)
+        w = self.window
+        return [
+            self._sample({k: v[b * w : (b + 1) * w] for k, v in cols.items()})
+            for b in range(len(indices))
+        ]
+
+
+def row_of(concat, source, index):
+    """The row of sample `index` of source `source` in
+    ``torch.utils.data.ConcatDataset`` `concat`, i.e. its index in a
+    ``DistDataset`` built over `concat`. Use it to map (file, trajectory,
+    step) to a row when several sources share one store."""
+    sizes = concat.cumulative_sizes
+    if not 0 <= source < len(sizes):
+        raise IndexError(f"source {source} out of range ({len(sizes)} sources)")
+    first = sizes[source - 1] if source > 0 else 0
+    if not 0 <= index < sizes[source] - first:
+        raise IndexError(
+            f"index {index} out of range for source {source} "
+            f"({sizes[source] - first} samples)"
+        )
+    return first + index
 
 
 # ---------------------------------------------------------------------------

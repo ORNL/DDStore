@@ -20,6 +20,8 @@ from pyddstore.torch import (
     DistDataset,
     DistDatasetReader,
     ThreadDataLoader,
+    WindowedDataset,
+    row_of,
 )  # noqa: E402
 
 HAVE_CXI = bool(glob.glob("/dev/cxi*")) and "SLURM_STEP_ID" in os.environ
@@ -265,6 +267,128 @@ def test_thread_loader_keeps_prefetch_full(comm):
     ok = src.batches == want
     it.close()
     assert all_ok(comm, ok), f"{src.batches} batches fetched, want {want}"
+
+
+def stacked(src, rows, key):
+    """Field `key` of src[r] for r in rows, stacked as read_rows returns it."""
+    vals = [src[int(r)] if key == 0 and not isinstance(src[0], (tuple, list, dict))
+            else src[int(r)][key] for r in rows]
+    if isinstance(vals[0], torch.Tensor):
+        return torch.stack(vals)
+    return np.stack([np.asarray(v) for v in vals])
+
+
+def same_values(a, b):
+    a = a.cpu().numpy() if isinstance(a, torch.Tensor) else np.asarray(a)
+    b = b.cpu().numpy() if isinstance(b, torch.Tensor) else np.asarray(b)
+    return a.dtype == b.dtype and a.shape == b.shape and np.array_equal(a, b)
+
+
+def shares(value, buf):
+    if isinstance(buf, torch.Tensor):
+        return value.data_ptr() == buf.data_ptr()
+    return np.shares_memory(np.asarray(value), buf)
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("source_cls", [TupleSource, DictSource, SingleSource])
+def test_read_rows_and_out(comm, monkeypatch, method, source_cls):
+    """read_rows (all fields / a subset), alloc() buffers reused across
+    reads, __getitems__(out=). Same number of calls on every rank (method 0
+    is collective)."""
+    src = source_cls()
+    ds = make(comm, monkeypatch, src, method)
+    keys = [ds._key(j) for j in range(len(ds._var))]
+    rng = np.random.default_rng(comm.Get_rank())
+    rows = rng.integers(0, N, size=10)  # any order, repeats
+    got = ds.read_rows(rows)
+    ok = list(got) == keys
+    ok &= all(same_values(got[k], stacked(src, rows, k)) for k in keys)
+    sub = ds.read_rows(rows[:3], fields=keys[-1:])
+    ok &= list(sub) == keys[-1:] and same_values(sub[keys[-1]], stacked(src, rows[:3], keys[-1]))
+    with pytest.raises(KeyError):
+        ds.read_rows(rows, fields=["nope"])
+
+    bufs = ds.alloc(16)
+    miss0 = None
+    if os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0") and method != 0:
+        miss0 = [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var]
+    for it in range(3):  # the same buffers, different rows each time
+        r = rng.integers(0, N, size=12)
+        got = ds.read_rows(r, out=bufs)
+        ok &= all(same_values(got[k], stacked(src, r, k)) for k in keys)
+        ok &= all(shares(got[k], bufs[k]) for k in keys)
+        batch = ds.__getitems__(r[:5], out=bufs)
+        ok &= all(same(b, src[int(i)]) for b, i in zip(batch, r[:5]))
+    if miss0 is not None:
+        ok &= [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var] == miss0
+    with pytest.raises(ValueError):
+        ds.read_rows(np.arange(17) % N, out=bufs)  # more rows than the buffers
+    ds.release(bufs)
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("loader", ["DataLoader", "ThreadDataLoader"])
+def test_windowed_dataset(comm, monkeypatch, method, loader):
+    """Windows with stride and dilation, explicit starts, a field subset, and
+    whole batches through a loader (one read_rows per batch)."""
+    src = TupleSource()
+    ds = make(comm, monkeypatch, src, method)
+    nf = len(ds._var)
+
+    def window(rows):
+        return tuple(stacked(src, rows, j) for j in range(nf))
+
+    wd = WindowedDataset(ds, window=3, stride=2, dilation=2)  # rows s, s+2, s+4
+    ok = len(wd) == (N - 5) // 2 + 1
+    ok &= same(wd[4], window([8, 10, 12])) and same(wd[-1], window([32, 34, 36]))
+    cls = DataLoader if loader == "DataLoader" else ThreadDataLoader
+    kw = {} if cls is DataLoader else {"num_workers": 1 if method == 0 else 2}
+    got = list(cls(wd, batch_size=4, **kw))
+    ref = [
+        torch.utils.data.default_collate([window([s, s + 2, s + 4]) for s in range(b, min(b + 8, len(wd) * 2), 2)])
+        for b in range(0, len(wd) * 2, 8)
+    ]
+    ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
+
+    starts = [0, 10, 30]  # e.g. one window per trajectory
+    ws = WindowedDataset(ds, window=2, starts=starts, fields=[0, 2])
+    ok &= len(ws) == 3
+    w = ws[1]
+    ok &= list(w) == [0, 2] and same_values(w[2], stacked(src, [10, 11], 2))
+    with pytest.raises(IndexError):
+        WindowedDataset(ds, window=2, starts=[N - 1])
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+class Offset(Dataset):
+    def __init__(self, n, base):
+        self.n, self.base = n, base
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        return np.full((3,), self.base + i, dtype=np.int64)
+
+
+def test_row_of_concat(comm, monkeypatch):
+    """Several sources in one store: row_of maps (source, index) to the row."""
+    parts = [Offset(11, 0), Offset(7, 1000), Offset(19, 2000)]
+    concat = torch.utils.data.ConcatDataset(parts)
+    ds = make(comm, monkeypatch, concat, 0)
+    ok = row_of(concat, 0, 3) == 3 and row_of(concat, 2, 0) == 18
+    rows = [row_of(concat, s, i) for s, i in [(1, 6), (2, 18), (0, 0)]]
+    got = ds.read_rows(rows)[0]
+    ok &= same_values(got, np.stack([parts[1][6], parts[2][18], parts[0][0]]))
+    for bad in [(3, 0), (1, 7), (0, -1)]:
+        with pytest.raises(IndexError):
+            row_of(concat, *bad)
+    finish(comm, ds)
+    assert all_ok(comm, ok)
 
 
 def test_per_sample_fallback(comm, monkeypatch):

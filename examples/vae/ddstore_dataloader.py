@@ -66,12 +66,17 @@ class ThreadDataLoader(DataLoader):
         return 0
 
     @staticmethod
-    def fetch(dataset, ibatch, index, collate_fn=None, pin_memory=False):
+    def fetch(dataset, ibatch, index, collate_fn=None, pin_memory=False,
+              auto_collation=True):
         # Collate here, in the worker, before pinning: pinning per-sample
         # tensors and collating afterwards would just torch.stack them into
         # a new, unpinned tensor. Use the dataset's whole-batch fetch when it
-        # has one, like torch's own map-style fetcher.
-        if getattr(dataset, "__getitems__", None):
+        # has one, like torch's own map-style fetcher. With batch_size=None
+        # (no auto-collation) the sampler's index goes to dataset[index] as
+        # is, also as torch does (e.g. samplers that yield whole batches).
+        if not auto_collation:
+            batch = dataset[index]
+        elif getattr(dataset, "__getitems__", None):
             batch = dataset.__getitems__(index)
         else:
             batch = [dataset[i] for i in index]
@@ -82,12 +87,15 @@ class ThreadDataLoader(DataLoader):
         return (ibatch, batch)
 
     def __iter__(self):
-        if self.fs.qsize() > 0:
-            for future in iter(self.fs.get, None):
-                future.cancel()
+        # Drop what an earlier epoch left behind (it may have stopped early)
+        self.clean()
 
         self._num_yielded = 0
         self._sampler_iter = iter(self._index_sampler)
+        # torch's DataLoader iterator draws a base seed from the global RNG
+        # here, every epoch; draw it too, so the training loop's later random
+        # draws are the same as with DataLoader
+        torch.empty((), dtype=torch.int64).random_(generator=self.generator)
         self.fs_iter = iter(self.fs.get, None)
         self._next_batch_i = 0
         self._inflight = 0
@@ -117,6 +125,7 @@ class ThreadDataLoader(DataLoader):
                 index,
                 collate_fn=self.collate_fn,
                 pin_memory=self.pin_memory,
+                auto_collation=self._auto_collation,
             )
             self.fs.put(future)
             self._next_batch_i += 1
@@ -139,8 +148,13 @@ class ThreadDataLoader(DataLoader):
         return data
 
     def clean(self):
-        if self.fs.qsize() > 0:
-            for future in iter(self.fs.get, None):
+        # Without blocking: the end marker (None) is queued only once the
+        # sampler is exhausted, so an epoch that stopped early has none, and
+        # waiting for it (iter(self.fs.get, None)) would block forever. Only
+        # this thread puts into fs, so qsize() is exact here.
+        while self.fs.qsize() > 0:
+            future = self.fs.get_nowait()
+            if future is not None:
                 future.cancel()
 
     def __del__(self):

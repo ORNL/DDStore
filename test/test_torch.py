@@ -70,6 +70,59 @@ class SingleSource(Dataset):
         return np.full((5,), i, dtype=np.int32)
 
 
+REC = np.dtype(
+    [
+        ("x_modules", np.float32, (4, 3)),
+        ("mask", np.bool_, (4,)),
+        ("params", np.int64, (2,)),
+    ]
+)
+# padded (align=True) and nested layout
+REC_NESTED = np.dtype(
+    [
+        ("a", np.uint8),
+        ("b", np.float64),
+        ("sub", [("c", np.int32, (2,)), ("d", np.bool_)]),
+    ],
+    align=True,
+)
+
+
+def _record(i, dtype=REC):
+    a = np.zeros((), dtype=dtype)
+    if dtype is REC:
+        a["x_modules"], a["mask"], a["params"] = i, i % 2 == 0, (i, -i)
+    else:
+        a["a"], a["b"], a["sub"]["c"], a["sub"]["d"] = (
+            i % 256,
+            i / 7,
+            (i, 2 * i),
+            i % 3 == 0,
+        )
+    return a[()]  # np.void
+
+
+class RecordSource(Dataset):
+    """Items are numpy structured records, in the forms projects use."""
+
+    def __init__(self, form):
+        self.form = form
+
+    def __len__(self):
+        return N
+
+    def __getitem__(self, i):
+        if self.form == "void":
+            return _record(i)
+        if self.form == "array":  # 1-element structured ndarray
+            return np.array([_record(i)], dtype=REC)
+        if self.form == "recarray":  # np.recarray of shape (2,)
+            return np.array([_record(i), _record(i + 1)], dtype=REC).view(np.recarray)
+        if self.form == "nested":
+            return _record(i, REC_NESTED)
+        return {"rec": _record(i), "t": torch.full((3,), float(i))}  # mixed dict
+
+
 def same(a, b):
     """Equal structure, types and values."""
     if type(a) is not type(b):
@@ -232,7 +285,7 @@ def test_gpu_device_and_add_device(comm, monkeypatch):
 def test_method2_reader(comm, monkeypatch, tmp_path):
     monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
     hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
-    src = DictSource()
+    src = RecordSource("dict")  # records + tensors: layout round-trips via meta.json
     core = DistDataset(src, "rd", comm, method=2, handshake_dir=hs)
     comm.Barrier()
     ok = True
@@ -243,4 +296,37 @@ def test_method2_reader(comm, monkeypatch, tmp_path):
         ok &= all(same(b, src[i]) for b, i in zip(reader.__getitems__(idx), idx))
         reader.ddstore.free()
     finish(comm, core)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize("chunk_size", [None, 4])
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("form", ["void", "array", "recarray", "nested", "dict"])
+def test_record_items(comm, monkeypatch, method, form, chunk_size):
+    """numpy structured records as items (or a field) come back as the same
+    kind of object with the same layout and values."""
+    src = RecordSource(form)
+    ds = make(comm, monkeypatch, src, method, chunk_size=chunk_size)
+    idx = list(range(N))[::-2]
+    ok = all(same(ds[i], src[i]) for i in idx[:4])
+    ok &= all(same(b, src[i]) for b, i in zip(ds.__getitems__(idx), idx))
+    # records don't collate with default_collate: pass collate_fn through
+    batches = list(
+        ThreadDataLoader(ds, batch_size=5, num_workers=1, collate_fn=lambda b: b)
+    )
+    ok &= all(
+        same(b, src[i]) for i, b in zip(range(N), [x for bt in batches for x in bt])
+    )
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+def test_record_dtypes_property(comm, monkeypatch):
+    ds = make(comm, monkeypatch, RecordSource("dict"), 0)
+    ok = (
+        ds.dtypes["rec"] == REC
+        and ds.dtypes["t"] == "float32"
+        and ds.shapes["rec"] == ()
+    )
+    finish(comm, ds)
     assert all_ok(comm, ok)

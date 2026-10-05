@@ -76,8 +76,43 @@ def _meta_path(handshake_dir, name):
 # ---------------------------------------------------------------------------
 
 
+def _record_descr(dtype):
+    """JSON-safe description of a structured dtype (see _record_dtype)."""
+    return json.loads(json.dumps(np.lib.format.dtype_to_descr(dtype)))
+
+
+def _record_dtype(descr):
+    """Structured dtype from _record_descr's output (JSON turns tuples into
+    lists; numpy needs them back as tuples)."""
+
+    def fix(d):
+        if isinstance(d, str):
+            return d
+        out = []
+        for item in d:
+            name = tuple(item[0]) if isinstance(item[0], list) else item[0]
+            entry = (name, fix(item[1]))
+            out.append(entry + (tuple(item[2]),) if len(item) > 2 else entry)
+        return out
+
+    return np.lib.format.descr_to_dtype(fix(descr))
+
+
 def _field_spec(value, where):
     """(kind, numpy dtype, shape) of one leaf value."""
+    # numpy structured records: stored as raw bytes (uint8), rebuilt on read
+    if isinstance(value, (np.ndarray, np.void)) and value.dtype.names is not None:
+        if isinstance(value, np.void):
+            kind, shape = "record", ()
+        else:
+            kind = "recarray" if isinstance(value, np.recarray) else "structarray"
+            shape = value.shape
+        return {
+            "kind": kind,
+            "dtype": "uint8",
+            "shape": list(shape),
+            "record": _record_descr(value.dtype),
+        }
     if isinstance(value, torch.Tensor):
         kind, dtype, shape = (
             "torch",
@@ -130,6 +165,8 @@ def _schema_of(sample, where):
 def _to_numpy_row(value):
     if isinstance(value, torch.Tensor):
         return value.detach().cpu().numpy().reshape(-1)
+    if isinstance(value, (np.ndarray, np.void)) and value.dtype.names is not None:
+        return np.frombuffer(np.array(value, dtype=value.dtype).tobytes(), np.uint8)
     return np.asarray(value).reshape(-1)
 
 
@@ -146,8 +183,14 @@ class _StoreDataset(Dataset):
         self.name = name
         self.device = device
         self._var = [f"{name}/{k}" for k in schema["keys"]]
+        self._record = [
+            _record_dtype(f["record"]) if "record" in f else None
+            for f in schema["fields"]
+        ]
         self._size = [
-            int(np.prod(f["shape"], dtype=np.int64)) for f in schema["fields"]
+            int(np.prod(f["shape"], dtype=np.int64))
+            * (rec.itemsize if rec is not None else 1)
+            for f, rec in zip(schema["fields"], self._record)
         ]
         self._batch_get = os.environ.get("DDSTORE_BATCH_GET", "1") != "0"
 
@@ -158,7 +201,13 @@ class _StoreDataset(Dataset):
 
     @property
     def dtypes(self):
-        return self._rebuild([f["dtype"] for f in self.schema["fields"]])
+        # plain fields: dtype name; record fields: the structured numpy dtype
+        return self._rebuild(
+            [
+                rec if rec is not None else f["dtype"]
+                for f, rec in zip(self.schema["fields"], self._record)
+            ]
+        )
 
     def _rebuild(self, values):
         s = self.schema["structure"]
@@ -185,6 +234,11 @@ class _StoreDataset(Dataset):
             return t.reshape(shape)
         if f["kind"] == "numpy":
             return row.reshape(shape)
+        if f["kind"] == "record":
+            return row.view(self._record[j])[0]
+        if f["kind"] in ("structarray", "recarray"):
+            arr = row.view(self._record[j]).reshape(shape)
+            return arr.view(np.recarray) if f["kind"] == "recarray" else arr
         if f["kind"] == "npscalar":
             return row[0]
         return row[0].item()

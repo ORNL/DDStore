@@ -220,6 +220,13 @@ class _StoreDataset(Dataset):
         return [self._rebuild([col[i] for col in columns]) for i in range(len(idx))]
 
 
+def _rows(values, dtype):
+    """Stack per-sample values into contiguous (n, size) rows of `dtype`."""
+    return np.ascontiguousarray(
+        np.stack([_to_numpy_row(v) for v in values]).astype(dtype, copy=False)
+    )
+
+
 class DistDataset(_StoreDataset):
     """A map-style dataset stored in DDStore across the ranks of `comm`.
 
@@ -238,6 +245,11 @@ class DistDataset(_StoreDataset):
         method: DDStore backend (default ``DDSTORE_METHOD`` or 0).
         handshake_dir: ``method=2`` directory (default
             ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
+        chunk_size: load this rank's share ``chunk_size`` samples at a time,
+            writing each chunk into the store before reading the next, so
+            only one chunk is held in memory besides the store (default:
+            read the whole share, then add it). Host storage only (no
+            ``add_device`` for tensor fields).
 
     ``ds[i]`` returns a sample with the source's structure: tensors stay
     tensors (on ``device`` if given), numpy arrays stay arrays, numbers stay
@@ -257,6 +269,7 @@ class DistDataset(_StoreDataset):
         add_device=None,
         method=None,
         handshake_dir=None,
+        chunk_size=None,
     ):
         super().__init__()
         from mpi4py import MPI
@@ -284,32 +297,20 @@ class DistDataset(_StoreDataset):
         group_rank = self.ddstore_comm.Get_rank()
         group_size = self.ddstore_comm.Get_size()
 
-        # This rank's share of the source, and the schema every rank agrees on.
+        # This rank's share of the source. Errors found locally are raised
+        # only after comparing with every rank (_raise_on_all), so a bad
+        # sample on some ranks raises on all of them instead of leaving the
+        # others blocked in a collective.
         self.total_ns = len(source)
         lo, hi = _nsplit(self.total_ns, group_size)[group_rank]
-        samples = [source[i] for i in range(lo, hi)]
-        # Check locally, but raise only after comparing with every rank, so a
-        # bad sample on some ranks raises on all of them instead of leaving
-        # the others blocked in the collective below.
-        schema, error = None, None
+        first, schema, error = None, None, None
         try:
-            if samples:
-                schema = _schema_of(samples[0], f"{name}[{lo}]")
-            for i, s in zip(range(lo + 1, hi), samples[1:]):
-                other = _schema_of(s, f"{name}[{i}]")
-                if other != schema:
-                    raise ValueError(
-                        f"{name}[{i}]: structure, shape or dtype differs from {name}[{lo}] "
-                        f"({other} vs {schema}); DistDataset needs fixed-shape samples"
-                    )
+            if hi > lo:
+                first = source[lo]
+                schema = _schema_of(first, f"{name}[{lo}]")
         except (TypeError, ValueError) as exc:
-            error = (type(exc).__name__, str(exc))
-        gathered = self.comm.allgather((schema, error))
-        errors = [e for _, e in gathered if e is not None]
-        if errors:
-            cls = TypeError if errors[0][0] == "TypeError" else ValueError
-            raise cls(errors[0][1])
-        schemas = [s for s, _ in gathered]
+            error = exc
+        schemas = self._raise_on_all(error, schema)
         if any(s is None for s in schemas):
             raise ValueError(
                 f"{name}: every rank needs at least one sample (dataset has {self.total_ns})"
@@ -319,6 +320,23 @@ class DistDataset(_StoreDataset):
                 f"{name}: samples differ in structure, shape or dtype across ranks"
             )
         self._setup_fields(schemas[0], name, device)
+        if chunk_size is not None:
+            if chunk_size < 1:
+                raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
+            if add_device is not None and any(
+                f["kind"] == "torch" for f in self.schema["fields"]
+            ):
+                raise ValueError(
+                    "chunk_size needs host storage: it can't be combined with add_device"
+                )
+
+        def check(i, sample):
+            other = _schema_of(sample, f"{name}[{i}]")
+            if other != self.schema:
+                raise ValueError(
+                    f"{name}[{i}]: structure, shape or dtype differs from {name}[{lo}] "
+                    f"({other} vs {self.schema}); DistDataset needs fixed-shape samples"
+                )
 
         hs = _handshake_dir(handshake_dir)
         if self.method == 2:
@@ -334,22 +352,56 @@ class DistDataset(_StoreDataset):
         else:
             self.ddstore = PyDDStore(self.ddstore_comm, method=self.method)
 
-        for j, var in enumerate(self._var):
-            f = self.schema["fields"][j]
-            values = [_flatten(s)[2][j] for s in samples]
-            if add_device is not None and f["kind"] == "torch":
-                rows = (
-                    torch.stack([v.reshape(-1) for v in values])
-                    .to(add_device)
-                    .contiguous()
-                )
-            else:
-                rows = np.ascontiguousarray(
-                    np.stack([_to_numpy_row(v) for v in values]).astype(
-                        f["dtype"], copy=False
+        fields = self.schema["fields"]
+        if chunk_size is None:
+            # Whole share at once: read, check, then add() each field.
+            samples, error = [first], None
+            try:
+                for i in range(lo + 1, hi):
+                    samples.append(source[i])
+                    check(i, samples[-1])
+            except (TypeError, ValueError) as exc:
+                error = exc
+            self._raise_on_all(error)
+            for j, var in enumerate(self._var):
+                values = [_flatten(s)[2][j] for s in samples]
+                if add_device is not None and fields[j]["kind"] == "torch":
+                    rows = (
+                        torch.stack([v.reshape(-1) for v in values])
+                        .to(add_device)
+                        .contiguous()
                     )
-                )
-            self.ddstore.add(var, rows)
+                else:
+                    rows = _rows(values, fields[j]["dtype"])
+                self.ddstore.add(var, rows)
+        else:
+            # Chunked: allocate every field (init, collective), then copy the
+            # share in chunks of chunk_size samples (update, local), so at most
+            # one chunk is held in memory besides the store itself.
+            for j, var in enumerate(self._var):
+                itemsize = np.dtype(fields[j]["dtype"]).itemsize
+                self.ddstore.init(var, hi - lo, self._size[j], itemsize)
+            error = None
+            try:
+                for start in range(lo, hi, chunk_size):
+                    stop = min(start + chunk_size, hi)
+                    chunk = [
+                        first if i == lo else source[i] for i in range(start, stop)
+                    ]
+                    for i, sample in zip(range(start, stop), chunk):
+                        if i != lo:
+                            check(i, sample)
+                    for j, var in enumerate(self._var):
+                        values = [_flatten(sm)[2][j] for sm in chunk]
+                        self.ddstore.update(
+                            var, _rows(values, fields[j]["dtype"]), start - lo
+                        )
+                    if start == lo:
+                        first = None  # held only for the first chunk
+            except (TypeError, ValueError) as exc:
+                error = exc
+            # also makes sure every rank has filled its share before any reads
+            self._raise_on_all(error)
         logger.debug(
             "DistDataset %s: rank %d holds [%d, %d) of %d",
             name,
@@ -358,6 +410,17 @@ class DistDataset(_StoreDataset):
             hi,
             self.total_ns,
         )
+
+    def _raise_on_all(self, error, value=None):
+        """Allgather (value, error) over comm; if any rank had an error,
+        raise it on every rank. Returns the gathered values."""
+        local = None if error is None else (type(error).__name__, str(error))
+        gathered = self.comm.allgather((value, local))
+        errors = [e for _, e in gathered if e is not None]
+        if errors:
+            cls = TypeError if errors[0][0] == "TypeError" else ValueError
+            raise cls(errors[0][1])
+        return [v for v, _ in gathered]
 
 
 class DistDatasetReader(_StoreDataset):

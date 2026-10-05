@@ -106,11 +106,12 @@ def finish(comm, ds):
     ds.ddstore.free()
 
 
+@pytest.mark.parametrize("chunk_size", [None, 1, 4])
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("source_cls", [TupleSource, DictSource, SingleSource])
-def test_items_match_source(comm, monkeypatch, method, source_cls):
+def test_items_match_source(comm, monkeypatch, method, source_cls, chunk_size):
     src = source_cls()
-    ds = make(comm, monkeypatch, src, method)
+    ds = make(comm, monkeypatch, src, method, chunk_size=chunk_size)
     rng = np.random.default_rng(comm.Get_rank())
     idx = rng.integers(0, N, size=20)
     ok = len(ds) == N
@@ -195,9 +196,18 @@ class _Bad(Dataset):
         ("object", TypeError),
     ],
 )
-def test_unsupported_samples_raise(comm, kind, exc):
+@pytest.mark.parametrize("chunk_size", [None, 3])
+def test_unsupported_samples_raise(comm, kind, exc, chunk_size):
     with pytest.raises(exc):
-        DistDataset(_Bad(kind), "bad", comm, method=0)
+        DistDataset(_Bad(kind), "bad", comm, method=0, chunk_size=chunk_size)
+    comm.Barrier()
+
+
+def test_chunk_size_needs_host_storage(comm):
+    with pytest.raises(ValueError):
+        DistDataset(TupleSource(), "c", comm, method=0, chunk_size=4, add_device="cpu")
+    with pytest.raises(ValueError):
+        DistDataset(TupleSource(), "c", comm, method=0, chunk_size=0)
     comm.Barrier()
 
 

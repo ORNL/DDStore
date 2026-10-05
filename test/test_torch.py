@@ -437,6 +437,90 @@ def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
     assert all_ok(comm, ok)
 
 
+LABELS = ["cat", "dog", "owl"]
+GROUP_INFO = {g: {"name": f"group-{g}", "scale": 1.5 * g} for g in range(4)}
+
+
+class Labeled(Dataset):
+    """Samples with a string label and an object that can't be stored."""
+
+    def __len__(self):
+        return N
+
+    def __getitem__(self, i):
+        return {
+            "x": torch.full((3,), float(i)),
+            "label": LABELS[i % 3],
+            "group": i // 10,
+            "meta": GROUP_INFO[i // 10],  # per-group object
+        }
+
+
+def labeled_encode(s):
+    return {"x": s["x"], "label": LABELS.index(s["label"]), "group": s["group"]}
+
+
+def labeled_decode(d, i):
+    return {
+        "x": d["x"],
+        "label": LABELS[d["label"]],
+        "group": d["group"],
+        "meta": GROUP_INFO[d["group"]],
+        "index": i,
+    }
+
+
+def labeled_ok(sample, i):
+    want = Labeled()[i]
+    return (
+        torch.equal(sample["x"], want["x"])
+        and sample["label"] == want["label"]
+        and sample["group"] == want["group"]
+        and sample["meta"] is GROUP_INFO[want["group"]]
+        and sample["index"] == i
+    )
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_encode_decode(comm, monkeypatch, method):
+    """encode stores ids instead of strings/objects, decode rebuilds the
+    sample with its index; ds[i], __getitems__ and a loader all decode;
+    read_rows stays row-level."""
+    with pytest.raises(TypeError):  # strings can't be stored as they are
+        make(comm, monkeypatch, Labeled(), method)
+    ds = make(comm, monkeypatch, Labeled(), method, encode=labeled_encode,
+              decode=labeled_decode)
+    ok = labeled_ok(ds[7], 7) and labeled_ok(ds[N - 1], N - 1)
+    idx = list(range(N))[::-2]
+    ok &= all(labeled_ok(sm, i) for sm, i in zip(ds.__getitems__(idx), idx))
+    kw = {"num_workers": 1 if method == 0 else 2}
+    seen = 0
+    for batch in ThreadDataLoader(ds, batch_size=8, collate_fn=lambda b: b, **kw):
+        ok &= all(labeled_ok(sm, sm["index"]) for sm in batch)
+        seen += len(batch)
+    ok &= seen == N
+    raw = ds.read_rows([4, 5])  # stored form: label ids, no meta/index
+    ok &= sorted(raw) == ["group", "label", "x"] and raw["label"].tolist() == [1, 2]
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+def test_fields_selection(comm, monkeypatch):
+    """fields= keeps the given keys / positions, in that order."""
+    ds = make(comm, monkeypatch, DictSource(), 0, fields=["y"])
+    ok = same(ds[5], {"y": DictSource()[5]["y"]})
+    finish(comm, ds)
+    src = TupleSource()
+    dt = make(comm, monkeypatch, src, 0, fields=[2, 0])
+    ok &= same(dt[9], (src[9][2], src[9][0]))
+    finish(comm, dt)
+    with pytest.raises(ValueError):
+        make(comm, monkeypatch, src, 0, fields=[0], encode=lambda s: s)
+    with pytest.raises(ValueError):  # missing key, raised on every rank
+        make(comm, monkeypatch, DictSource(), 0, fields=["nope"])
+    assert all_ok(comm, ok)
+
+
 def test_per_sample_fallback(comm, monkeypatch):
     monkeypatch.setenv("DDSTORE_BATCH_GET", "0")
     src = TupleSource()
@@ -550,6 +634,26 @@ def test_method2_reader(comm, monkeypatch, tmp_path):
         idx = list(range(N))
         ok = len(reader) == N and reader.shapes == core.shapes
         ok &= all(same(b, src[i]) for b, i in zip(reader.__getitems__(idx), idx))
+        reader.ddstore.free()
+    finish(comm, core)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
+def test_method2_reader_decode(comm, monkeypatch, tmp_path):
+    """The core group encodes, a DistDatasetReader decodes."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    core = DistDataset(Labeled(), "lab", comm, method=2, handshake_dir=hs,
+                       encode=labeled_encode)
+    comm.Barrier()
+    ok = True
+    if comm.Get_rank() == 0:
+        reader = DistDatasetReader("lab", handshake_dir=hs, n_core=comm.Get_size(),
+                                   decode=labeled_decode)
+        idx = list(range(N))
+        ok = all(labeled_ok(sm, i) for sm, i in zip(reader.__getitems__(idx), idx))
+        ok &= labeled_ok(reader[3], 3)
         reader.ddstore.free()
     finish(comm, core)
     assert all_ok(comm, ok)

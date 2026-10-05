@@ -184,6 +184,36 @@ def _to_numpy_row(value):
 # ---------------------------------------------------------------------------
 
 
+def _selector(fields):
+    """encode() keeping `fields` of a dict sample, or positions of a
+    tuple/list sample, in that order."""
+
+    def select(sample):
+        try:
+            if isinstance(sample, dict):
+                return {k: sample[k] for k in fields}
+            if isinstance(sample, (tuple, list)):
+                return type(sample)(sample[k] for k in fields)
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"fields={fields}: not in the sample ({exc!r})") from None
+        raise ValueError("fields= needs dict, tuple or list samples")
+
+    return select
+
+
+class _Encoded(Dataset):
+    """`source` with `encode` applied to every sample."""
+
+    def __init__(self, source, encode):
+        self.source, self.encode = source, encode
+
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, i):
+        return self.encode(self.source[i])
+
+
 class _StoreDataset(Dataset):
     """Reads samples described by `self.schema` from `self.ddstore`."""
 
@@ -202,6 +232,8 @@ class _StoreDataset(Dataset):
             for f, rec in zip(schema["fields"], self._record)
         ]
         self._batch_get = os.environ.get("DDSTORE_BATCH_GET", "1") != "0"
+        if not hasattr(self, "_decode"):
+            self._decode = None
 
     # -- shapes as the user sees them (same structure as a sample) --------
     @property
@@ -327,6 +359,8 @@ class _StoreDataset(Dataset):
         arrays. `out`: buffers from ``alloc()`` (at least ``len(rows)``
         rows); the values are then views into them.
 
+        Rows come back as stored: ``decode`` is not applied.
+
         With ``method=0`` this is collective, like ``get_batch()``: every
         rank calls it the same number of times, in the same order."""
         idx = np.asarray(rows, dtype=np.int64).reshape(-1)
@@ -347,7 +381,8 @@ class _StoreDataset(Dataset):
             buf = self._alloc(1, j)
             self.ddstore.get(var, buf, int(idx))
             values.append(self._value(buf[0], j))
-        return self._rebuild(values)
+        sample = self._rebuild(values)
+        return sample if self._decode is None else self._decode(sample, int(idx))
 
     def __getitem__(self, idx):
         return self.get(idx)
@@ -364,7 +399,10 @@ class _StoreDataset(Dataset):
         for j in range(len(self._var)):
             buf = self._read_field(j, idx, out)
             columns.append([self._value(buf[i], j) for i in range(len(idx))])
-        return [self._rebuild([col[i] for col in columns]) for i in range(len(idx))]
+        samples = [self._rebuild([col[i] for col in columns]) for i in range(len(idx))]
+        if self._decode is not None:
+            samples = [self._decode(sm, int(i)) for sm, i in zip(samples, idx)]
+        return samples
 
 
 def _rows(values, dtype):
@@ -397,6 +435,19 @@ class DistDataset(_StoreDataset):
             only one chunk is held in memory besides the store (default:
             read the whole share, then add it). Host storage only (no
             ``add_device`` for tensor fields).
+        encode: ``encode(sample) -> sample`` applied to every source sample
+            before it is stored: pick and convert what to store (e.g. drop
+            metadata objects, turn a label string into an id). Its result
+            must meet the rules above.
+        decode: ``decode(stored, index) -> sample`` applied to every sample
+            read (``ds[i]``, ``__getitems__``), with its index: add back
+            what wasn't stored (constants, tables looked up by index or by
+            a stored id). Runs on the reading rank, in the loader thread;
+            anything it looks up must be on every rank. Not applied by
+            ``read_rows()`` or ``WindowedDataset`` (row-level reads).
+        fields: store only these keys (dict samples) or positions
+            (tuple/list samples), in this order: shorthand for an
+            ``encode`` that selects them. Not together with ``encode``.
 
     ``ds[i]`` returns a sample with the source's structure: tensors stay
     tensors (on ``device`` if given), numpy arrays stay arrays, numbers stay
@@ -417,9 +468,20 @@ class DistDataset(_StoreDataset):
         method=None,
         handshake_dir=None,
         chunk_size=None,
+        encode=None,
+        decode=None,
+        fields=None,
     ):
         super().__init__()
         from mpi4py import MPI
+
+        if fields is not None:
+            if encode is not None:
+                raise ValueError("pass either fields or encode, not both")
+            encode = _selector(list(fields))
+        if encode is not None:
+            source = _Encoded(source, encode)
+        self._decode = decode
 
         from ._core import PyDDStore
 
@@ -580,13 +642,16 @@ class DistDatasetReader(_StoreDataset):
             ``./ddstore_hs``).
         n_core: number of core ranks (default ``DDSTORE_N_CORE``).
         device: put tensor fields of read samples on this device.
+        decode: as for ``DistDataset`` (the core group's ``encode`` already
+            ran before storing).
 
     Waits up to ``DDSTORE_HANDSHAKE_TIMEOUT_S`` (default 300 s) for the core
     group to publish.
     """
 
-    def __init__(self, name, handshake_dir=None, n_core=None, device=None):
+    def __init__(self, name, handshake_dir=None, n_core=None, device=None, decode=None):
         super().__init__()
+        self._decode = decode
         from ._core import PyDDStore
 
         hs = _handshake_dir(handshake_dir)

@@ -105,8 +105,11 @@ cdef extern from "ddstore.hpp":
         # Method 2: core member (with MPI communicator; n_core == comm size)
         DDStore(int method, libmpi.MPI_Comm comm,
                 string handshake_dir)
+        # Methods 1/2 without MPI: rank of size, records exchanged via files
+        DDStore(int method, string handshake_dir, int rank, int size,
+                string ns) except +
         # Method 2: extra member (no MPI communicator)
-        DDStore(int method, string handshake_dir, int n_core)
+        DDStore(int method, string handshake_dir, int n_core) except +
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except + nogil
         void get_batch[T](string name, const long *idx, long n, T* buffer, int hmem_iface) except + nogil
@@ -144,15 +147,28 @@ cdef class PyDDStore:
     cdef long _prof_gets
 
     def __cinit__(self, comm_or_none=None, int method=0,
-                  str handshake_dir="", int n_core=0, nic_map=None):
+                  str handshake_dir="", int n_core=0, nic_map=None,
+                  rank=None, int size=0, str exchange_ns=""):
         """
         Constructors:
           PyDDStore(comm)                          — method 0, MPI
           PyDDStore(comm, method=1)                — method 1, libfabric+MPI
           PyDDStore(comm, method=2,                — method 2, core member
                     handshake_dir="/path")            (n_core == comm size)
+          PyDDStore(None, method=1,                — method 1 without MPI:
+                    handshake_dir="/path",            this process is rank r
+                    rank=r, size=N)                   of N
+          PyDDStore(None, method=2,                — method 2 core member
+                    handshake_dir="/path",            without MPI (size= also
+                    rank=r, n_core=N)                 accepted for n_core)
           PyDDStore(None, method=2,                — method 2, extra member
                     handshake_dir="/path", n_core=N)
+
+        Without a communicator, ranks exchange their handshake records
+        through files in handshake_dir (on a filesystem all ranks see), and
+        every rank must create its stores in the same order. exchange_ns
+        names this store's exchange files; by default stores are numbered
+        in creation order.
 
         nic_map: optional precomputed CPU->NIC map string (see
           cpu_nic_map.py --env) used to select FABRIC_IFACE for this rank's
@@ -170,7 +186,23 @@ cdef class PyDDStore:
         self._prof_gets = 0
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
-        if method == 2:
+        if comm_or_none is None and rank is not None:
+            # Methods 1/2 without MPI.
+            if method not in (1, 2):
+                raise ValueError(
+                    "a store without an MPI communicator needs method=1 or 2 "
+                    "(got method=%d)" % method)
+            if not handshake_dir:
+                raise ValueError(
+                    "a store without an MPI communicator needs handshake_dir "
+                    "(a directory every rank sees)")
+            if size <= 0:
+                size = n_core
+            if size <= 0:
+                raise ValueError("rank= needs size= (or n_core= for method=2) > 0")
+            self.c_ddstore = new DDStore(method, s2b(handshake_dir), <int>rank,
+                                         size, s2b(exchange_ns))
+        elif method == 2:
             if not handshake_dir:
                 raise ValueError(
                     "method=2 requires handshake_dir (got handshake_dir=%r)"

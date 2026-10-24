@@ -6,6 +6,7 @@
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,6 +14,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 /* hsn (tcp;ofi_rxm over Slingshot) path — DDSTORE_FABRIC=hsn (default).
@@ -539,28 +542,22 @@ void init_fabric(struct fabric_state *fabric)
         init_fabric_hsn(fabric);
 }
 
-int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
+/* Register send_data (send_hmem_iface) for remote reads and set fs->key.
+ * Methods 1 and 2 core ranks, before exchange_records().                  */
+void register_send_mr(struct fabric_state *fabric_state)
 {
-    char address[DP_AV_DEF_SIZE];
-    size_t address_len = DP_AV_DEF_SIZE;
-    int world_size = fabric_state->world_size;
-    int rank = fabric_state->rank;
-
     bool send_is_hmem = fabric_state->send_hmem_iface != FI_HMEM_SYSTEM;
     if (send_is_hmem && !is_hmem_capable(fabric_state))
-    {
-        fprintf(stderr, "GPU (HMEM) send buffer requested but fabric is not cxi\n");
-        return 1;
-    }
+        throw std::runtime_error("GPU (HMEM) send buffer requested but fabric is not cxi");
 
     int mr_rc;
     if (send_is_hmem)
     {
         /* GPU source buffer. This MR is only ever the passive TARGET of
          * other ranks' fi_read() (via remote_key/remote_address, exchanged
-         * below) -- never the local operand of a local fi_read/fi_write on
-         * this rank -- so unlike recv_mr in read_from_remote(), no
-         * fi_mr_desc()/local descriptor is needed here at all.              */
+         * in exchange_records()) -- never the local operand of a local
+         * fi_read/fi_write on this rank -- so unlike recv_mr in
+         * read_from_remote(), no fi_mr_desc()/local descriptor is needed.   */
         struct iovec iov = {fabric_state->send_data, fabric_state->send_data_len};
         struct fi_mr_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -585,11 +582,8 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
             NULL);
     }
     if (mr_rc != FI_SUCCESS)
-    {
-        fprintf(stderr, "%s (send) failed: %s\n",
-                send_is_hmem ? "fi_mr_regattr" : "fi_mr_reg", fi_strerror(mr_rc));
-        return 1;
-    }
+        throw std::runtime_error(std::string(send_is_hmem ? "fi_mr_regattr" : "fi_mr_reg") +
+                                 " (send) failed: " + fi_strerror(mr_rc));
 
     /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before use.
      * The provider-assigned key is only valid after fi_mr_enable(). No-op
@@ -598,68 +592,63 @@ int handshake(struct fabric_state *fabric_state, MPI_Comm comm)
     {
         int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
         if (rc != FI_SUCCESS)
-        {
-            fprintf(stderr, "fi_mr_bind (send) failed: %s\n", fi_strerror(rc));
-            return 1;
-        }
+            throw std::runtime_error(std::string("fi_mr_bind (send) failed: ") + fi_strerror(rc));
         rc = fi_mr_enable(fabric_state->mr);
         if (rc != FI_SUCCESS)
-        {
-            fprintf(stderr, "fi_mr_enable (send) failed: %s\n", fi_strerror(rc));
-            return 1;
-        }
+            throw std::runtime_error(std::string("fi_mr_enable (send) failed: ") + fi_strerror(rc));
     }
     fabric_state->key = fi_mr_key(fabric_state->mr);
+}
 
-    int status = fi_getname((fid_t)fabric_state->signal, address, &address_len);
+/* Fill fs->comm_partner/remote_key/remote_address (n entries) from the
+ * records, inserting each fabric address into fs->av.                     */
+static void use_records(struct fabric_state *fs, const struct CoreRecord *all, int n)
+{
+    fs->comm_partner   = (fi_addr_t *)malloc(n * sizeof(fi_addr_t));
+    fs->remote_key     = (uint64_t  *)malloc(n * sizeof(uint64_t));
+    fs->remote_address = (uint64_t  *)malloc(n * sizeof(uint64_t));
+    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
+        throw std::runtime_error("malloc failed for handshake arrays");
+    for (int i = 0; i < n; i++)
+    {
+        int rc = fi_av_insert(fs->av, all[i].fabric_address, 1,
+                              &fs->comm_partner[i], 0, NULL);
+        if (rc != 1)
+            throw std::runtime_error("fi_av_insert failed for rank " + std::to_string(i) +
+                                     " (rc=" + std::to_string(rc) + ")");
+        fs->remote_key[i]     = all[i].key;
+        fs->remote_address[i] = all[i].base_address;
+    }
+    fs->world_size = n;
+}
+
+/* Gather every rank's CoreRecord (fabric address, MR key, base address,
+ * row count and shape) over `ex` into `all` (ex.size entries, by rank) and
+ * set up fs for reading from every rank. Collective over ex. Methods 1 and
+ * 2 core ranks, after register_send_mr().                                 */
+void exchange_records(struct fabric_state *fs, Exchange &ex,
+                      long nrows, int disp, int itemsize,
+                      std::vector<struct CoreRecord> &all)
+{
+    struct CoreRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.fabric_address_len = DP_AV_DEF_SIZE;
+    int status = fi_getname((fid_t)fs->signal, rec.fabric_address, &rec.fabric_address_len);
     if (status != FI_SUCCESS)
-    {
-        fprintf(stderr, "fi_getname failed: %s\n", fi_strerror(status));
-        return 1;
-    }
-
-    fabric_state->comm_partner   = (fi_addr_t *)malloc(world_size * sizeof(fi_addr_t));
-    fabric_state->remote_key     = (uint64_t  *)malloc(world_size * sizeof(uint64_t));
-    fabric_state->remote_address = (uint64_t  *)malloc(world_size * sizeof(uint64_t));
-
-    char *address_data = (char *)malloc(world_size * address_len);
-    for (int i = 0; i < address_len; i++)
-    {
-        address_data[rank * address_len + i] = address[i];
-    }
-    MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, address_data, address_len, MPI_CHAR, comm);
-    for (int i = 0; i < world_size; i++)
-    {
-        fi_av_insert(fabric_state->av, address_data + address_len * i, 1, &(fabric_state->comm_partner[i]), 0, NULL);
-    }
-
-    uint64_t *key_data = (uint64_t *)malloc(world_size * sizeof(uint64_t));
-    key_data[rank] = fabric_state->key;
-    MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, key_data, 1, MPI_UINT64_T, comm);
-    for (int i = 0; i < world_size; i++)
-    {
-        fabric_state->remote_key[i] = key_data[i];
-    }
-
-    size_t *pointer_addr_data = (size_t *)malloc(world_size * sizeof(size_t));
+        throw std::runtime_error(std::string("fi_getname failed: ") + fi_strerror(status));
+    rec.key = fs->key;
     /* With FI_MR_VIRT_ADDR the remote offset in fi_read is the virtual
      * address; without it (e.g. CXI with FI_MR_PROV_KEY) it is 0-based
-     * from the MR registration base, so exchange 0. Always true (the real
-     * pointer) for hsn/verbs/gni/psm2.                                       */
-    pointer_addr_data[rank] = is_virt_addr(fabric_state)
-                                  ? (size_t)fabric_state->send_data
-                                  : 0;
+     * from the MR registration base, so exchange 0. Always the real
+     * pointer for hsn/verbs/gni/psm2.                                       */
+    rec.base_address = is_virt_addr(fs) ? (uint64_t)(uintptr_t)fs->send_data : 0;
+    rec.nrows        = nrows;
+    rec.disp         = disp;
+    rec.itemsize     = itemsize;
 
-    MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, pointer_addr_data, 1, MPI_UNSIGNED_LONG, comm);
-    for (int i = 0; i < world_size; i++)
-    {
-        fabric_state->remote_address[i] = pointer_addr_data[i];
-    }
-
-    free(address_data);
-    free(key_data);
-    free(pointer_addr_data);
-    return 0;
+    all.resize(ex.size);
+    ex.allgather(&rec, all.data(), sizeof(rec));
+    use_records(fs, all.data(), ex.size);
 }
 
 /* Register [base, base + len) for receiving (FI_READ) into *out; hmem_iface
@@ -1005,7 +994,7 @@ int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset
  * File naming convention:
  *   {dir}/{varname}.bin   — one combined file per variable, holding all
  *                           n_core CoreRecords, written once by core rank 0
- *                           after an MPI_Allgather among core ranks.
+ *                           after exchange_records() among core ranks.
  *
  * Directory resolution priority:
  *   1. user_dir argument (non-empty string)
@@ -1072,126 +1061,48 @@ static int handshake_timeout_s(void)
 }
 
 /* --------------------------------------------------------------------------
- * handshake_write()
+ * publish_records()
  *
- * Called by each core rank after init_fabric() and fi_mr_reg().
- * Exchanges CoreRecords with all other core ranks via MPI_Allgather over
- * `comm` — no filesystem round-trip needed, since core ranks already share
- * a communicator.  Builds this rank's address vector / remote key / remote
- * address arrays from the gathered records.  Rank 0 additionally publishes
- * the combined array to {resolved_dir}/{varname}.bin (tmp + fsync + rename)
- * so extra members can join later.
+ * Method 2, core rank 0, after exchange_records(): write the combined
+ * record array to {resolved_dir}/{varname}.bin for extra members to join.
+ * Written to a temp file first, fsynced, then atomically renamed into place
+ * so readers polling the final path never observe a partially-written or
+ * truncated-then-being-rewritten record.
  * -------------------------------------------------------------------------- */
-extern "C" int handshake_write(struct fabric_state *fs, MPI_Comm comm,
-                    const char *dir, const char *varname,
-                    int n_core, long nrows, int disp, int itemsize,
-                    long *lenlist)
+void publish_records(const char *dir, const char *varname,
+                     const std::vector<struct CoreRecord> &all)
 {
-    int rank = 0;
-    MPI_Comm_rank(comm, &rank);
+    const char *rdir = resolve_handshake_dir(dir);
+    char bin_path[4096];
+    char tmp_path[4096 + 32];
+    record_path(bin_path, sizeof(bin_path), rdir, varname);
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
+    const size_t n = all.size();
 
-    /* Build this rank's CoreRecord. */
-    struct CoreRecord rec;
-    memset(&rec, 0, sizeof(rec));
-
-    rec.fabric_address_len = DP_AV_DEF_SIZE;
-    int status = fi_getname((fid_t)fs->signal,
-                            rec.fabric_address, &rec.fabric_address_len);
-    if (status != FI_SUCCESS)
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f)
+        throw std::runtime_error(std::string("publish_records: cannot open ") + tmp_path +
+                                 ": " + strerror(errno));
+    if (fwrite(all.data(), sizeof(struct CoreRecord), n, f) != n ||
+        fflush(f) != 0 || fsync(fileno(f)) != 0)
     {
-        fprintf(stderr, "[handshake_write] fi_getname failed: %s\n",
-                fi_strerror(status));
-        return 1;
-    }
-
-    rec.key          = fs->key;
-    /* Same rule as handshake(): 0 for CXI's provider-key mode, the real
-     * pointer otherwise (always true for hsn/verbs/gni/psm2).               */
-    rec.base_address = is_virt_addr(fs) ? (uint64_t)(uintptr_t)fs->send_data : 0;
-    rec.nrows        = nrows;
-    rec.disp         = disp;
-    rec.itemsize     = itemsize;
-
-    /* Exchange records among core ranks directly over MPI. */
-    std::vector<struct CoreRecord> all_recs(n_core);
-    MPI_Allgather(&rec, sizeof(rec), MPI_BYTE,
-                 all_recs.data(), sizeof(rec), MPI_BYTE, comm);
-
-    /* Build this rank's address vector / remote key / remote address
-     * arrays from the gathered records. */
-    fs->comm_partner   = (fi_addr_t *)malloc(n_core * sizeof(fi_addr_t));
-    fs->remote_key     = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
-    fs->remote_address = (uint64_t  *)malloc(n_core * sizeof(uint64_t));
-    if (!fs->comm_partner || !fs->remote_key || !fs->remote_address)
-    {
-        fprintf(stderr, "[handshake_write] malloc failed\n");
-        return 1;
-    }
-    for (int i = 0; i < n_core; i++)
-    {
-        int rc = fi_av_insert(fs->av, all_recs[i].fabric_address, 1,
-                              &fs->comm_partner[i], 0, NULL);
-        if (rc != 1)
-        {
-            fprintf(stderr,
-                    "[handshake_write] fi_av_insert failed for rank %d (rc=%d)\n",
-                    i, rc);
-            return 1;
-        }
-        fs->remote_key[i]     = all_recs[i].key;
-        fs->remote_address[i] = all_recs[i].base_address;
-        lenlist[i]            = all_recs[i].nrows;
-    }
-    fs->world_size = n_core;
-
-    /* Rank 0 publishes the combined record array for extra members.  Write
-     * to a temp file first, fsync, then atomically rename into place so
-     * readers polling the final path never observe a partially-written or
-     * truncated-then-being-rewritten record.                                */
-    if (rank == 0)
-    {
-        const char *rdir = resolve_handshake_dir(dir);
-        char bin_path[4096];
-        char tmp_path[4096 + 32];
-        record_path(bin_path, sizeof(bin_path), rdir, varname);
-        snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", bin_path, (int)getpid());
-
-        FILE *f = fopen(tmp_path, "wb");
-        if (!f)
-        {
-            fprintf(stderr, "[handshake_write] cannot open %s: ", tmp_path);
-            perror("");
-            return 1;
-        }
-        if (fwrite(all_recs.data(), sizeof(struct CoreRecord), n_core, f) != (size_t)n_core)
-        {
-            fprintf(stderr, "[handshake_write] fwrite failed for %s\n", tmp_path);
-            fclose(f);
-            unlink(tmp_path);
-            return 1;
-        }
-        if (fflush(f) != 0 || fsync(fileno(f)) != 0)
-        {
-            fprintf(stderr, "[handshake_write] fsync failed for %s: ", tmp_path);
-            perror("");
-            fclose(f);
-            unlink(tmp_path);
-            return 1;
-        }
+        int e = errno;
         fclose(f);
+        unlink(tmp_path);
+        throw std::runtime_error(std::string("publish_records: write failed for ") + tmp_path +
+                                 ": " + strerror(e));
+    }
+    fclose(f);
 
-        if (rename(tmp_path, bin_path) != 0)
-        {
-            fprintf(stderr, "[handshake_write] rename %s -> %s failed: ", tmp_path, bin_path);
-            perror("");
-            unlink(tmp_path);
-            return 1;
-        }
-
-        fprintf(stderr, "[handshake_write] wrote %s (%d records)\n", bin_path, n_core);
+    if (rename(tmp_path, bin_path) != 0)
+    {
+        int e = errno;
+        unlink(tmp_path);
+        throw std::runtime_error(std::string("publish_records: rename to ") + bin_path +
+                                 " failed: " + strerror(e));
     }
 
-    return 0;
+    fprintf(stderr, "[publish_records] wrote %s (%zu records)\n", bin_path, n);
 }
 
 /* --------------------------------------------------------------------------
@@ -1199,7 +1110,7 @@ extern "C" int handshake_write(struct fabric_state *fs, MPI_Comm comm,
  *
  * Called by extra members (no MPI communicator, no data to publish).
  * Polls for {resolved_dir}/{varname}.bin (the combined record file written
- * by core rank 0 in handshake_write()) to reach its expected size, reads
+ * by core rank 0 in publish_records()) to reach its expected size, reads
  * it, and populates:
  *   fs->comm_partner[0..n_core-1]   (fi_addr_t, via fi_av_insert)
  *   fs->remote_key[0..n_core-1]

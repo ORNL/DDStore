@@ -38,6 +38,7 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_multirank.py` | 2 (4 recommended) | Remote reads, shard boundaries, multiple variables, `ddstore_width` grouping |
 | `test/test_gpu_rdma.py` | 2 | GPU-resident `add()`/`get()` in both directions, both libfabric methods, negative/error cases |
 | `test/test_get_batch.py` | 2 (4 recommended) | `get_batch()`: shuffled indices across ranks with repeats, single row, dtypes, error recovery, GPU destination, concurrent threads, registered destination buffers, wide rows (with `DDSTORE_MAX_READ_BYTES=4096` they are read in pieces); method 0, plus method 1 over `cxi` inside a Slurm step |
+| `test/test_file_exchange.py` | 2 (4 recommended) | Methods 1 and 2 without an MPI communicator (`rank=`/`size=`, records exchanged through files): `get`/`get_batch`, uneven shards with `init`/`update`, several stores and variables, stale exchange files, an extra member joining, same layout as the MPI exchange, shape mismatch, bad arguments, GPU buffers; inside a Slurm step with a CXI device |
 | `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source, `ThreadDataLoader` iterators and prefetch depth, `read_rows`/`alloc` buffers, `reuse_buffers` (also with GPU buffers), `WindowedDataset`, `row_of`, `encode`/`decode`/`fields`, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
 ## Integration scripts

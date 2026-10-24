@@ -26,6 +26,13 @@ int sortedsearch(const std::vector<long> &vec, long num)
                               std::upper_bound(vec.begin(), vec.end(), num));
 }
 
+static void check_method(int method)
+{
+    if (method < 0 || method > 2)
+        throw std::invalid_argument("method must be 0, 1 or 2 (got " + std::to_string(method) + ")");
+}
+
+#ifdef DDSTORE_HAVE_MPI
 DDStore::DDStore() : method(0), comm_size(1), rank(0), n_core(0), is_extra(false)
 {
     this->comm = MPI_COMM_SELF;
@@ -42,10 +49,13 @@ DDStore::DDStore(MPI_Comm comm) : method(0), n_core(0), is_extra(false)
 
 DDStore::DDStore(int method, MPI_Comm comm) : n_core(0), is_extra(false)
 {
+    check_method(method);
     this->method = method;
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
+    if (method != 0)
+        this->exchange.reset(new MpiExchange(comm, this->rank, this->comm_size));
 }
 
 /* Method 2: core member constructor. n_core is derived from comm_size —
@@ -54,20 +64,47 @@ DDStore::DDStore(int method, MPI_Comm comm,
                  const std::string &handshake_dir)
     : is_extra(false)
 {
+    check_method(method);
     this->method        = method;
     this->comm          = comm;
     this->handshake_dir = resolve_dir(handshake_dir);
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
     this->n_core        = this->comm_size;
+    if (method != 0)
+        this->exchange.reset(new MpiExchange(comm, this->rank, this->comm_size));
     fprintf(stderr, "[DDStore] method=2 core: handshake_dir=%s, n_core=%d\n",
             this->handshake_dir.c_str(), this->n_core);
+}
+#endif
+
+/* Methods 1/2 without MPI: records are exchanged through files in dir.     */
+DDStore::DDStore(int method, const std::string &dir, int rank, int size,
+                 const std::string &ns)
+    : comm_size(size), rank(rank), n_core(0), is_extra(false)
+{
+    if (method != 1 && method != 2)
+        throw std::invalid_argument(
+            "a store without an MPI communicator needs method 1 or 2 (got " +
+            std::to_string(method) + ")");
+    this->method        = method;
+    this->handshake_dir = resolve_dir(dir);
+    if (method == 2)
+        this->n_core = size;
+    this->exchange.reset(new FileExchange(this->handshake_dir, rank, size,
+                                          ns.empty() ? next_exchange_ns() : ns));
+    if (method == 2)
+        fprintf(stderr, "[DDStore] method=2 core (no MPI): handshake_dir=%s, rank=%d, n_core=%d\n",
+                this->handshake_dir.c_str(), rank, size);
 }
 
 /* Method 2: extra member constructor (no MPI communicator needed). */
 DDStore::DDStore(int method, const std::string &handshake_dir, int n_core)
-    : comm(MPI_COMM_SELF), comm_size(1), rank(0), is_extra(true)
+    : comm_size(1), rank(0), is_extra(true)
 {
+    if (method != 2)
+        throw std::invalid_argument("an extra member needs method 2 (got " +
+                                    std::to_string(method) + ")");
     this->method        = method;
     this->handshake_dir = resolve_dir(handshake_dir);
     this->n_core        = n_core;
@@ -87,6 +124,7 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
 
 void DDStore::epoch_begin()
 {
+#ifdef DDSTORE_HAVE_MPI
     if (!this->method)
     {
         for (auto &x : this->varlist)
@@ -97,11 +135,13 @@ void DDStore::epoch_begin()
             x.second.fence_active = true;
         }
     }
+#endif
     /* Methods 1 and 2 use libfabric — no fence needed. */
 }
 
 void DDStore::epoch_end()
 {
+#ifdef DDSTORE_HAVE_MPI
     if (!this->method)
     {
         for (auto &x : this->varlist)
@@ -112,6 +152,7 @@ void DDStore::epoch_end()
             x.second.fence_active = false;
         }
     }
+#endif
     /* Methods 1 and 2 use libfabric — no fence needed. */
 }
 
@@ -168,7 +209,6 @@ void DDStore::join(std::string name)
     var.name         = name;
     var.itemsize     = out_itemsize;
     var.disp         = out_disp;
-    var.win          = MPI_WIN_NULL;
     var.lenlist      = lenlist;
     var.active       = true;
     var.fence_active = false;
@@ -188,8 +228,11 @@ void DDStore::join(std::string name)
  * -------------------------------------------------------------------------- */
 void DDStore::free()
 {
-    int finalized;
+    int finalized = 0;
+#ifdef DDSTORE_HAVE_MPI
     MPI_Finalized(&finalized);
+#endif
+    (void)finalized;
     for (auto &x : this->varlist)
     {
         VarInfo_t &var = x.second;
@@ -198,8 +241,10 @@ void DDStore::free()
 
         if (this->method == 0)
         {
+#ifdef DDSTORE_HAVE_MPI
             if (!finalized)
                 MPI_Win_free(&var.win);
+#endif
         }
         else if (var.fabric_state)
         {
@@ -222,12 +267,24 @@ void DDStore::free()
             var.fabric_state = NULL;
         }
 
-        if (var.owns_base && var.base && !finalized)
-            MPI_Free_mem(var.base);
+        if (var.owns_base && var.base)
+        {
+#ifdef DDSTORE_HAVE_MPI
+            if (var.mpi_mem)
+            {
+                if (!finalized)
+                    MPI_Free_mem(var.base);
+            }
+            else
+#endif
+                ::free(var.base);
+        }
         var.base = NULL;
         var.owns_base = false;
         var.active = false;
     }
+#ifdef DDSTORE_HAVE_MPI
     if (this->coll_comm != MPI_COMM_NULL && !finalized)
         MPI_Comm_free(&this->coll_comm);
+#endif
 }

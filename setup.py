@@ -9,7 +9,7 @@ from setuptools.extension import Extension
 import os
 import subprocess
 
-defs = [("NPY_NO_DEPRECATED_API", 0)]
+defs = [("NPY_NO_DEPRECATED_API", 0), ("DDSTORE_HAVE_MPI", 1)]
 include_dirs = list()
 library_dirs = list()
 libraries = list()
@@ -33,7 +33,12 @@ include_dirs.append("include")
 
 extending = Extension(
     "pyddstore._core",
-    sources=["src/pyddstore/_core.pyx", "src/ddstore.cxx", "src/common.cxx"],
+    sources=[
+        "src/pyddstore/_core.pyx",
+        "src/ddstore.cxx",
+        "src/common.cxx",
+        "src/exchange.cxx",
+    ],
     include_dirs=include_dirs,
     extra_compile_args=["-std=c++11"],
     define_macros=defs,

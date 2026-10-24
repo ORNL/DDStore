@@ -88,12 +88,12 @@ public:
     static DDStore *from_fortran_comm(int method, long long fcomm,
                                       const std::string &handshake_dir);
 
-    /* A read-only store for a process forked from the one that made this
-     * store (a PyTorch DataLoader worker): opens its own fabric, endpoint
-     * and address vector per variable from the records this store holds,
-     * reading the same data with get()/get_batch(). Call it in the forked
-     * process; the store it was forked from must not be used there.
-     * Methods 1 and 2 only. Caller deletes the result.                     */
+    /* A read-only store with its own fabric, endpoint and address vector
+     * per variable, from the records this store holds, reading the same
+     * data with get()/get_batch(). For a process forked from the one that
+     * made this store (a PyTorch DataLoader worker; the inherited store
+     * must not be used there), or for a second independent reader in the
+     * same process. Methods 1 and 2 only. Caller deletes the result.       */
     DDStore *fork_reader() const;
 
     ~DDStore();

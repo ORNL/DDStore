@@ -189,10 +189,22 @@ def test_forked_workers_method2_reader(file_comm, hs):
 
 def test_fork_reader_refuses_kdreg2(file_comm, hs, monkeypatch):
     ds = DistDataset(Source(), "fkk", handshake_dir=hs, method=1)
+    # In the parent kdreg2 is fine: a second reader of its own works.
+    # (DDSTORE_FORK_WORKERS=0: otherwise opening it switches the
+    # environment to memhooks, which the worker below would inherit.)
+    monkeypatch.setenv("DDSTORE_FORK_WORKERS", "0")
     monkeypatch.setenv("FI_MR_CACHE_MONITOR", "kdreg2")
+    r = ds.ddstore.fork_reader()
+    out = np.zeros((1, 6), dtype=np.float32)
+    r.get_batch(ds._var[0], out, [4])
+    ok = bool((out == 4.0).all())
+    r.free()
+    # A forked worker sees kdreg2 (environment inherited) and refuses.
+    loader = torch.utils.data.DataLoader(ds, batch_size=4, num_workers=1, timeout=60)
     with pytest.raises(RuntimeError, match="DDSTORE_FORK_WORKERS"):
-        ds.ddstore.fork_reader()
+        next(iter(loader))
     finish(ds)
+    assert all(file_comm.allgather(ok))
 
 
 def test_error_raised_on_every_rank(file_comm, hs):

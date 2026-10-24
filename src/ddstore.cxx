@@ -259,7 +259,7 @@ DDStore *DDStore::fork_reader() const
             "a forked process can only read a method 1 or 2 store "
             "(method 0 is MPI, which a forked process can't use)");
     const char *mon = getenv("FI_MR_CACHE_MONITOR");
-    if (mon && strcmp(mon, "kdreg2") == 0)
+    if (getpid() != this->owner_pid && mon && strcmp(mon, "kdreg2") == 0)
         throw std::runtime_error(
             "DDStore read from a forked process (DataLoader worker) needs "
             "DDSTORE_FORK_WORKERS=1 (or FI_MR_CACHE_MONITOR=memhooks) set "

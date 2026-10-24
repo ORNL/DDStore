@@ -20,7 +20,12 @@ Runs examples/vae/vae-ddp.py under DDP.
 
 Options:
   --method=N     DDSTORE_METHOD: 0=MPI RMA, 1=libfabric, 2=file-based
-                 handshake. Default: 0.
+                 handshake. Default: DistDataset's (DDSTORE_METHOD if set,
+                 else 0 with --comm=mpi, 1 with --comm=torch).
+  --comm=X       mpi or torch: the communicator vae-ddp.py gives DistDataset.
+                 torch uses the DDP process group and no MPI (methods 1 and
+                 2; the only choice for a DDSTORE_MPI=0 build). Default: mpi
+                 if pyddstore was built with MPI, else torch.
   --fabric=X     DDSTORE_FABRIC: hsn or cxi. Default: cxi.
   --gpudirect    Test GPUDirect RDMA. Requires --method=1 or 2 and
                  --fabric=cxi.
@@ -37,12 +42,13 @@ Options:
   -h, --help     Show this help message and exit.
 
 Examples:
-  $(basename "$0")                              # method=0, cxi
+  $(basename "$0")                              # method=0 (1 without MPI), cxi
   $(basename "$0") --method=1 --gpudirect       # GPUDirect over libfabric
   $(basename "$0") --method=2 --gpudirect       # GPUDirect over file-based handshake
   $(basename "$0") --fabric=hsn                 # baseline over hsn instead
   $(basename "$0") --method=1 --num-workers=4   # ThreadDataLoader, no GPU buffers
   $(basename "$0") --method=1 --gpudirect --num-workers=4  # GPUDirect + ThreadDataLoader
+  $(basename "$0") --comm=torch                 # no MPI: method=1, torch.distributed
 EOF
 }
 
@@ -62,6 +68,7 @@ METHOD=
 FABRIC=
 GPUDIRECT_ARGS=""
 NUM_WORKERS=
+COMM=
 REPLICATE=
 IMAGE_SCALE=
 RANKS_PER_NODE=
@@ -72,6 +79,7 @@ for arg in "$@"; do
         --fabric=*) FABRIC="${arg#--fabric=}" ;;
         --gpudirect) GPUDIRECT_ARGS="--gpu-dest --gpu-source" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
+        --comm=*) COMM="${arg#--comm=}" ;;
         --replicate=*) REPLICATE="${arg#--replicate=}" ;;
         --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
         --ranks-per-node=*) RANKS_PER_NODE="${arg#--ranks-per-node=}" ;;
@@ -80,14 +88,13 @@ for arg in "$@"; do
 done
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
-METHOD="${METHOD:-0}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 REPLICATE="${REPLICATE:-1}"
 IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
-EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --image-scale=$IMAGE_SCALE"
+EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --image-scale=$IMAGE_SCALE${COMM:+ --comm=$COMM}"
 
-echo "DDSTORE_METHOD=$METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
+echo "DDSTORE_METHOD=${METHOD:-default} DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
 
 # Perlmutter: every rank sees all 4 GPUs of its node and vae-ddp.py picks
 # cuda:$SLURM_LOCALID. With --gpus-per-task=1 each rank sees only its own GPU
@@ -108,6 +115,6 @@ NNODES="${SLURM_NNODES:-1}"
 
 echo "PLATFORM=$PLATFORM NNODES=$NNODES RANKS_PER_NODE=$RANKS_PER_NODE CPUS_PER_TASK=$CPUS_PER_TASK GPU_ARGS=$GPU_ARGS"
 
-DDSTORE_METHOD=$METHOD srun -N$NNODES -n$((NNODES*RANKS_PER_NODE)) -c$CPUS_PER_TASK $GPU_ARGS -l \
+env ${METHOD:+DDSTORE_METHOD=$METHOD} srun -N$NNODES -n$((NNODES*RANKS_PER_NODE)) -c$CPUS_PER_TASK $GPU_ARGS -l \
     python -u examples/vae/vae-ddp.py --epochs 3 $EXTRA_ARGS \
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /')

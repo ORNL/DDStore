@@ -1,8 +1,8 @@
 """
 VAE example — core (data-holding) group.
 
-Loads the MNIST training set, shards it across the ranks of MPI.COMM_WORLD,
-and publishes it via DDStore method=2 (file-based handshake) so a separate
+Loads the MNIST training set, shards it across the ranks of the job
+(MPI.COMM_WORLD, or without MPI the ranks Slurm launched), and publishes it via DDStore method=2 (file-based handshake) so a separate
 extra group can train against it over RDMA. This script does no training
 itself — it just holds the data in memory until the extra group signals it
 is done.
@@ -23,6 +23,10 @@ Usage:
                 side derives S from the published row width.
 
 Environment:
+  DDSTORE_COMM                mpi or file (default: mpi if pyddstore was
+                               built with MPI, else file: ranks from
+                               SLURM_PROCID/SLURM_NTASKS, collectives through
+                               files in handshake_dir)
   DDSTORE_HANDSHAKE_DIR       overrides handshake_dir positional arg
   DDSTORE_HANDSHAKE_TIMEOUT_S poll timeout in seconds (default: 300)
   DDSTORE_NIC_MAP             optional precomputed CPU->NIC map (see
@@ -38,12 +42,11 @@ import time
 ## torch (pulled in below via torchvision/pyddstore.torch) must finish loading
 ## before mpi4py triggers MPI_Init, or - if GPU/NCCL use is ever added here -
 ## their static destructors run in the wrong order at interpreter exit and
-## corrupt the heap. Do not reorder these imports.
+## corrupt the heap. Do not reorder these imports (mpi4py is imported below).
 import torch
 from torchvision import datasets, transforms
 
-from mpi4py import MPI
-
+import pyddstore
 from pyddstore.torch import DistDataset
 from vae_model import mnist_transform
 
@@ -67,8 +70,19 @@ hs_dir = _resolve_dir(positional_args[0] if positional_args else "")
 os.environ["DDSTORE_METHOD"] = "2"
 os.environ["DDSTORE_HANDSHAKE_DIR"] = hs_dir
 
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
+if os.environ.get("DDSTORE_COMM", "mpi" if pyddstore.HAVE_MPI else "file") == "mpi":
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    barrier = comm.Barrier
+else:
+    # No MPI: DistDataset(comm=None) finds the same ranks; this FileComm is
+    # only for the barriers below.
+    os.environ["DDSTORE_COMM"] = "file"
+    comm = None
+    rank, size = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
+    barrier = pyddstore.FileComm(hs_dir, rank, size, "core").barrier
 
 add_device = None
 if gpu_source:
@@ -82,7 +96,7 @@ if rank == 0:
         if fname.endswith((".bin", ".meta.json")) or fname == "done_extra":
             os.remove(os.path.join(hs_dir, fname))
     print(f"[core] handshake_dir={hs_dir}", flush=True)
-comm.Barrier()
+barrier()
 
 trainset = datasets.MNIST(
     "data", train=True, download=True, transform=mnist_transform(image_scale)
@@ -93,7 +107,7 @@ dds_trainset = DistDataset(
     comm,
     add_device=add_device,
 )
-comm.Barrier()
+barrier()
 
 if rank == 0:
     print(
@@ -122,7 +136,7 @@ if rank == 0:
             raise TimeoutError("timed out waiting for done_extra sentinel")
         time.sleep(0.5)
     print("[core] sentinel received, shutting down", flush=True)
-comm.Barrier()
+barrier()
 
 dds_trainset.ddstore.free()
 

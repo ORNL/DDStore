@@ -7,7 +7,8 @@ device, e.g.:
   srun -n 4 python -m pytest test/test_torch_nompi.py -v
 
 DDSTORE_TEST_DIR (default: the current directory) must be on a filesystem
-every rank sees.
+every rank sees. Run it on its own: test_no_mpi4py_imported fails if
+another test file in the same session imports mpi4py.
 """
 
 import glob

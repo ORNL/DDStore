@@ -45,18 +45,49 @@ starts = [row_of(files, k, t) for k, f in enumerate(paths)       # windows insid
 pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+dt, t+2dt)
 ```
 
+- **`comm`**: an mpi4py communicator, a `torch.distributed` process group, or `None` (see [Without MPI](#without-mpi) below).
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)`**: the same dataset read by a separate `method=2` extra job; it learns the fields from a `{name}.meta.json` file the core group writes next to the handshake records.
 - **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy.
   - `reuse_buffers=True` reads every batch into one of a fixed pool of `num_workers` buffer sets from `dataset.alloc(batch_size)`, registered once, instead of fresh buffers registered on every read (for large rows, registration can cost more than the transfer). A worker reads and collates its batch, then returns the set, so the collate must copy: it needs `batch_size` and the default `collate_fn`, or `collate_copies=True` to declare that your `collate_fn` copies; other setups raise. `loader.close()` (or deleting the loader) waits for running fetches and unregisters the pool. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
+
+## Without MPI
+
+`DistDataset` needs no MPI when its stores use method 1 or 2. Pass `comm=` a `torch.distributed` process group, or leave it `None`:
+
+| `comm=None` resolves to | When |
+|---|---|
+| `MPI.COMM_WORLD` | MPI build (default) |
+| the default `torch.distributed` group | no MPI, `torch.distributed` initialized |
+| a `FileComm` in `handshake_dir`, rank and size from `srun` (`SLURM_PROCID`/`SLURM_NTASKS`) | otherwise |
+
+`DDSTORE_COMM=mpi|torch|file` forces one. Without MPI the stores exchange their records through files in `handshake_dir` (on a filesystem every rank sees), the default method is 1, and `method=0` raises. `ddstore_width` works (each group's stores get their own exchange files); method 2 still needs one group.
+
+```python
+import torch
+import torch.distributed as dist
+from pyddstore.torch import DistDataset, ThreadDataLoader
+
+dist.init_process_group("nccl")                  # DDP as usual, ranks from srun
+trainset = DistDataset(my_dataset, "train", comm=dist.group.WORLD,
+                       handshake_dir="/lustre/.../hs")    # method 1, no MPI
+```
+
+```bash
+srun -N2 -n8 --gpus-per-task=1 python train.py
+```
+
+`all_gather_object` over NCCL/RCCL needs `torch.cuda.set_device()` first, as for DDP.
 
 [examples/vae/vae-ddp.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae-ddp.py) trains a VAE with DDP on top of it:
 
 ```bash
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1
 DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py --num-workers=1 --gpu-dest --gpu-source
+DDSTORE_FABRIC=cxi srun -n 4 --gpus-per-task=1 python examples/vae/vae-ddp.py --comm=torch   # no MPI: method 1 over the DDP group
 ```
 
 - **`--num-workers`** (default 0): `0` uses PyTorch's standard `DataLoader`; `> 0` uses `ThreadDataLoader` (needs `method=1`/`2`).
 - **`--gpu-dest` / `--gpu-source`**: `DistDataset`'s `device` / `add_device`.
 - **`--replicate R`** repeats the training set R times (longer epochs); **`--image-scale S`** upscales images to (28·S)² so each row is S² larger. Both default to 1, the original example.
+- **`--comm torch`**: `DistDataset` over the DDP process group instead of MPI (the default for a `DDSTORE_MPI=0` build). `job-vae-single.sh --comm=torch`.
 - The [method=2 split](backends.md#file-based-handshake-method2) variant is [vae_core_server.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_core_server.py) (a `DistDataset` core group) + [vae_extra_train.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_extra_train.py) (a `DistDatasetReader`), with the same options.

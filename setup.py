@@ -84,7 +84,7 @@ for old in ("src/pyddstore.cpp",) + tuple(
 
 setup(
     name="PyDDStore",
-    version="2.0",
+    version="2.1",
     description="Distributed Data Store",
     package_dir={"": "src"},
     packages=["pyddstore"],

@@ -96,8 +96,8 @@ def _meta_path(handshake_dir, name):
 def _env_rank_size():
     """(rank, size) from the launcher's environment, or None."""
     for r, n in (
-        ("RANK", "WORLD_SIZE"),  # torchrun
-        ("SLURM_PROCID", "SLURM_NTASKS"),
+        ("SLURM_PROCID", "SLURM_NTASKS"),  # srun
+        ("RANK", "WORLD_SIZE"),
         ("PMI_RANK", "PMI_SIZE"),
         ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"),
     ):
@@ -196,7 +196,7 @@ def _file_comm(handshake_dir):
         if rs is None:
             raise RuntimeError(
                 "no MPI and no torch.distributed: can't tell this process's rank; "
-                "launch with srun or torchrun (or set RANK and WORLD_SIZE)"
+                "launch with srun (or set RANK and WORLD_SIZE)"
             )
         os.makedirs(handshake_dir, exist_ok=True)
         fc = FileComm(handshake_dir, rs[0], rs[1], "pw")
@@ -594,7 +594,8 @@ class DistDataset(_StoreDataset):
             or None (default) for ``MPI.COMM_WORLD`` in an MPI build, else
             the default ``torch.distributed`` group if initialized, else
             files in ``handshake_dir`` with rank and size from the launcher
-            (torchrun ``RANK``/``WORLD_SIZE``, Slurm, PMI). ``DDSTORE_COMM``
+            (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
+            ``WORLD_SIZE``, PMI). ``DDSTORE_COMM``
             = ``mpi``, ``torch`` or ``file`` forces one for None. All its
             ranks must construct the dataset together. Without MPI, stores
             exchange their records through files (methods 1 and 2 only).

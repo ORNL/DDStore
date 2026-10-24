@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PyDDStore"
-version = "2.0"
+version = "2.1"
 description = "Distributed Data Store"
 requires-python = ">=3.9"
 # numpy, plus mpi4py unless built with DDSTORE_MPI=0 (see setup.py)

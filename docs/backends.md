@@ -38,7 +38,7 @@ export DDSTORE_FABRIC=cxi   # native CXI: Perlmutter, or Frontier with GPUDirect
 
 Splits the dataset-holding job from the training job entirely: a **core** group loads and publishes data, and a separate **extra** group reads it over RDMA (`fi_read`, same transport as `method=1`) — the two are independent MPI jobs (e.g. two separate `srun`/`mpirun` launches, possibly on different node allocations) that never share a communicator. They rendezvous only through record files written to a shared-filesystem directory (must be visible to all nodes, e.g. Lustre):
 
-- **Core member** — has an MPI communicator, publishes with `add()`/`init()`. Core ranks exchange records via `MPI_Allgather`, and rank 0 writes the combined set to a single `{name}.bin` file (fabric address, MR key, base pointer, row count, dtype per rank) into `handshake_dir`.
+- **Core member** — has an MPI communicator (or, [without MPI](#without-mpi-methods-1-and-2), `rank=`/`size=`), publishes with `add()`/`init()`. Core ranks exchange records via `MPI_Allgather` (or files), and rank 0 writes the combined set to a single `{name}.bin` file (fabric address, MR key, base pointer, row count, dtype per rank) into `handshake_dir`.
 - **Extra member** — no MPI communicator; constructed with `comm_or_none=None` and an explicit `n_core`. Calls `join(name)` to poll for and read all `n_core` core-rank records, then `get()` works exactly as on the core side, reading directly from core-rank memory over RDMA.
 
 ```python
@@ -62,6 +62,32 @@ See [test/test_method2_core.py](https://github.com/ORNL/DDStore/blob/main/test/t
 
 `ddstore_width` grouping (below) is not currently supported with `method=2` — every core rank in `comm` is treated as one group.
 
+## Without MPI (methods 1 and 2)
+
+Methods 1 and 2 move data with libfabric only; MPI is used just once per variable, when `add()`/`init()` gathers every rank's record (fabric address, memory key, base pointer, row count). Without a communicator, that gather goes through files in a shared directory instead:
+
+```python
+import os
+import pyddstore as dds
+
+rank, size = int(os.environ["SLURM_PROCID"]), int(os.environ["SLURM_NTASKS"])
+store = dds.PyDDStore(None, method=1, handshake_dir="/lustre/.../hs", rank=rank, size=size)
+store.add("x", data)                 # collective, through files in handshake_dir
+store.get_batch("x", out, indices)   # RDMA reads, as with MPI
+store.free()
+```
+
+```bash
+srun -N2 -n8 python train.py         # no mpirun, no MPI library needed
+```
+
+- Works with either build; in a [`DDSTORE_MPI=0` build](installation.md#building-without-mpi) it is the only way to make a store.
+- `method=2` the same way gives a core member (`size=` is `n_core`), which publishes `{name}.bin` for extra members as usual.
+- Each gather: every rank writes its record to a file, rank 0 combines them into one file, the others read it. Ranks poll with a backoff from 1 ms to 200 ms, for up to `DDSTORE_HANDSHAKE_TIMEOUT_S`. Every rank must create its stores, and call `add()`/`init()`, in the same order.
+- File names carry a session (`DDSTORE_SESSION`, else `{SLURM_JOB_ID}_{SLURM_STEP_ID}`) and a per-store name (`exchange_ns=`, default `s0`, `s1`, … in creation order), so separate steps and stores sharing one directory don't collide. Each rank's record carries a random nonce, so files left by an earlier run are never mistaken for the current one.
+- `epoch_begin`/`epoch_end` are no-ops, as with MPI. Synchronize ranks yourself where needed (before `free()`, for example): `pyddstore.FileComm(dir, rank, size, ns)` provides `allgather(obj)` and `barrier()` over the same file exchange.
+
+`pyddstore.torch.DistDataset` does all this when it gets no MPI communicator (see [PyTorch integration](pytorch.md#without-mpi)).
 
 ## Partitioned / Sub-communicator Usage
 

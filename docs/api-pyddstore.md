@@ -1,23 +1,29 @@
 # `PyDDStore` reference
 
-## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None)`
+## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None, rank=None, size=0, exchange_ns="")`
 
 | Parameter | Type | Description |
 |---|---|---|
-| `comm_or_none` | `mpi4py.MPI.Comm` or `None` | MPI communicator covering all ranks. `None` only for a `method=2` extra member |
+| `comm_or_none` | `mpi4py.MPI.Comm` or `None` | MPI communicator covering all ranks. `None` for a `method=2` extra member, or for a store [without MPI](backends.md#without-mpi-methods-1-and-2) (with `rank=`) |
 | `method` | `int` | `0` = MPI RMA (default), `1` = libfabric RDMA, `2` = file-based handshake (see [below](backends.md#file-based-handshake-method2)) |
-| `handshake_dir` | `str` | Required for `method=2`: shared-filesystem directory used to exchange RDMA addresses |
-| `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data |
+| `handshake_dir` | `str` | Required for `method=2` and without MPI: shared-filesystem directory used to exchange RDMA addresses |
+| `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data. Without MPI, also accepted for `size` with `method=2` |
+| `rank`, `size` | `int` | Without MPI (`comm_or_none=None`, `method=1`/`2`): this process is rank `rank` of `size` (e.g. `SLURM_PROCID`, `SLURM_NTASKS`) |
+| `exchange_ns` | `str` | Without MPI: names this store's exchange files; default `s0`, `s1`, … in creation order, which is right as long as every rank creates its stores in the same order. Avoid `.` in it |
 | `nic_map` | `str` or `None` | Optional, `method=1`/`2` only: a precomputed CPU→NIC map string (see [`DDSTORE_NIC_MAP`](backends.md#libfabric-rdma-method1) below) to use instead of the environment variable. Ignored if `FABRIC_IFACE` is already set |
 
-Four call shapes:
+Call shapes:
 
 ```python
 PyDDStore(comm)                                     # method 0, MPI RMA
 PyDDStore(comm, method=1)                            # method 1, libfabric RDMA
 PyDDStore(comm, method=2, handshake_dir="/path")      # method 2, core member (n_core == comm size)
 PyDDStore(None, method=2, handshake_dir="/path", n_core=N)  # method 2, extra member (no comm)
+PyDDStore(None, method=1, handshake_dir="/path", rank=r, size=N)  # method 1 without MPI
+PyDDStore(None, method=2, handshake_dir="/path", rank=r, size=N)  # method 2 core member without MPI
 ```
+
+In a build without MPI (`DDSTORE_MPI=0`, `pyddstore.HAVE_MPI` is `False`) only the last three work; a communicator raises `RuntimeError`.
 
 Note: grouping ranks into independent stores (the "sub-communicator" pattern below) is done by splitting `comm` yourself before constructing `PyDDStore` — there is no `ddstore_width` constructor parameter. `pyddstore.torch.DistDataset` does this for you (`ddstore_width`) and shows the pattern (`comm.Split()` then `PyDDStore(sub_comm)`).
 
@@ -133,3 +139,17 @@ Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. 
 ## `free()`
 
 Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations, including [`register_recv()`](api-pyddstore.md#register_recvname-arr--unregister_recvname-arr) buffers (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
+
+---
+
+## `pyddstore.HAVE_MPI`
+
+`True` for the default build, `False` for one made with `DDSTORE_MPI=0` (methods 1 and 2 without a communicator only).
+
+---
+
+## `pyddstore.FileComm(dir, rank, size, ns)`
+
+Collectives for ranks without MPI, through the same file exchange stores use without a communicator: `allgather(obj)` returns every rank's picklable `obj` as a list by rank, and `barrier()` waits for all ranks. `dir` must be on a filesystem every rank sees. Every rank must create its `FileComm`s in the same order with the same `ns`, and make the same calls in the same order; `ns` must differ from every other `FileComm`'s and store's `exchange_ns` in `dir` during the session. Attributes: `rank`, `size`, `dir`, `ns`.
+
+A rank leaves `barrier()` as soon as it has read the combined file, but rank 0 leaves as soon as it has written it: don't remove `dir` right after a barrier without a further handshake.

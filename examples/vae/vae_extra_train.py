@@ -36,8 +36,6 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import torch.distributed as dist
 
-from mpi4py import MPI
-
 from ddp_utils import setup_ddp, get_local_rank
 from pyddstore.torch import DistDatasetReader, ThreadDataLoader
 from vae_model import VAE, loss_function, mnist_transform

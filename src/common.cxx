@@ -533,8 +533,35 @@ static void init_fabric_cxi(struct fabric_state *fabric)
  * an earlier attempt to unify both paths via runtime detection compiled
  * cleanly but crashed hsn on Frontier at runtime, so hsn and cxi are kept
  * as two independent, individually-proven implementations instead.        */
+bool fork_workers_enabled()
+{
+    const char *e = getenv("DDSTORE_FORK_WORKERS");
+    return e && *e && strcmp(e, "0") != 0;
+}
+
 void init_fabric(struct fabric_state *fabric)
 {
+    /* So a process forked after libfabric started (a PyTorch DataLoader
+     * worker) can open its own endpoint (fork_reader()):
+     * - FI_CXI_DISABLE_HOST_REGISTER=1: otherwise the CXI provider
+     *   registers its host receive buffers with ROCm, which fails after
+     *   fork (hsa_amd_memory_lock), and fi_enable() returns -FI_EDOMAIN.
+     * - DDSTORE_FORK_WORKERS=1: FI_MR_CACHE_MONITOR=memhooks if it is
+     *   unset or kdreg2 (Frontier's default). kdreg2's monitor thread
+     *   doesn't survive fork, and the child's first registration blocks
+     *   forever once the parent has read or used the GPU. memhooks runs in
+     *   the process and is as fast; "disabled" also works but makes host
+     *   reads several times slower. Opt-in: it overrides a site default.
+     * libfabric reads them when it starts, so this only helps if DDStore
+     * is the first to call into libfabric; pyddstore also sets them on
+     * import. A value set by the user wins.                                */
+    setenv("FI_CXI_DISABLE_HOST_REGISTER", "1", 0);
+    if (fork_workers_enabled())
+    {
+        const char *mon = getenv("FI_MR_CACHE_MONITOR");
+        if (!mon || strcmp(mon, "kdreg2") == 0)
+            setenv("FI_MR_CACHE_MONITOR", "memhooks", 1);
+    }
     const char *provider = getenv("DDSTORE_FABRIC");
     if (provider && strcmp(provider, "cxi") == 0)
         init_fabric_cxi(fabric);
@@ -600,9 +627,7 @@ void register_send_mr(struct fabric_state *fabric_state)
     fabric_state->key = fi_mr_key(fabric_state->mr);
 }
 
-/* Fill fs->comm_partner/remote_key/remote_address (n entries) from the
- * records, inserting each fabric address into fs->av.                     */
-static void use_records(struct fabric_state *fs, const struct CoreRecord *all, int n)
+void use_records(struct fabric_state *fs, const struct CoreRecord *all, int n)
 {
     fs->comm_partner   = (fi_addr_t *)malloc(n * sizeof(fi_addr_t));
     fs->remote_key     = (uint64_t  *)malloc(n * sizeof(uint64_t));
@@ -1123,7 +1148,8 @@ void publish_records(const char *dir, const char *varname,
 extern "C" int handshake_join(struct fabric_state *fs,
                    const char *dir, const char *varname,
                    int n_core,
-                   long *lenlist, int *out_disp, int *out_itemsize)
+                   long *lenlist, int *out_disp, int *out_itemsize,
+                   struct CoreRecord *out_recs)
 {
     const char *rdir = resolve_handshake_dir(dir);
     int timeout_s = handshake_timeout_s();
@@ -1196,6 +1222,8 @@ extern "C" int handshake_join(struct fabric_state *fs,
         lenlist[i]            = all_recs[i].nrows;
     }
 
+    if (out_recs)
+        memcpy(out_recs, all_recs.data(), n_core * sizeof(struct CoreRecord));
     if (out_disp)     *out_disp     = all_recs[0].disp;
     if (out_itemsize) *out_itemsize = all_recs[0].itemsize;
 

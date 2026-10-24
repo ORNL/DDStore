@@ -11,6 +11,7 @@
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <unistd.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -35,6 +36,9 @@ struct VarInfo
     bool owns_base;
     bool mpi_mem = false; /* base came from MPI_Alloc_mem, not posix_memalign */
     struct fabric_state *fabric_state;
+    /* Methods 1/2: every core rank's record (address, key, rows), kept so
+     * fork_reader() can open a new endpoint onto the same data.          */
+    std::vector<struct CoreRecord> records;
 };
 typedef struct VarInfo VarInfo_t;
 
@@ -83,6 +87,14 @@ public:
      * std::runtime_error in a build without MPI.                           */
     static DDStore *from_fortran_comm(int method, long long fcomm,
                                       const std::string &handshake_dir);
+
+    /* A read-only store for a process forked from the one that made this
+     * store (a PyTorch DataLoader worker): opens its own fabric, endpoint
+     * and address vector per variable from the records this store holds,
+     * reading the same data with get()/get_batch(). Call it in the forked
+     * process; the store it was forked from must not be used there.
+     * Methods 1 and 2 only. Caller deletes the result.                     */
+    DDStore *fork_reader() const;
 
     ~DDStore();
 
@@ -458,7 +470,7 @@ private:
                     "(current fabric does not support FI_HMEM)");
             register_send_mr(fs);
 
-            std::vector<struct CoreRecord> all;
+            std::vector<struct CoreRecord> &all = var.records;
             exchange_records(fs, *this->exchange, nrows, disp, itemsize, all);
             if (this->method == 2 && this->rank == 0)
                 publish_records(this->handshake_dir.c_str(), name.c_str(), all);
@@ -622,6 +634,15 @@ private:
     std::string handshake_dir;  /* shared directory for CoreRecord files     */
     int         n_core;         /* number of core ranks                      */
     bool        is_extra;       /* true if this is an extra (read-only) node */
+
+    /* Process that made this store. In a process forked from it, free()
+     * leaves the libfabric objects alone: their file descriptors are shared
+     * with the parent, so closing them would tear down the parent's.       */
+    pid_t       owner_pid = getpid();
+
+    /* fork_reader(): an empty read-only store for method 1 or 2.          */
+    struct reader_tag {};
+    DDStore(int method, int n_core, reader_tag);
 
     std::unordered_map<std::string, VarInfo_t> varlist;
 };

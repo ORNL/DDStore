@@ -29,10 +29,13 @@ Options:
   --fabric=X     DDSTORE_FABRIC: hsn or cxi. Default: cxi.
   --gpudirect    Test GPUDirect RDMA. Requires --method=1 or 2 and
                  --fabric=cxi.
-  --num-workers=N  DataLoader workers. 0 uses PyTorch's standard
-                 DataLoader in the main process (no worker processes).
-                 > 0 switches to ThreadDataLoader with that many worker
-                 threads (requires --method=1 or 2). Default: 0.
+  --num-workers=N  DataLoader workers: threads with --loader=thread,
+                 forked processes with --loader=torch, 0 = main process.
+                 Default: 0.
+  --loader=X     torch: PyTorch's standard DataLoader (forked workers,
+                 each with its own DDStore endpoint, host memory).
+                 thread: ThreadDataLoader. Workers need --method=1 or 2.
+                 Default: thread if --num-workers > 0, else torch.
   --replicate=R  Repeat the MNIST training set R times (longer epochs,
                  same per-sample cost). Default: 1.
   --image-scale=S  Upscale images to (28*S)x(28*S): S^2 larger samples.
@@ -48,6 +51,8 @@ Examples:
   $(basename "$0") --fabric=hsn                 # baseline over hsn instead
   $(basename "$0") --method=1 --num-workers=4   # ThreadDataLoader, no GPU buffers
   $(basename "$0") --method=1 --gpudirect --num-workers=4  # GPUDirect + ThreadDataLoader
+  $(basename "$0") --method=1 --loader=thread   # ThreadDataLoader, 1 thread
+  $(basename "$0") --method=1 --loader=torch --num-workers=4  # PyTorch DataLoader, 4 forked workers
   $(basename "$0") --comm=torch                 # no MPI: method=1, torch.distributed
 EOF
 }
@@ -68,6 +73,7 @@ METHOD=
 FABRIC=
 GPUDIRECT_ARGS=""
 NUM_WORKERS=
+LOADER=
 COMM=
 REPLICATE=
 IMAGE_SCALE=
@@ -80,6 +86,7 @@ for arg in "$@"; do
         --gpudirect) GPUDIRECT_ARGS="--gpu-dest --gpu-source" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
         --comm=*) COMM="${arg#--comm=}" ;;
+        --loader=*) LOADER="${arg#--loader=}" ;;
         --replicate=*) REPLICATE="${arg#--replicate=}" ;;
         --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
         --ranks-per-node=*) RANKS_PER_NODE="${arg#--ranks-per-node=}" ;;
@@ -88,11 +95,16 @@ for arg in "$@"; do
 done
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
+# Forked DataLoader workers read DDStore through their own endpoints; that
+# needs a fork-safe libfabric MR cache monitor (see docs/pytorch.md).
+if [ "$LOADER" = torch ] && [ "${NUM_WORKERS:-0}" -gt 0 ]; then
+    export DDSTORE_FORK_WORKERS=1
+fi
 NUM_WORKERS="${NUM_WORKERS:-0}"
 REPLICATE="${REPLICATE:-1}"
 IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
-EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --image-scale=$IMAGE_SCALE${COMM:+ --comm=$COMM}"
+EXTRA_ARGS="$GPUDIRECT_ARGS --num-workers=$NUM_WORKERS --replicate=$REPLICATE --image-scale=$IMAGE_SCALE${COMM:+ --comm=$COMM}${LOADER:+ --loader=$LOADER}"
 
 echo "DDSTORE_METHOD=${METHOD:-default} DDSTORE_FABRIC=$DDSTORE_FABRIC EXTRA_ARGS=\"$EXTRA_ARGS\""
 

@@ -8,7 +8,7 @@ Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a glo
 
 - **Batched reads**: `get_batch()` fetches a whole training batch in one call (one-sided RDMA reads in flight together, or an MPI collective for `method=0`).
 - **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory.
-- **PyTorch integration**: `pyddstore.torch` turns any map-style dataset into a distributed one (`DistDataset`), reads samples made of several stored rows (`WindowedDataset`), and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers.
+- **PyTorch integration**: `pyddstore.torch` turns any map-style dataset into a distributed one (`DistDataset`), reads samples made of several stored rows (`WindowedDataset`), and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers. PyTorch's own `DataLoader` with forked workers works too (methods 1 and 2, `DDSTORE_FORK_WORKERS=1`).
 - **Thread-safe** reads, a profiler for where read time goes, and a split mode (`method=2`) where a separate job reads data published by another.
 - **MPI optional**: the libfabric backends also run without MPI (`DDSTORE_MPI=0` build), with ranks launched by `srun`.
 
@@ -72,6 +72,8 @@ for x, y in loader:
 ```
 
 Run with `mpirun -n 4 python my_script.py` (or `srun`).
+
+PyTorch's standard `DataLoader` with `num_workers > 0` (forked workers) also works for methods 1 and 2: export `DDSTORE_FORK_WORKERS=1` in the job script. Each worker opens its own endpoint and returns samples on the CPU. On Frontier this switches the libfabric MR cache monitor from the default `kdreg2`, which hangs forked workers, to `memhooks` (same speed); with MPI, import pyddstore before mpi4py. See [Forked DataLoader workers](docs/pytorch.md#forked-dataloader-workers).
 
 Without MPI (a `DDSTORE_MPI=0` build, or `DDSTORE_COMM=file`), stores exchange their RDMA records through files in a shared directory, and ranks come from `srun`:
 

@@ -12,6 +12,10 @@
   handshake directory.
 - ``ThreadDataLoader``: a ``DataLoader`` whose workers are threads instead of
   forked processes (safe with MPI and GPU-resident buffers).
+- PyTorch's own ``DataLoader`` with forked workers also reads ``DistDataset``
+  and ``DistDatasetReader`` (methods 1 and 2): each worker opens its own store
+  (``PyDDStore.fork_reader()``) and reads into host memory. Set
+  ``DDSTORE_FORK_WORKERS=1`` before libfabric starts (see ``pyddstore``).
 - ``WindowedDataset``: samples made of several stored rows (time windows,
   clips), read with ``read_rows()``; ``row_of()`` maps a sample of one source
   in a ``ConcatDataset`` to its row.
@@ -385,7 +389,37 @@ class _Encoded(Dataset):
 
 
 class _StoreDataset(Dataset):
-    """Reads samples described by `self.schema` from `self.ddstore`."""
+    """Reads samples described by `self.schema` from `self.ddstore`.
+
+    In a process forked from the one that made the store (a PyTorch
+    DataLoader worker), `ddstore` is a store of that process's own
+    (``PyDDStore.fork_reader()``, opened on first use) and `device` is None:
+    the inherited store's endpoint and the GPU belong to the parent."""
+
+    _owner_pid = None
+
+    @property
+    def ddstore(self):
+        pid = os.getpid()
+        if pid == self._owner_pid:
+            return self._ddstore
+        if self._fork_pid != pid:
+            self._fork_store = self._ddstore.fork_reader()
+            self._fork_pid = pid
+        return self._fork_store
+
+    @ddstore.setter
+    def ddstore(self, store):
+        self._ddstore, self._owner_pid = store, os.getpid()
+        self._fork_store = self._fork_pid = None
+
+    @property
+    def device(self):
+        return self._device if self._owner_pid in (None, os.getpid()) else None
+
+    @device.setter
+    def device(self, device):
+        self._device = device
 
     def _setup_fields(self, schema, name, device):
         self.schema = schema
@@ -944,8 +978,9 @@ def row_of(concat, source, index):
 class ThreadDataLoader(DataLoader):
     """A ``DataLoader`` that fetches batches in a thread pool instead of forked
     worker processes. Threads share the process's MPI state, CUDA context and
-    Python objects, so it is safe with DDStore and GPU-resident buffers, where
-    forked workers are not. Takes the same arguments as ``DataLoader``;
+    Python objects, so it works with every method and reads straight into
+    GPU buffers; forked workers (methods 1 and 2, ``DDSTORE_FORK_WORKERS=1``)
+    read into host memory only. Takes the same arguments as ``DataLoader``;
     ``num_workers`` is the number of threads (0 means 1).
 
     Each batch is fetched (via ``dataset.__getitems__`` when present),

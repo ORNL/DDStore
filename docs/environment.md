@@ -15,6 +15,8 @@
 | `DDSTORE_PROFILE` | off | `1` turns on `get()`/`get_batch()` timing counters, read with `get_profile(name)`. See [Performance](performance.md). |
 | `DDSTORE_MAX_READ_BYTES` | `1073741824` (1 GiB) | `method=1`/`2`: largest single `fi_read`; longer rows are read in pieces (on Perlmutter's `cxi` one 5 GB read fails with `EMSGSIZE`, 2.5 GB works, and the provider doesn't report the limit). Lowered to the endpoint's `max_msg_size` when the provider reports one. |
 | `DDSTORE_ALLTOALL_MAX_BYTES` | `2097152` (2 MiB) | `method=0` `get_batch()`: bytes each rank receives per exchange round. Must be equal on all ranks. |
+| `DDSTORE_FORK_WORKERS` | unset | `1`: stores will be read from forked `DataLoader` workers. Sets `FI_MR_CACHE_MONITOR=memhooks` if it is unset or `kdreg2` (Frontier's default, which hangs forked workers). Must be set before libfabric starts. See [Forked DataLoader workers](pytorch.md#forked-dataloader-workers). |
+| `FI_CXI_DISABLE_HOST_REGISTER` | set to `1` by `pyddstore` and DDStore unless already set | libfabric CXI: don't register host receive buffers with ROCm. Needed for forked workers (registration fails after fork). |
 
 **Read by `pyddstore.torch`** (defaults for arguments not given):
 

@@ -193,6 +193,8 @@ def test_method2_extra_joins_file_core(comm, hs):
 
 def test_same_layout_as_mpi_exchange(comm, hs):
     """The file exchange and MPI_Allgather give the same global layout."""
+    if not dds.HAVE_MPI:
+        pytest.skip("needs an MPI build (DDSTORE_MPI=1)")
     rank = comm.Get_rank()
     n = 3 + rank
     data = np.full((n, NCOLS), rank, dtype=np.float32)

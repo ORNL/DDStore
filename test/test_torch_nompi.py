@@ -8,7 +8,8 @@ device, e.g.:
 
 DDSTORE_TEST_DIR (default: the current directory) must be on a filesystem
 every rank sees. Run it on its own: test_no_mpi4py_imported fails if
-another test file in the same session imports mpi4py.
+another test file in the same session imports mpi4py. Sets
+DDSTORE_FORK_WORKERS=1 (forked DataLoader workers) for the whole session.
 """
 
 import glob
@@ -19,6 +20,9 @@ import time
 
 import numpy as np
 import pytest
+
+# Before pyddstore (and libfabric) start: forked DataLoader workers.
+os.environ.setdefault("DDSTORE_FORK_WORKERS", "1")
 
 torch = pytest.importorskip("torch")
 import torch.distributed as dist  # noqa: E402
@@ -142,6 +146,53 @@ def test_method2_reader(file_comm, hs):
     reader.ddstore.free()
     finish(core)
     assert all(file_comm.allgather(ok))
+
+
+def read_forked(ds, num_workers):
+    """Every sample through PyTorch's DataLoader with forked workers."""
+    loader = torch.utils.data.DataLoader(
+        ds, batch_size=8, num_workers=num_workers, timeout=60
+    )
+    seen = 0
+    ok = True
+    for x, y in loader:
+        ok &= x.device.type == "cpu"
+        for k in range(len(y)):
+            i = int(y[k])
+            ok &= bool(torch.equal(x[k], torch.full((2, 3), float(i))))
+            ok &= i == seen
+            seen += 1
+    return ok and seen == N
+
+
+@pytest.mark.parametrize("method", [1, 2])
+def test_forked_dataloader_workers(file_comm, hs, method):
+    ds = DistDataset(Source(), f"fk{method}", handshake_dir=hs, method=method)
+    # The parent reads before forking (this hung workers under kdreg2).
+    ok = int(ds[3][1]) == 3
+    for _ in range(2):  # new workers every epoch
+        ok &= read_forked(ds, num_workers=2)
+    ok &= int(ds[N - 1][1]) == N - 1  # the parent's store still works
+    finish(ds)
+    assert all(file_comm.allgather(ok))
+
+
+def test_forked_workers_method2_reader(file_comm, hs):
+    core = DistDataset(Source(), "fkr", handshake_dir=hs, method=2)
+    reader = DistDatasetReader("fkr", handshake_dir=hs, n_core=file_comm.size)
+    ok = read_forked(reader, num_workers=2)
+    file_comm.allgather(None)
+    reader.ddstore.free()
+    finish(core)
+    assert all(file_comm.allgather(ok))
+
+
+def test_fork_reader_refuses_kdreg2(file_comm, hs, monkeypatch):
+    ds = DistDataset(Source(), "fkk", handshake_dir=hs, method=1)
+    monkeypatch.setenv("FI_MR_CACHE_MONITOR", "kdreg2")
+    with pytest.raises(RuntimeError, match="DDSTORE_FORK_WORKERS"):
+        ds.ddstore.fork_reader()
+    finish(ds)
 
 
 def test_error_raised_on_every_rank(file_comm, hs):

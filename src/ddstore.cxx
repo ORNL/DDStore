@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Forward-declare the C helper from common.cxx so we can call it here.     */
 extern "C" const char *resolve_handshake_dir(const char *user_dir);
@@ -207,11 +208,13 @@ void DDStore::join(std::string name)
     fs->key           = 0;
 
     std::vector<long> raw_lens(this->n_core);
+    std::vector<struct CoreRecord> records(this->n_core);
     int out_disp = 0, out_itemsize = 0;
     if (handshake_join(fs,
                        this->handshake_dir.c_str(), name.c_str(),
                        this->n_core,
-                       raw_lens.data(), &out_disp, &out_itemsize) != 0)
+                       raw_lens.data(), &out_disp, &out_itemsize,
+                       records.data()) != 0)
         throw std::runtime_error("handshake_join failed for variable: " + name);
 
     /* Build prefix-sum lenlist. */
@@ -233,7 +236,73 @@ void DDStore::join(std::string name)
     var.base         = NULL; /* extra member owns no data */
     var.owns_base    = false;
     var.fabric_state = fs;
+    var.records      = records;
     this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+}
+
+DDStore::DDStore(int method, int n_core, reader_tag)
+    : method(method), comm_size(1), rank(0), n_core(n_core), is_extra(true)
+{
+}
+
+/* --------------------------------------------------------------------------
+ * fork_reader() — read-only store for a forked process (see ddstore.hpp).
+ *
+ * Per variable: a new fabric_state with its own fabric/domain/endpoint/AV
+ * (init_fabric), the records inserted into that AV (use_records), and no
+ * send MR. get() and get_batch() then work as for an extra member.
+ * -------------------------------------------------------------------------- */
+DDStore *DDStore::fork_reader() const
+{
+    if (this->method != 1 && this->method != 2)
+        throw std::runtime_error(
+            "a forked process can only read a method 1 or 2 store "
+            "(method 0 is MPI, which a forked process can't use)");
+    const char *mon = getenv("FI_MR_CACHE_MONITOR");
+    if (mon && strcmp(mon, "kdreg2") == 0)
+        throw std::runtime_error(
+            "DDStore read from a forked process (DataLoader worker) needs "
+            "DDSTORE_FORK_WORKERS=1 (or FI_MR_CACHE_MONITOR=memhooks) set "
+            "before the store is created: the kdreg2 MR cache monitor "
+            "doesn't survive fork and the worker's reads would hang");
+
+    std::unique_ptr<DDStore> r(new DDStore(this->method, this->n_core, reader_tag()));
+    for (const auto &x : this->varlist)
+    {
+        const VarInfo_t &src = x.second;
+        if (!src.active)
+            continue;
+        if (src.records.empty())
+            throw std::logic_error("no records for variable " + src.name);
+
+        struct fabric_state *fs =
+            (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+        if (!fs)
+            throw std::bad_alloc();
+        pthread_mutex_init(&fs->recv_lock, NULL);
+        fs->rank = -1;
+
+        VarInfo_t var;
+        var.name         = src.name;
+        var.itemsize     = src.itemsize;
+        var.disp         = src.disp;
+        var.lenlist      = src.lenlist;
+        var.active       = true;
+        var.fence_active = false;
+        var.base         = NULL;
+        var.owns_base    = false;
+        var.fabric_state = fs;
+        var.records      = src.records;
+        /* In the map before anything can throw, so r's free() cleans up. */
+        r->varlist.insert(std::pair<std::string, VarInfo_t>(var.name, var));
+
+        init_fabric(fs);
+        if (!fs->info)
+            throw std::runtime_error("init_fabric failed in forked reader (variable " +
+                                     src.name + ")");
+        use_records(fs, src.records.data(), (int)src.records.size());
+    }
+    return r.release();
 }
 
 /* --------------------------------------------------------------------------
@@ -246,6 +315,19 @@ void DDStore::join(std::string name)
  * -------------------------------------------------------------------------- */
 void DDStore::free()
 {
+    if (getpid() != this->owner_pid)
+    {
+        /* Inherited through fork: the parent still owns these resources. */
+        for (auto &x : this->varlist)
+        {
+            x.second.fabric_state = NULL;
+            x.second.base = NULL;
+            x.second.owns_base = false;
+            x.second.active = false;
+        }
+        return;
+    }
+
     int finalized = 0;
 #ifdef DDSTORE_HAVE_MPI
     MPI_Finalized(&finalized);

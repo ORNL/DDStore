@@ -231,12 +231,14 @@ extern "C"
     /* Extra member: poll for {dir}/{varname}.bin (single file holding all
      * n_core CoreRecords), read it, and populate this process's
      * fs->comm_partner[], remote_key[], remote_address[], and
-     * lenlist[0..n_core-1] (raw row counts, NOT yet prefix-summed).  Does
+     * lenlist[0..n_core-1] (raw row counts, NOT yet prefix-summed), and,
+     * if out_recs is not NULL, out_recs[0..n_core-1] (the records).  Does
      * NOT write anything.  Blocks until the file appears (with timeout).     */
     int handshake_join(struct fabric_state *fs,
                        const char *dir, const char *varname,
                        int n_core,
-                       long *lenlist, int *out_disp, int *out_itemsize);
+                       long *lenlist, int *out_disp, int *out_itemsize,
+                       struct CoreRecord *out_recs);
 
 #ifdef __cplusplus
 }
@@ -255,6 +257,15 @@ void register_send_mr(struct fabric_state *fs);
 void exchange_records(struct fabric_state *fs, Exchange &ex,
                       long nrows, int disp, int itemsize,
                       std::vector<struct CoreRecord> &all);
+
+/* DDSTORE_FORK_WORKERS set (and not "0"): forked readers are wanted, so
+ * init_fabric() picks an MR cache monitor that survives fork.            */
+bool fork_workers_enabled();
+
+/* Fill fs->comm_partner/remote_key/remote_address and world_size (n
+ * entries) from the records, inserting each fabric address into fs->av.
+ * Throws.                                                                 */
+void use_records(struct fabric_state *fs, const struct CoreRecord *all, int n);
 
 /* Method 2 core rank 0: publish the combined records to
  * {dir}/{varname}.bin (temp + fsync + rename) for extra members. Throws.  */

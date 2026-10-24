@@ -73,13 +73,20 @@ parser.add_argument(
     type=int,
     default=0,
     metavar="N",
-    help="Number of DataLoader workers. 0 uses PyTorch's standard "
-    "DataLoader in the main process (no worker processes, no fork). "
-    "> 0 switches to ThreadDataLoader "
-    "(pyddstore.torch), with that many worker threads "
-    "-- forked processes can't safely own GPU state or MPI's live state, "
-    "so any --num-workers > 0 goes through threads, never a fork. "
-    "Requires DDSTORE_METHOD 1 or 2 when > 0. Default: 0.",
+    help="Number of DataLoader workers: threads for --loader=thread, "
+    "forked processes for --loader=torch (0 reads in the main process). "
+    "Default: 0.",
+)
+parser.add_argument(
+    "--loader",
+    choices=["torch", "thread"],
+    default=None,
+    help="torch: PyTorch's standard DataLoader; with --num-workers > 0 its "
+    "workers are forked processes, each reading through its own DDStore "
+    "endpoint into host memory (DDSTORE_METHOD 1 or 2). thread: "
+    "ThreadDataLoader (pyddstore.torch), worker threads in this process "
+    "(DDSTORE_METHOD 1 or 2). Default: thread if --num-workers > 0, else "
+    "torch.",
 )
 parser.add_argument(
     "--replicate",
@@ -108,6 +115,8 @@ parser.add_argument(
 args = parser.parse_args()
 if args.comm is None:
     args.comm = "mpi" if pyddstore.HAVE_MPI else "torch"
+if args.loader is None:
+    args.loader = "thread" if args.num_workers > 0 else "torch"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
@@ -184,9 +193,11 @@ trainset = DistDataset(
 barrier()
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.num_workers > 0:
+if args.num_workers > 0 and trainset.method == 0:
+    raise RuntimeError("--num-workers > 0 requires DDSTORE_METHOD=1 or 2")
+if args.loader == "thread":
     if trainset.method == 0:
-        raise RuntimeError("--num-workers > 0 requires DDSTORE_METHOD=1 or 2")
+        raise RuntimeError("--loader=thread requires DDSTORE_METHOD=1 or 2")
     train_loader = ThreadDataLoader(
         trainset,
         batch_size=args.batch_size,
@@ -196,7 +207,11 @@ if args.num_workers > 0:
     )
 else:
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
     )
 
 print(

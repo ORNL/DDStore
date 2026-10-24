@@ -117,6 +117,7 @@ cdef extern from "ddstore.hpp":
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
         void profile(string name, unsigned long long *out) except +
+        DDStore *fork_reader() except +
 
     # The MPI constructors, from comm.py2f() (method 2 with handshake_dir:
     # core member, n_core == comm size). Raises in a build without MPI.
@@ -206,6 +207,10 @@ cdef class PyDDstoreVarinfo:
     def __cinit__(self):
         pass
 
+# PyDDStore(_NO_STORE): a wrapper with no C++ store yet (fork_reader()).
+_NO_STORE = object()
+
+
 cdef class PyDDStore:
     cdef DDStore *c_ddstore
     cdef int method
@@ -258,6 +263,8 @@ cdef class PyDDStore:
         self._prof_get_s = 0.0
         self._prof_sync_s = 0.0
         self._prof_gets = 0
+        if comm_or_none is _NO_STORE:
+            return
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
         if comm_or_none is None and rank is not None:
@@ -564,6 +571,16 @@ cdef class PyDDStore:
     def join(self, str name):
         """Method 2 extra member: discover variable published by core members."""
         self.c_ddstore.join(s2b(name))
+
+    def fork_reader(self):
+        """A read-only store for a process forked from this one (a PyTorch
+        DataLoader worker), reading the same variables through its own
+        libfabric endpoint. Call it in the forked process; don't use this
+        store there. Methods 1 and 2; read into host buffers (a forked
+        process can't use the GPU)."""
+        cdef PyDDStore r = PyDDStore(_NO_STORE, method=self.method)
+        r.c_ddstore = self.c_ddstore.fork_reader()
+        return r
 
     def info(self, str name):
         """Return (total_rows, disp, itemsize) for an added or joined variable."""

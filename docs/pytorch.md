@@ -50,6 +50,40 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
 - **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy.
   - `reuse_buffers=True` reads every batch into one of a fixed pool of `num_workers` buffer sets from `dataset.alloc(batch_size)`, registered once, instead of fresh buffers registered on every read (for large rows, registration can cost more than the transfer). A worker reads and collates its batch, then returns the set, so the collate must copy: it needs `batch_size` and the default `collate_fn`, or `collate_copies=True` to declare that your `collate_fn` copies; other setups raise. `loader.close()` (or deleting the loader) waits for running fetches and unregisters the pool. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
 
+## Forked `DataLoader` workers
+
+PyTorch's standard `DataLoader` with `num_workers > 0` (forked worker processes) can read a `DistDataset` or `DistDatasetReader` with `method=1` or `2`. Set `DDSTORE_FORK_WORKERS=1` before libfabric starts:
+
+```bash
+export DDSTORE_FORK_WORKERS=1        # in the job script, or os.environ before importing pyddstore
+srun -N2 -n16 --gpus-per-task=1 python train.py
+```
+
+```python
+import torch
+from pyddstore.torch import DistDataset
+
+trainset = DistDataset(my_dataset, "train", handshake_dir=hs)            # method 1 without MPI
+loader = torch.utils.data.DataLoader(trainset, batch_size=128, sampler=sampler,
+                                     num_workers=4, pin_memory=True)
+for x, y in loader:
+    x = x.to(device, non_blocking=True)
+```
+
+- **How it works**: a worker never uses the store it inherited from the parent (its endpoint belongs to the parent). On its first read it opens a store of its own (`PyDDStore.fork_reader()`), with its own libfabric endpoint, from the record table it inherited, and reads the same data. The parent's store keeps working.
+- **Host memory only**: in a worker, `device=` is ignored and samples come back on the CPU, since a forked process can't use the GPU. Move batches in the training loop (`pin_memory=True` helps). GPUDirect (`device=`/`add_device=`) still applies to reads in the parent.
+- **`method=0`** can't be read from a worker (MPI doesn't work after fork): use `ThreadDataLoader`.
+- **Libfabric settings** (Slingshot/CXI; read when libfabric starts, so import pyddstore before mpi4py, or export them in the job script):
+
+  | Setting | Who sets it | Why |
+  |---|---|---|
+  | `FI_MR_CACHE_MONITOR=memhooks` | `DDSTORE_FORK_WORKERS=1`, if the variable is unset or `kdreg2` | Frontier exports `kdreg2` by default ([OLCF system updates, 2025-05-13](https://docs.olcf.ornl.gov/systems/frontier_user_guide.html#id30)). Its monitor thread doesn't survive fork, so once the parent has read from the store or used the GPU, a worker's first read hangs. `memhooks` runs in the process. Without `DDSTORE_FORK_WORKERS=1` a worker under `kdreg2` raises an error instead of hanging. |
+  | `FI_CXI_DISABLE_HOST_REGISTER=1` | `pyddstore` on import (and DDStore), unless already set | Otherwise the CXI provider registers its host receive buffers with ROCm, which fails after fork, and the worker's endpoint can't start (`fi_enable` −262). |
+
+  On Frontier, `memhooks` measured the same as `kdreg2` (`bench_get`, 16 ranks, host and GPU destinations, single and batched reads). `FI_MR_CACHE_MONITOR=disabled` also works with workers but makes host reads 2× (single row) to 10× (batched) slower.
+- **Tested** on Frontier with both builds (MPI and `DDSTORE_MPI=0`): methods 1 and 2, 2 to 8 workers, a parent that reads before forking and uses the GPU (GPUDirect), new workers every epoch, and the VAE example over MPI, `torch.distributed` and file communicators. With MPI, import pyddstore (or `pyddstore.torch`) before mpi4py, or export `FI_MR_CACHE_MONITOR=memhooks` in the job script: MPI starts libfabric when mpi4py is imported.
+- **Which loader**: `ThreadDataLoader` avoids the fork and reads straight into GPU memory, and was faster in the VAE example (fetch 0.01 s vs 0.09 s per epoch with 4 workers). Forked workers help when the rest of the pipeline (decoding, augmentation in Python) needs separate processes.
+
 ## Without MPI
 
 `DistDataset` needs no MPI when its stores use method 1 or 2. Pass `comm=` a `torch.distributed` process group, or leave it `None`:
@@ -86,7 +120,8 @@ DDSTORE_METHOD=1 DDSTORE_FABRIC=cxi mpirun -n 4 python examples/vae/vae-ddp.py -
 DDSTORE_FABRIC=cxi srun -n 4 --gpus-per-task=1 python examples/vae/vae-ddp.py --comm=torch   # no MPI: method 1 over the DDP group
 ```
 
-- **`--num-workers`** (default 0): `0` uses PyTorch's standard `DataLoader`; `> 0` uses `ThreadDataLoader` (needs `method=1`/`2`).
+- **`--num-workers`** (default 0): worker threads (`ThreadDataLoader`) or forked processes (PyTorch `DataLoader`); `0` reads in the main process.
+- **`--loader`** `torch|thread`: PyTorch's standard `DataLoader`, or `ThreadDataLoader`. Workers need `method=1`/`2`. Default: `thread` if `--num-workers > 0`, else `torch`. With `torch` and workers, see [Forked DataLoader workers](#forked-dataloader-workers); `job-vae-single.sh` sets `DDSTORE_FORK_WORKERS=1` for it.
 - **`--gpu-dest` / `--gpu-source`**: `DistDataset`'s `device` / `add_device`.
 - **`--replicate R`** repeats the training set R times (longer epochs); **`--image-scale S`** upscales images to (28·S)² so each row is S² larger. Both default to 1, the original example.
 - **`--comm torch`**: `DistDataset` over the DDP process group instead of MPI (the default for a `DDSTORE_MPI=0` build). `job-vae-single.sh --comm=torch`.

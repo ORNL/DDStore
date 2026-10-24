@@ -13,7 +13,27 @@ on ``import pyddstore``. It does not import mpi4py itself: MPI starts when
 the caller imports mpi4py to make the communicator it passes. Import torch
 before that (``from pyddstore.torch import ...`` does), the order torch +
 RCCL/NCCL need to shut down cleanly.
+
+Methods 1 and 2 can be read from forked PyTorch DataLoader workers
+(``num_workers > 0``): each worker opens its own endpoint. Set
+``DDSTORE_FORK_WORKERS=1`` for that. On CXI it needs, before libfabric
+starts:
+
+- ``FI_CXI_DISABLE_HOST_REGISTER=1`` (always set here unless already set);
+- an MR cache monitor that survives fork: with ``DDSTORE_FORK_WORKERS=1``,
+  ``FI_MR_CACHE_MONITOR=memhooks`` if it is unset or ``kdreg2`` (Frontier's
+  default, which hangs forked workers).
+
+Import pyddstore before mpi4py (MPI starts libfabric), or export them in
+the job script.
 """
+
+import os as _os
+
+_os.environ.setdefault("FI_CXI_DISABLE_HOST_REGISTER", "1")
+if _os.environ.get("DDSTORE_FORK_WORKERS", "0") not in ("", "0"):
+    if _os.environ.get("FI_MR_CACHE_MONITOR", "kdreg2") == "kdreg2":
+        _os.environ["FI_MR_CACHE_MONITOR"] = "memhooks"
 
 try:
     from importlib.metadata import version as _version

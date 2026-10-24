@@ -1,5 +1,4 @@
 import pytest
-from mpi4py import MPI
 
 
 @pytest.fixture(scope="function")
@@ -12,5 +11,7 @@ def comm():
     CXI endpoint cleanup on a fast rank can desynchronize the ranks
     enough to deadlock the next test's collective in add().
     """
+    from mpi4py import MPI  # here, so tests without MPI never import it
+
     yield MPI.COMM_WORLD
     MPI.COMM_WORLD.Barrier()

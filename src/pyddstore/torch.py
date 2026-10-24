@@ -85,6 +85,176 @@ def _meta_path(handshake_dir, name):
 # ---------------------------------------------------------------------------
 
 
+# --- communicators -------------------------------------------------------
+# DistDataset needs rank/size, an allgather of Python objects, a split into
+# ddstore_width groups, and a way to make a store on a group. _MpiComm does
+# that with mpi4py (any method); _NoMpiComm with torch.distributed or a
+# FileComm for the allgather, and stores without a communicator (methods 1
+# and 2, records exchanged through files in handshake_dir).
+
+
+def _env_rank_size():
+    """(rank, size) from the launcher's environment, or None."""
+    for r, n in (
+        ("RANK", "WORLD_SIZE"),  # torchrun
+        ("SLURM_PROCID", "SLURM_NTASKS"),
+        ("PMI_RANK", "PMI_SIZE"),
+        ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"),
+    ):
+        if r in os.environ and n in os.environ:
+            return int(os.environ[r]), int(os.environ[n])
+    return None
+
+
+_ns_count = 0
+
+
+def _next_ns():
+    # Exchange names for the files of groups and stores; the same on every
+    # rank as long as every rank creates its datasets in the same order.
+    global _ns_count
+    _ns_count += 1
+    return f"p{_ns_count - 1}"
+
+
+class _MpiComm:
+    is_mpi = True
+
+    def __init__(self, comm):
+        self.comm = comm
+        self.rank, self.size = comm.Get_rank(), comm.Get_size()
+
+    def allgather(self, obj):
+        return self.comm.allgather(obj)
+
+    def split(self, color, key):
+        return _MpiComm(self.comm.Split(color, key))
+
+    def store(self, method, handshake_dir):
+        from ._core import PyDDStore
+
+        if method == 2:
+            return PyDDStore(self.comm, method=2, handshake_dir=handshake_dir)
+        return PyDDStore(self.comm, method=method)
+
+
+class _NoMpiComm:
+    is_mpi = False
+
+    def __init__(self, rank, size, allgather, handshake_dir, ns):
+        # ns: this group's name, part of its stores' exchange names, so
+        # groups of one split never share files
+        self.rank, self.size, self.ns = rank, size, ns
+        self._allgather = allgather
+        self.handshake_dir = handshake_dir
+
+    def allgather(self, obj):
+        return self._allgather(obj)
+
+    def split(self, color, key):
+        from ._core import FileComm
+
+        ns = _next_ns()
+        peers = self.allgather((color, key, self.rank))
+        members = sorted((k, r) for c, k, r in peers if c == color)
+        rank = members.index((key, self.rank))
+        if len(members) == self.size and rank == self.rank:
+            return self
+        ns = f"{ns}g{color}"
+        fc = FileComm(self.handshake_dir, rank, len(members), ns)
+        return _NoMpiComm(rank, len(members), fc.allgather, self.handshake_dir, ns)
+
+    def store(self, method, handshake_dir):
+        from ._core import PyDDStore
+
+        if method not in (1, 2):
+            raise ValueError(
+                f"method={method} needs an MPI communicator; without MPI use "
+                "method=1 or 2"
+            )
+        return PyDDStore(
+            None,
+            method=method,
+            handshake_dir=handshake_dir,
+            rank=self.rank,
+            size=self.size,
+            exchange_ns=f"{self.ns}-{_next_ns()}",
+        )
+
+
+_default_file_comm = None
+
+
+def _file_comm(handshake_dir):
+    # One per process: a second FileComm with the same ns could make a slow
+    # rank miss the first one's last exchange.
+    global _default_file_comm
+    if _default_file_comm is None:
+        from ._core import FileComm
+
+        rs = _env_rank_size()
+        if rs is None:
+            raise RuntimeError(
+                "no MPI and no torch.distributed: can't tell this process's rank; "
+                "launch with srun or torchrun (or set RANK and WORLD_SIZE)"
+            )
+        os.makedirs(handshake_dir, exist_ok=True)
+        fc = FileComm(handshake_dir, rs[0], rs[1], "pw")
+        _default_file_comm = _NoMpiComm(
+            fc.rank, fc.size, fc.allgather, handshake_dir, "pw"
+        )
+    return _default_file_comm
+
+
+def _torch_comm(group, handshake_dir):
+    import torch.distributed as dist
+
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+
+    def allgather(obj):
+        out = [None] * size
+        dist.all_gather_object(out, obj, group=group)
+        return out
+
+    return _NoMpiComm(rank, size, allgather, handshake_dir, "t")
+
+
+def _resolve_comm(comm, handshake_dir):
+    """A DistDataset communicator from the comm= argument (see DistDataset)."""
+    if comm is None:
+        kind = os.environ.get("DDSTORE_COMM", "").lower()
+        if not kind:
+            from ._core import HAVE_MPI
+
+            if HAVE_MPI:
+                kind = "mpi"
+            elif (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            ):
+                kind = "torch"
+            else:
+                kind = "file"
+        if kind == "mpi":
+            from mpi4py import MPI
+
+            return _MpiComm(MPI.COMM_WORLD)
+        if kind == "torch":
+            return _torch_comm(None, handshake_dir)
+        if kind == "file":
+            return _file_comm(handshake_dir)
+        raise ValueError(f"DDSTORE_COMM must be mpi, torch or file (got {kind!r})")
+    if hasattr(comm, "Get_rank") and hasattr(comm, "Split"):
+        return _MpiComm(comm)
+    if torch.distributed.is_available() and isinstance(
+        comm, torch.distributed.ProcessGroup
+    ):
+        return _torch_comm(comm, handshake_dir)
+    raise TypeError(
+        "comm must be an mpi4py communicator, a torch.distributed ProcessGroup "
+        f"or None (got {type(comm).__name__})"
+    )
+
+
 def _record_descr(dtype):
     """JSON-safe description of a structured dtype (see _record_dtype)."""
     return json.loads(json.dumps(np.lib.format.dtype_to_descr(dtype)))
@@ -420,15 +590,23 @@ class DistDataset(_StoreDataset):
             rank loads only its contiguous share. Every sample must have the
             same structure, and each field the same shape and dtype.
         name: dataset name; field ``k`` is stored as variable ``name/k``.
-        comm: MPI communicator (default ``MPI.COMM_WORLD``). All its ranks
-            must construct the dataset together.
+        comm: an mpi4py communicator, a ``torch.distributed`` process group,
+            or None (default) for ``MPI.COMM_WORLD`` in an MPI build, else
+            the default ``torch.distributed`` group if initialized, else
+            files in ``handshake_dir`` with rank and size from the launcher
+            (torchrun ``RANK``/``WORLD_SIZE``, Slurm, PMI). ``DDSTORE_COMM``
+            = ``mpi``, ``torch`` or ``file`` forces one for None. All its
+            ranks must construct the dataset together. Without MPI, stores
+            exchange their records through files (methods 1 and 2 only).
         ddstore_width: ranks per independent store (default: all of
             ``comm``); each group holds a full copy of the dataset.
         device: put tensor fields of read samples on this device
             (GPUDirect RDMA; needs ``method`` 1/2 and ``DDSTORE_FABRIC=cxi``).
         add_device: keep this rank's share of tensor fields on this device.
-        method: DDStore backend (default ``DDSTORE_METHOD`` or 0).
-        handshake_dir: ``method=2`` directory (default
+        method: DDStore backend (default ``DDSTORE_METHOD``, else 0 with an
+            MPI communicator and 1 without).
+        handshake_dir: directory on a filesystem every rank sees, for
+            ``method=2`` and for any store without MPI (default
             ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
         chunk_size: load this rank's share ``chunk_size`` samples at a time,
             writing each chunk into the store before reading the next, so
@@ -473,8 +651,6 @@ class DistDataset(_StoreDataset):
         fields=None,
     ):
         super().__init__()
-        from mpi4py import MPI
-
         if fields is not None:
             if encode is not None:
                 raise ValueError("pass either fields or encode, not both")
@@ -483,28 +659,27 @@ class DistDataset(_StoreDataset):
             source = _Encoded(source, encode)
         self._decode = decode
 
-        from ._core import PyDDStore
-
-        self.comm = comm if comm is not None else MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.comm_size = self.comm.Get_size()
+        hs = _handshake_dir(handshake_dir)
+        self._comm = _resolve_comm(comm, hs)
+        self.rank = self._comm.rank
+        self.comm_size = self._comm.size
         self.add_device = add_device
         self.ddstore_width = (
             ddstore_width if ddstore_width is not None else self.comm_size
         )
-        self.method = (
-            int(os.environ.get("DDSTORE_METHOD", "0"))
-            if method is None
-            else int(method)
-        )
+        if method is None:
+            method = os.environ.get("DDSTORE_METHOD", "0" if self._comm.is_mpi else "1")
+        self.method = int(method)
+        if self.method == 0 and not self._comm.is_mpi:
+            raise ValueError("method=0 needs an MPI communicator; use method=1 or 2")
         if self.method == 2 and self.ddstore_width != self.comm_size:
             raise NotImplementedError(
                 "method=2 does not support ddstore_width < comm size (groups would "
                 "collide on the same handshake directory)"
             )
-        self.ddstore_comm = self.comm.Split(self.rank // self.ddstore_width, self.rank)
-        group_rank = self.ddstore_comm.Get_rank()
-        group_size = self.ddstore_comm.Get_size()
+        self._group = self._comm.split(self.rank // self.ddstore_width, self.rank)
+        group_rank = self._group.rank
+        group_size = self._group.size
 
         # This rank's share of the source. Errors found locally are raised
         # only after comparing with every rank (_raise_on_all), so a bad
@@ -547,9 +722,8 @@ class DistDataset(_StoreDataset):
                     f"({other} vs {self.schema}); DistDataset needs fixed-shape samples"
                 )
 
-        hs = _handshake_dir(handshake_dir)
+        self.ddstore = self._group.store(self.method, hs)
         if self.method == 2:
-            self.ddstore = PyDDStore(self.ddstore_comm, method=2, handshake_dir=hs)
             if group_rank == 0:
                 # published before the variables, so a reader that sees a
                 # variable's record file always finds the schema too
@@ -558,8 +732,6 @@ class DistDataset(_StoreDataset):
                 with open(tmp, "w") as fh:
                     json.dump({"total_ns": self.total_ns, **self.schema}, fh)
                 os.replace(tmp, path)
-        else:
-            self.ddstore = PyDDStore(self.ddstore_comm, method=self.method)
 
         fields = self.schema["fields"]
         if chunk_size is None:
@@ -624,7 +796,7 @@ class DistDataset(_StoreDataset):
         """Allgather (value, error) over comm; if any rank had an error,
         raise it on every rank. Returns the gathered values."""
         local = None if error is None else (type(error).__name__, str(error))
-        gathered = self.comm.allgather((value, local))
+        gathered = self._comm.allgather((value, local))
         errors = [e for _, e in gathered if e is not None]
         if errors:
             cls = TypeError if errors[0][0] == "TypeError" else ValueError
@@ -722,8 +894,9 @@ class WindowedDataset(Dataset):
         return len(self.starts)
 
     def _rows(self, indices):
-        return (self.starts[np.asarray(indices, dtype=np.int64)][:, None]
-                + self._offsets).reshape(-1)
+        return (
+            self.starts[np.asarray(indices, dtype=np.int64)][:, None] + self._offsets
+        ).reshape(-1)
 
     def _sample(self, values):
         if self.fields is not None:

@@ -22,11 +22,11 @@ try:
 except Exception:  # pragma: no cover - not installed as a distribution
     __version__ = "unknown"
 
-__all__ = ["PyDDStore", "PyDDstoreVarinfo", "HAVE_MPI", "__version__"]
+__all__ = ["PyDDStore", "PyDDstoreVarinfo", "FileComm", "HAVE_MPI", "__version__"]
 
 
 def __getattr__(name):
-    if name in ("PyDDStore", "PyDDstoreVarinfo", "HAVE_MPI"):
+    if name in ("PyDDStore", "PyDDstoreVarinfo", "FileComm", "HAVE_MPI"):
         from . import _core
 
         return getattr(_core, name)

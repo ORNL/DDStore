@@ -3,6 +3,7 @@
 # cython: language=c++
 
 import os
+import pickle
 import time
 
 import cpu_nic_map
@@ -125,6 +126,63 @@ cdef extern from "ddstore.hpp":
 # True if this build has MPI (method 0 and MPI communicators); False for a
 # DDSTORE_MPI=0 build, where only methods 1 and 2 without a communicator work.
 HAVE_MPI = bool(ddstore_have_mpi)
+
+cdef extern from "exchange.hpp":
+    cdef cppclass FileExchange:
+        FileExchange(string dir, int rank, int size, string ns) except +
+        void allgather(const void *inp, void *out, size_t nbytes) except + nogil
+
+
+cdef class FileComm:
+    """Collectives for ranks without MPI, through files in a shared directory
+    (the FileExchange stores without a communicator use; see exchange.hpp).
+
+      FileComm(dir, rank, size, ns)
+
+    dir must be on a filesystem every rank sees. Every rank must create its
+    FileComms in the same order with the same ns, and make the same calls
+    on them in the same order. ns must differ from that of any other
+    FileComm or store exchange (exchange_ns=) in dir during this session;
+    avoid '.' in it (the file names use '.' to separate the call number).
+    """
+    cdef FileExchange *c_x
+    cdef readonly int rank
+    cdef readonly int size
+    cdef readonly str dir
+    cdef readonly str ns
+
+    def __cinit__(self, str dir, int rank, int size, str ns):
+        if not ns:
+            raise ValueError("FileComm needs a non-empty ns")
+        self.c_x = new FileExchange(s2b(dir), rank, size, s2b(ns))
+        self.rank, self.size, self.dir, self.ns = rank, size, dir, ns
+
+    def __dealloc__(self):
+        del self.c_x
+
+    cdef bytes _gather(self, bytes data):
+        # every rank passes the same number of bytes
+        cdef size_t n = len(data)
+        cdef const char *src = data
+        out = bytearray(n * self.size)
+        cdef char *dst = out
+        with nogil:
+            self.c_x.allgather(src, dst, n)
+        return bytes(out)
+
+    def allgather(self, obj):
+        """Every rank's (picklable) obj, as a list by rank."""
+        data = pickle.dumps(obj)
+        lens = np.frombuffer(
+            self._gather(np.int64(len(data)).tobytes()), dtype=np.int64)
+        width = int(lens.max())
+        allb = self._gather(data.ljust(width, b"\0"))
+        return [pickle.loads(allb[r * width:r * width + int(lens[r])])
+                for r in range(self.size)]
+
+    def barrier(self):
+        self._gather(b"\0")
+
 
 cdef long long _fortran_comm(comm) except? -1:
     # An MPI communicator as a Fortran handle, so this module needs neither

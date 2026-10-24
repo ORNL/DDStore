@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "Cython", "numpy", "mpi4py"]
+requires = ["setuptools>=45", "wheel", "Cython", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "PyDDStore"
 version = "2.0"
 description = "Distributed Data Store"
 requires-python = ">=3.9"
-dependencies = ["numpy", "mpi4py"]
+# numpy, plus mpi4py unless built with DDSTORE_MPI=0 (see setup.py)
+dynamic = ["dependencies"]
 
 [project.optional-dependencies]
 torch = ["torch"]

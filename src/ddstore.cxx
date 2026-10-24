@@ -112,6 +112,24 @@ DDStore::DDStore(int method, const std::string &handshake_dir, int n_core)
             this->handshake_dir.c_str());
 }
 
+DDStore *DDStore::from_fortran_comm(int method, long long fcomm,
+                                    const std::string &handshake_dir)
+{
+#ifdef DDSTORE_HAVE_MPI
+    MPI_Comm comm = MPI_Comm_f2c((MPI_Fint)fcomm);
+    if (method == 2)
+        return new DDStore(method, comm, handshake_dir);
+    return new DDStore(method, comm);
+#else
+    (void)method;
+    (void)fcomm;
+    (void)handshake_dir;
+    throw std::runtime_error(
+        "DDStore was built without MPI (DDSTORE_MPI=0): pass no communicator "
+        "and use method 1 or 2 with rank/size");
+#endif
+}
+
 DDStore::~DDStore()
 {
     this->free();

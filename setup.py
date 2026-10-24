@@ -9,7 +9,15 @@ from setuptools.extension import Extension
 import os
 import subprocess
 
-defs = [("NPY_NO_DEPRECATED_API", 0), ("DDSTORE_HAVE_MPI", 1)]
+# DDSTORE_MPI=0 builds without MPI: methods 1 and 2 only, with ranks
+# exchanging handshake records through files (no mpi.h, no mpi4py). The
+# default (1) needs an MPI compiler wrapper, e.g. CC=mpicc CXX=mpicxx, or
+# CC=cc CXX=CC on Cray.
+with_mpi = os.environ.get("DDSTORE_MPI", "1").lower() not in ("0", "off", "no", "false")
+print("DDSTORE_MPI:", int(with_mpi))
+defs = [("NPY_NO_DEPRECATED_API", 0)]
+if with_mpi:
+    defs.append(("DDSTORE_HAVE_MPI", 1))
 include_dirs = list()
 library_dirs = list()
 libraries = list()
@@ -67,7 +75,8 @@ with open(stamp, "w") as f:
 
 # Left over from the layout before pyddstore became a package.
 for old in ("src/pyddstore.cpp",) + tuple(
-    join("src", f) for f in os.listdir("src")
+    join("src", f)
+    for f in os.listdir("src")
     if f.startswith("pyddstore.") and f.endswith(".so")
 ):
     if os.path.exists(old):
@@ -80,5 +89,6 @@ setup(
     package_dir={"": "src"},
     packages=["pyddstore"],
     py_modules=["cpu_nic_map"],
+    install_requires=["numpy"] + (["mpi4py"] if with_mpi else []),
     ext_modules=cythonize(extensions, force=regenerate),
 )

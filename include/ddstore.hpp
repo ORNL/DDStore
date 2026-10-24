@@ -40,6 +40,13 @@ typedef struct VarInfo VarInfo_t;
 
 int sortedsearch(const std::vector<long> &vec, long num);
 
+/* 1 if built with MPI (DDSTORE_HAVE_MPI: method 0 and MPI communicators), 0 if not. */
+#ifdef DDSTORE_HAVE_MPI
+static const int ddstore_have_mpi = 1;
+#else
+static const int ddstore_have_mpi = 0;
+#endif
+
 class DDStore
 {
 public:
@@ -69,6 +76,13 @@ public:
     /* Method 2: extra member constructor (no MPI communicator required).
      * The extra member calls join() per variable to discover the data.      */
     DDStore(int method, const std::string &handshake_dir, int n_core);
+
+    /* The MPI constructors above, from a Fortran communicator handle
+     * (mpi4py's comm.py2f()), so a binding needs no MPI headers: method 2
+     * with handshake_dir uses the core-member constructor. Throws
+     * std::runtime_error in a build without MPI.                           */
+    static DDStore *from_fortran_comm(int method, long long fcomm,
+                                      const std::string &handshake_dir);
 
     ~DDStore();
 

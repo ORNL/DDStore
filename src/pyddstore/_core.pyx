@@ -5,10 +5,6 @@
 import os
 import time
 
-import mpi4py.MPI as MPI
-cimport mpi4py.MPI as MPI
-cimport mpi4py.libmpi as libmpi
-
 import cpu_nic_map
 
 import numpy as np
@@ -98,13 +94,9 @@ cdef extern from "ddstore.hpp":
         int itemsize
 
 
+    const int ddstore_have_mpi
+
     cdef cppclass DDStore:
-        DDStore()
-        DDStore(libmpi.MPI_Comm comm)
-        DDStore(int method, libmpi.MPI_Comm comm)
-        # Method 2: core member (with MPI communicator; n_core == comm size)
-        DDStore(int method, libmpi.MPI_Comm comm,
-                string handshake_dir)
         # Methods 1/2 without MPI: rank of size, records exchanged via files
         DDStore(int method, string handshake_dir, int rank, int size,
                 string ns) except +
@@ -124,6 +116,31 @@ cdef extern from "ddstore.hpp":
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
         void profile(string name, unsigned long long *out) except +
+
+    # The MPI constructors, from comm.py2f() (method 2 with handshake_dir:
+    # core member, n_core == comm size). Raises in a build without MPI.
+    DDStore *DDStore_from_fortran_comm "DDStore::from_fortran_comm"(
+        int method, long long fcomm, string handshake_dir) except +
+
+# True if this build has MPI (method 0 and MPI communicators); False for a
+# DDSTORE_MPI=0 build, where only methods 1 and 2 without a communicator work.
+HAVE_MPI = bool(ddstore_have_mpi)
+
+cdef long long _fortran_comm(comm) except? -1:
+    # An MPI communicator as a Fortran handle, so this module needs neither
+    # mpi.h nor mpi4py at build time (mpi4py's Comm.py2f()).
+    if not HAVE_MPI:
+        raise RuntimeError(
+            "pyddstore was built without MPI (DDSTORE_MPI=0): pass "
+            "comm_or_none=None with method=1 or 2, handshake_dir=, rank= "
+            "and size=")
+    try:
+        py2f = comm.py2f
+    except AttributeError:
+        raise TypeError("comm_or_none must be an mpi4py communicator "
+                        "(got %s)" % type(comm).__name__) from None
+    return py2f()
+
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -176,7 +193,6 @@ cdef class PyDDStore:
           DDSTORE_NIC_MAP env var. Only used if FABRIC_IFACE isn't already
           set in the environment.
         """
-        cdef MPI.Comm mpi_comm
         self.method = method
         self._gpu_owned_buffers = {}
         self._recv_buffers = {}
@@ -218,17 +234,16 @@ cdef class PyDDStore:
             else:
                 # Core member with file-based handshake; n_core is derived
                 # from the communicator size.
-                mpi_comm = comm_or_none
-                self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi,
-                                             s2b(handshake_dir))
+                self.c_ddstore = DDStore_from_fortran_comm(
+                    method, _fortran_comm(comm_or_none), s2b(handshake_dir))
         else:
             # Methods 0 and 1: standard MPI constructor
             if comm_or_none is None:
                 raise ValueError(
                     "method=%d requires a valid MPI communicator "
                     "(got comm_or_none=None)" % method)
-            mpi_comm = comm_or_none
-            self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi)
+            self.c_ddstore = DDStore_from_fortran_comm(
+                method, _fortran_comm(comm_or_none), b"")
 
     def __dealloc__(self):
         if self.c_ddstore != NULL:

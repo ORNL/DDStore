@@ -4,13 +4,13 @@
 
 Efficient distributed data loading for distributed data-parallel (DDP) training.
 
-Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a global index space so any rank can read any sample via one-sided remote memory access — either MPI RMA (default) or libfabric RDMA — without coordinator synchronization.
+Each rank holds a shard of the dataset in memory; any rank reads any sample by global index through one-sided remote memory access (MPI RMA or libfabric RDMA), without coordination.
 
-- **Batched reads**: [`get_batch()`](api-pyddstore.md#get_batchname-arr-indices) fetches a whole training batch in one call (one-sided RDMA reads in flight together, or an MPI collective for `method=0`).
+- **Batched reads**: [`get_batch()`](api-pyddstore.md#get_batchname-arr-indices) reads a whole batch in one call.
 - **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory ([details](gpudirect.md)).
-- **PyTorch integration**: [`pyddstore.torch`](pytorch.md) turns any map-style dataset into a distributed one (`DistDataset`) and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers (one DDStore reader per worker thread, batches read straight into their tensors). PyTorch's own `DataLoader` with [forked workers](pytorch.md#forked-dataloader-workers) works too (methods 1 and 2, `DDSTORE_FORK_WORKERS=1`).
-- **Thread-safe** reads, a [profiler](performance.md) for where read time goes, and a split mode (`method=2`) where a separate job reads data published by another.
-- **MPI optional**: the libfabric backends also run [without MPI](backends.md#without-mpi-methods-1-and-2) (`DDSTORE_MPI=0` build), with ranks launched by `srun`.
+- **PyTorch integration**: [`pyddstore.torch`](pytorch.md): `DistDataset` (any map-style dataset), `WindowedDataset` (multi-row samples), `ThreadDataLoader` (threads; safe with MPI and GPU buffers). PyTorch's `DataLoader` with [forked workers](pytorch.md#forked-dataloader-workers) also works (methods 1 and 2).
+- **Thread-safe** reads, a read-time [profiler](performance.md), and a split mode (`method=2`) where one job reads data published by another.
+- **MPI optional**: methods 1 and 2 also run [without MPI](backends.md#without-mpi-methods-1-and-2) (`DDSTORE_MPI=0`), launched by `srun`.
 
 <img src="https://github.com/allaffa/DDStore/assets/2488656/88a3b139-062d-41e8-a8d7-40c1a144d897" alt="DDStore architecture" width="300" />
 

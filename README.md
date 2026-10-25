@@ -4,13 +4,13 @@
 
 Efficient distributed data loading for distributed data-parallel (DDP) training.
 
-Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a global index space so any rank can read any sample via one-sided remote memory access — either MPI RMA (default) or libfabric RDMA — without coordinator synchronization.
+Each rank holds a shard of the dataset in memory; any rank reads any sample by global index through one-sided remote memory access (MPI RMA or libfabric RDMA), without coordination.
 
-- **Batched reads**: `get_batch()` fetches a whole training batch in one call (one-sided RDMA reads in flight together, or an MPI collective for `method=0`).
+- **Batched reads**: `get_batch()` reads a whole batch in one call.
 - **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory.
-- **PyTorch integration**: `pyddstore.torch` turns any map-style dataset into a distributed one (`DistDataset`), reads samples made of several stored rows (`WindowedDataset`), and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers (one DDStore reader per worker thread, batches read straight into their tensors). PyTorch's own `DataLoader` with forked workers works too (methods 1 and 2, `DDSTORE_FORK_WORKERS=1`).
-- **Thread-safe** reads, a profiler for where read time goes, and a split mode (`method=2`) where a separate job reads data published by another.
-- **MPI optional**: the libfabric backends also run without MPI (`DDSTORE_MPI=0` build), with ranks launched by `srun`.
+- **PyTorch integration**: `DistDataset` (any map-style dataset), `WindowedDataset` (multi-row samples), `ThreadDataLoader` (threads; safe with MPI and GPU buffers). PyTorch's `DataLoader` with forked workers also works (methods 1 and 2).
+- **Thread-safe** reads, a read-time profiler, and a split mode (`method=2`) where one job reads data published by another.
+- **MPI optional**: methods 1 and 2 also run without MPI (`DDSTORE_MPI=0`), launched by `srun`.
 
 <img src="https://github.com/allaffa/DDStore/assets/2488656/88a3b139-062d-41e8-a8d7-40c1a144d897" alt="DDStore architecture" width="300" />
 
@@ -35,7 +35,7 @@ CC=mpicc CXX=mpicxx pip install -e .           # editable, for development
 DDSTORE_MPI=0 CC=gcc CXX=g++ pip install .     # without MPI: methods 1 and 2 only
 ```
 
-On Cray systems, building against the environment's own `mpi4py` (`--no-build-isolation`), and other build details: [Installation](docs/installation.md).
+Cray systems and other build details: [Installation](docs/installation.md).
 
 ## Quick start
 
@@ -73,9 +73,9 @@ for x, y in loader:
 
 Run with `mpirun -n 4 python my_script.py` (or `srun`).
 
-PyTorch's standard `DataLoader` with `num_workers > 0` (forked workers) also works for methods 1 and 2: export `DDSTORE_FORK_WORKERS=1` in the job script, and pass `persistent_workers=True` (new workers every epoch cost ~0.7 s per epoch in the VAE example). Each worker opens its own endpoint and returns samples on the CPU: a forked process can't use the GPU, so reads into GPU memory (`device=`) need `ThreadDataLoader`; data stored on the GPU (`add_device=`) is still readable from workers. On Frontier this switches the libfabric MR cache monitor from the default `kdreg2`, which hangs forked workers, to `memhooks` (same speed); with MPI, import pyddstore before mpi4py. See [Forked DataLoader workers](docs/pytorch.md#forked-dataloader-workers).
+PyTorch's `DataLoader` with forked workers also works (methods 1 and 2): set `DDSTORE_FORK_WORKERS=1`, pass `persistent_workers=True`, and with MPI import pyddstore before mpi4py. Workers read into host memory; use `ThreadDataLoader` for GPU destinations. See [Forked DataLoader workers](docs/pytorch.md#forked-dataloader-workers).
 
-Without MPI (a `DDSTORE_MPI=0` build, or `DDSTORE_COMM=file`), stores exchange their RDMA records through files in a shared directory, and ranks come from `srun`:
+Without MPI (`DDSTORE_MPI=0` build or `DDSTORE_COMM=file`), records are exchanged through files in a shared directory; ranks come from `srun`:
 
 ```python
 import os

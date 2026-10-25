@@ -20,9 +20,9 @@ Methods 1 and 2 can be read from forked PyTorch DataLoader workers
 starts:
 
 - ``FI_CXI_DISABLE_HOST_REGISTER=1`` (always set here unless already set);
-- an MR cache monitor that survives fork: with ``DDSTORE_FORK_WORKERS=1``,
-  ``FI_MR_CACHE_MONITOR=memhooks`` if it is unset or ``kdreg2`` (Frontier's
-  default, which hangs forked workers).
+- an MR cache monitor that works in forked processes: with
+  ``DDSTORE_FORK_WORKERS=1``, ``FI_MR_CACHE_MONITOR=memhooks`` if it is
+  unset or ``kdreg2`` (Frontier's default).
 
 Import pyddstore before mpi4py (MPI starts libfabric), or export them in
 the job script.

@@ -1064,17 +1064,14 @@ class ThreadDataLoader(DataLoader):
     read into host memory only. Takes the same arguments as ``DataLoader``;
     ``num_workers`` is the number of threads (0 means 1).
 
-    Methods 1 and 2: worker thread *i* reads a ``DistDataset`` /
-    ``DistDatasetReader`` through the dataset's reader *i*
-    (``PyDDStore.fork_reader()``, opened on first use and kept for later
-    loaders), which has its own libfabric endpoint, so the threads' reads
-    run in parallel instead of taking turns on the store's per-variable
-    lock. ``DDSTORE_THREAD_READERS=0``: all threads share the store.
+    Methods 1 and 2: each worker thread reads a ``DistDataset`` /
+    ``DistDatasetReader`` through its own reader (``PyDDStore.fork_reader()``,
+    kept for later loaders over the dataset), so threads read in parallel.
+    ``DDSTORE_THREAD_READERS=0``: the threads share the store.
 
-    With the default ``collate_fn``, a ``DistDataset`` / ``DistDatasetReader``
-    batch whose fields are tensors, numpy arrays or numbers is read straight
-    into its batch tensors (``default_collate``'s result, without building
-    per-sample values under the GIL). ``DDSTORE_FAST_COLLATE=0``: off.
+    With the default ``collate_fn``, a batch whose fields are tensors, numpy
+    arrays or numbers is read directly into its batch tensors, with the same
+    result as ``default_collate``. ``DDSTORE_FAST_COLLATE=0``: off.
 
     Each batch is fetched (via ``dataset.__getitems__`` when present),
     collated and optionally pinned in a worker thread; at most
@@ -1085,8 +1082,7 @@ class ThreadDataLoader(DataLoader):
 
     ``reuse_buffers=True`` (dataset with ``alloc()``, e.g. ``DistDataset``):
     read every batch into a buffer set from ``dataset.alloc(batch_size)``,
-    one per worker thread, registered once (with that thread's reader),
-    instead of fresh buffers that are registered on every read. A worker
+    one per worker thread, registered once, instead of fresh buffers that are registered on every read. A worker
     reads and collates a batch, then reuses its set, so the collate must copy:
     needs ``batch_size`` and the default ``collate_fn``, or
     ``collate_copies=True`` to declare that a custom ``collate_fn`` copies.

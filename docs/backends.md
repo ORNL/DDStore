@@ -2,44 +2,33 @@
 
 ## MPI RMA (`method=0`, default)
 
-Uses `MPI_Win_create` and `MPI_Get` for one-sided remote reads. Works on any MPI-capable cluster without additional hardware. `epoch_begin`/`epoch_end` are required to delimit access epochs.
+`MPI_Win_create` + `MPI_Get`. Runs on any MPI cluster. Reads go between `epoch_begin()` and `epoch_end()`.
 
 ## libfabric RDMA (`method=1`)
 
-Uses `fi_read` for true RDMA transfers over high-speed interconnects (Infiniband/verbs, Cray GNI, Intel PSM2, Cray Slingshot). Lower latency than MPI RMA on supported hardware. `epoch_begin`/`epoch_end` are no-ops with this backend.
+`fi_read` over high-speed interconnects (Slingshot, InfiniBand/verbs, …); lower latency than MPI RMA. `epoch_begin`/`epoch_end` are no-ops.
 
-**`DDSTORE_FABRIC`** selects which libfabric provider to open, for `method=1`/`2`:
+**`DDSTORE_FABRIC`** (methods 1 and 2) picks the provider; set it per system:
 
-- `hsn` (default, unset) — opens the `tcp;ofi_rxm` domain over Cray Slingshot (Frontier).
-- `cxi` — opens the native `cxi` domain over Cray Slingshot (Frontier and Perlmutter; Perlmutter is CXI-only). Required for [GPUDirect RDMA](gpudirect.md), and the default in the Frontier job scripts.
+- `hsn` (default): `tcp;ofi_rxm` over Slingshot (Frontier).
+- `cxi`: native Slingshot (Frontier, Perlmutter). Required for [GPUDirect RDMA](gpudirect.md); the Frontier job scripts use it.
 
-The two are independent code paths (not runtime auto-detection), so set this explicitly per system rather than relying on a guess:
+The network interface (`FABRIC_IFACE`) is chosen per rank from its CPU affinity:
 
-```bash
-export DDSTORE_FABRIC=hsn   # tcp;ofi_rxm (default)
-export DDSTORE_FABRIC=cxi   # native CXI: Perlmutter, or Frontier with GPUDirect
-```
-
-`PyDDStore` picks the network interface (`FABRIC_IFACE`) automatically for `method=1`/`2`, based on each rank's real CPU affinity (`os.sched_getaffinity`) — no changes needed in your code:
-
-- **`DDSTORE_NIC_MAP`** — a precomputed CPU→NIC map, used directly if set (no NIC discovery at construction time). Generate it once from a context with reliable NIC visibility, e.g. an `sbatch` batch step's own shell (not a nested `srun` task — NIC/PCI discovery has been observed to fail there), and export it before launching ranks so every one inherits it:
+- **`DDSTORE_NIC_MAP`**: a precomputed CPU→NIC map, used if set. Generate it in the batch step's shell (NIC discovery can fail inside nested `srun` tasks) and export it:
   ```bash
   export DDSTORE_NIC_MAP=$(python3 -m cpu_nic_map --env)
   srun ... python train.py
   ```
-- If `DDSTORE_NIC_MAP` isn't set, each rank falls back to a live `hwloc-calc`/`lstopo` query against its own CPU affinity (`cpu_nic_map.allocated_nics()`, also runnable standalone as `python3 cpu_nic_map.py --allocated`) to find the nearest NIC.
-- Set `FABRIC_IFACE` explicitly to override both and force a specific interface, e.g. when the automatic selection picks the wrong one:
-  ```bash
-  export FABRIC_IFACE=hsn0   # e.g. Cray Slingshot
-  ```
-- Or skip the environment entirely and pass a map straight to the constructor: `PyDDStore(comm, method=1, nic_map="hsn0=0-15,64-79;hsn1=...")`.
+- Otherwise each rank queries `hwloc` for its nearest NIC (`python3 cpu_nic_map.py --allocated` to check).
+- `FABRIC_IFACE=hsn0` forces an interface; `PyDDStore(..., nic_map="hsn0=0-15,64-79;...")` passes a map directly.
 
 ## File-based handshake (`method=2`)
 
-Splits the dataset-holding job from the training job entirely: a **core** group loads and publishes data, and a separate **extra** group reads it over RDMA (`fi_read`, same transport as `method=1`) — the two are independent MPI jobs (e.g. two separate `srun`/`mpirun` launches, possibly on different node allocations) that never share a communicator. They rendezvous only through record files written to a shared-filesystem directory (must be visible to all nodes, e.g. Lustre):
+Separates the job holding the data from the training job. A **core** group publishes data; a separate **extra** group (its own launch, possibly other nodes, no shared communicator) reads it over RDMA as in `method=1`. They meet only through record files in a shared directory (e.g. Lustre):
 
-- **Core member** — has an MPI communicator (or, [without MPI](#without-mpi-methods-1-and-2), `rank=`/`size=`), publishes with `add()`/`init()`. Core ranks exchange records via `MPI_Allgather` (or files), and rank 0 writes the combined set to a single `{name}.bin` file (fabric address, MR key, base pointer, row count, dtype per rank) into `handshake_dir`.
-- **Extra member** — no MPI communicator; constructed with `comm_or_none=None` and an explicit `n_core`. Calls `join(name)` to poll for and read all `n_core` core-rank records, then `get()` works exactly as on the core side, reading directly from core-rank memory over RDMA.
+- **Core member**: has a communicator (or `rank=`/`size=` [without MPI](#without-mpi-methods-1-and-2)); publishes with `add()`/`init()`. Rank 0 writes the combined records (address, key, base pointer, rows, dtype per rank) to `{name}.bin` in `handshake_dir`.
+- **Extra member**: `comm_or_none=None` and `n_core`; `join(name)` reads the records, then `get()`/`get_batch()` read from core memory.
 
 ```python
 # core side — one MPI job
@@ -56,15 +45,11 @@ store.get("x", out, start=global_idx)
 store.free()
 ```
 
-Environment variables: `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S`, `DDSTORE_FABRIC` and `DDSTORE_NIC_MAP` — see [Environment variables](environment.md).
-
-See [test/test_method2_core.py](https://github.com/ORNL/DDStore/blob/main/test/test_method2_core.py) / [test/test_method2_extra.py](https://github.com/ORNL/DDStore/blob/main/test/test_method2_extra.py) for a minimal runnable pair, and [examples/vae/vae_core_server.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_core_server.py) / [examples/vae/vae_extra_train.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_extra_train.py) for a full DDP training example using this split.
-
-`ddstore_width` grouping (below) is not currently supported with `method=2` — every core rank in `comm` is treated as one group.
+Settings: `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S`, `DDSTORE_FABRIC`, `DDSTORE_NIC_MAP` ([Environment variables](environment.md)). Examples: [test_method2_core.py](https://github.com/ORNL/DDStore/blob/main/test/test_method2_core.py) / [test_method2_extra.py](https://github.com/ORNL/DDStore/blob/main/test/test_method2_extra.py); [vae_core_server.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_core_server.py) / [vae_extra_train.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_extra_train.py) for DDP training. `ddstore_width` is not supported: all core ranks form one group.
 
 ## Without MPI (methods 1 and 2)
 
-Methods 1 and 2 move data with libfabric only; MPI is used just once per variable, when `add()`/`init()` gathers every rank's record (fabric address, memory key, base pointer, row count). Without a communicator, that gather goes through files in a shared directory instead:
+Methods 1 and 2 use MPI only to gather each rank's record in `add()`/`init()`. Without a communicator, that gather goes through files in a shared directory:
 
 ```python
 import os
@@ -81,17 +66,17 @@ store.free()
 srun -N2 -n8 python train.py         # no mpirun, no MPI library needed
 ```
 
-- Works with either build; in a [`DDSTORE_MPI=0` build](installation.md#building-without-mpi) it is the only way to make a store.
-- `method=2` the same way gives a core member (`size=` is `n_core`), which publishes `{name}.bin` for extra members as usual.
-- Each gather: every rank writes its record to a file, rank 0 combines them into one file, the others read it. Ranks poll with a backoff from 1 ms to 200 ms, for up to `DDSTORE_HANDSHAKE_TIMEOUT_S`. Every rank must create its stores, and call `add()`/`init()`, in the same order.
-- File names carry a session (`DDSTORE_SESSION`, else `{SLURM_JOB_ID}_{SLURM_STEP_ID}`) and a per-store name (`exchange_ns=`, default `s0`, `s1`, … in creation order), so separate steps and stores sharing one directory don't collide. Each rank's record carries a random nonce, so files left by an earlier run are never mistaken for the current one.
-- `epoch_begin`/`epoch_end` are no-ops, as with MPI. Synchronize ranks yourself where needed (before `free()`, for example): `pyddstore.FileComm(dir, rank, size, ns)` provides `allgather(obj)` and `barrier()` over the same file exchange.
+- Works in either build; the only option in a [`DDSTORE_MPI=0` build](installation.md#building-without-mpi).
+- `method=2` gives a core member (`size=` is `n_core`) that publishes `{name}.bin` as usual.
+- Every rank creates its stores and calls `add()`/`init()` in the same order. Ranks poll (1–200 ms backoff) for up to `DDSTORE_HANDSHAKE_TIMEOUT_S`.
+- File names include a session (`DDSTORE_SESSION`, else `{SLURM_JOB_ID}_{SLURM_STEP_ID}`) and a store name (`exchange_ns`, default `s0`, `s1`, …), and records carry a nonce, so runs and stores can share a directory.
+- `epoch_begin`/`epoch_end` are no-ops. For barriers (e.g. before `free()`), use `pyddstore.FileComm(dir, rank, size, ns)`.
 
-`pyddstore.torch.DistDataset` does all this when it gets no MPI communicator (see [PyTorch integration](pytorch.md#without-mpi)).
+`DistDataset` does this when it has no MPI communicator ([PyTorch integration](pytorch.md#without-mpi)).
 
 ## Partitioned / Sub-communicator Usage
 
-`PyDDStore` always spans the whole communicator you pass it. To run several independent stores side by side (e.g. one per node), split `comm` first; each group then holds a full replica of the dataset, partitioned across its own members:
+A store spans its whole communicator. For independent stores (e.g. one per node), split `comm`; each group holds a full replica, partitioned across its members:
 
 ```python
 width = 4                                       # ranks per group, e.g. GPUs per node
@@ -99,4 +84,4 @@ sub_comm = comm.Split(rank // width, rank)
 store = dds.PyDDStore(sub_comm)                  # one independent store per group
 ```
 
-This keeps sample fetches inside a node at the cost of replicating the data per group. `DistDataset` exposes it as `ddstore_width` (`None` = one store across all ranks). Not supported with `method=2`.
+Reads stay within the group at the cost of one replica per group. `DistDataset(ddstore_width=)` does this. Not supported with `method=2`.

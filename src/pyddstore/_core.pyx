@@ -3,16 +3,23 @@
 # cython: language=c++
 
 import os
+import pickle
 import time
-
-import mpi4py.MPI as MPI
-cimport mpi4py.MPI as MPI
-cimport mpi4py.libmpi as libmpi
 
 import cpu_nic_map
 
 import numpy as np
 cimport numpy as np
+
+np.import_array()
+
+
+cdef inline size_t _host_ptr(arr) except? 0:
+    # Data address of a host buffer: the C field for an ndarray, without
+    # arr.ctypes building a ctypes object on every read.
+    if isinstance(arr, np.ndarray):
+        return <size_t> np.PyArray_DATA(<np.ndarray> arr)
+    return arr.ctypes.data
 
 from libcpp.string cimport string
 from libcpp.typeinfo cimport type_info
@@ -98,22 +105,21 @@ cdef extern from "ddstore.hpp":
         int itemsize
 
 
+    const int ddstore_have_mpi
+
     cdef cppclass DDStore:
-        DDStore()
-        DDStore(libmpi.MPI_Comm comm)
-        DDStore(int method, libmpi.MPI_Comm comm)
-        # Method 2: core member (with MPI communicator; n_core == comm size)
-        DDStore(int method, libmpi.MPI_Comm comm,
-                string handshake_dir)
+        # Methods 1/2 without MPI: rank of size, records exchanged via files
+        DDStore(int method, string handshake_dir, int rank, int size,
+                string ns) except +
         # Method 2: extra member (no MPI communicator)
-        DDStore(int method, string handshake_dir, int n_core)
+        DDStore(int method, string handshake_dir, int n_core) except +
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
         void get[T](string name, long start, long count, T* buffer, int hmem_iface) except + nogil
         void get_batch[T](string name, const long *idx, long n, T* buffer, int hmem_iface) except + nogil
         void register_recv(string name, void *buffer, size_t len, int hmem_iface) except +
         void unregister_recv(string name, void *buffer) except +
-        void epoch_begin()
-        void epoch_end()
+        void epoch_begin() except +
+        void epoch_end() except +
         void free()
         void init(string name, long nrows, int disp, int itemsize) except +
         void update[T](string name, T* buffer, long nrows, long offset) except +
@@ -121,6 +127,89 @@ cdef extern from "ddstore.hpp":
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
         void profile(string name, unsigned long long *out) except +
+        DDStore *fork_reader() except +
+
+    # The MPI constructors, from comm.py2f() (method 2 with handshake_dir:
+    # core member, n_core == comm size). Raises in a build without MPI.
+    DDStore *DDStore_from_fortran_comm "DDStore::from_fortran_comm"(
+        int method, long long fcomm, string handshake_dir) except +
+
+# True if this build has MPI (method 0 and MPI communicators); False for a
+# DDSTORE_MPI=0 build, where only methods 1 and 2 without a communicator work.
+HAVE_MPI = bool(ddstore_have_mpi)
+
+cdef extern from "exchange.hpp":
+    cdef cppclass FileExchange:
+        FileExchange(string dir, int rank, int size, string ns) except +
+        void allgather(const void *inp, void *out, size_t nbytes) except + nogil
+
+
+cdef class FileComm:
+    """Collectives for ranks without MPI, through files in a shared directory
+    (the FileExchange stores without a communicator use; see exchange.hpp).
+
+      FileComm(dir, rank, size, ns)
+
+    dir must be on a filesystem every rank sees. Every rank must create its
+    FileComms in the same order with the same ns, and make the same calls
+    on them in the same order. ns must differ from that of any other
+    FileComm or store exchange (exchange_ns=) in dir during this session;
+    avoid '.' in it (the file names use '.' to separate the call number).
+    """
+    cdef FileExchange *c_x
+    cdef readonly int rank
+    cdef readonly int size
+    cdef readonly str dir
+    cdef readonly str ns
+
+    def __cinit__(self, str dir, int rank, int size, str ns):
+        if not ns:
+            raise ValueError("FileComm needs a non-empty ns")
+        self.c_x = new FileExchange(s2b(dir), rank, size, s2b(ns))
+        self.rank, self.size, self.dir, self.ns = rank, size, dir, ns
+
+    def __dealloc__(self):
+        del self.c_x
+
+    cdef bytes _gather(self, bytes data):
+        # every rank passes the same number of bytes
+        cdef size_t n = len(data)
+        cdef const char *src = data
+        out = bytearray(n * self.size)
+        cdef char *dst = out
+        with nogil:
+            self.c_x.allgather(src, dst, n)
+        return bytes(out)
+
+    def allgather(self, obj):
+        """Every rank's (picklable) obj, as a list by rank."""
+        data = pickle.dumps(obj)
+        lens = np.frombuffer(
+            self._gather(np.int64(len(data)).tobytes()), dtype=np.int64)
+        width = int(lens.max())
+        allb = self._gather(data.ljust(width, b"\0"))
+        return [pickle.loads(allb[r * width:r * width + int(lens[r])])
+                for r in range(self.size)]
+
+    def barrier(self):
+        self._gather(b"\0")
+
+
+cdef long long _fortran_comm(comm) except? -1:
+    # An MPI communicator as a Fortran handle, so this module needs neither
+    # mpi.h nor mpi4py at build time (mpi4py's Comm.py2f()).
+    if not HAVE_MPI:
+        raise RuntimeError(
+            "pyddstore was built without MPI (DDSTORE_MPI=0): pass "
+            "comm_or_none=None with method=1 or 2, handshake_dir=, rank= "
+            "and size=")
+    try:
+        py2f = comm.py2f
+    except AttributeError:
+        raise TypeError("comm_or_none must be an mpi4py communicator "
+                        "(got %s)" % type(comm).__name__) from None
+    return py2f()
+
 
 cdef class PyDDstoreVarinfo:
     cdef VarInfo c_varinfo
@@ -128,9 +217,13 @@ cdef class PyDDstoreVarinfo:
     def __cinit__(self):
         pass
 
+# PyDDStore(_NO_STORE): a wrapper with no C++ store yet (fork_reader()).
+_NO_STORE = object()
+
+
 cdef class PyDDStore:
     cdef DDStore *c_ddstore
-    cdef int method
+    cdef readonly int method
     # Keepalive for GPU tensors passed to add(): C++ holds a raw pointer
     # into them with no copy and no refcounting (see ddstore.hpp add()'s
     # lifetime-contract comment) -- this dict keeps the Python reference
@@ -144,15 +237,28 @@ cdef class PyDDStore:
     cdef long _prof_gets
 
     def __cinit__(self, comm_or_none=None, int method=0,
-                  str handshake_dir="", int n_core=0, nic_map=None):
+                  str handshake_dir="", int n_core=0, nic_map=None,
+                  rank=None, int size=0, str exchange_ns=""):
         """
         Constructors:
           PyDDStore(comm)                          — method 0, MPI
           PyDDStore(comm, method=1)                — method 1, libfabric+MPI
           PyDDStore(comm, method=2,                — method 2, core member
                     handshake_dir="/path")            (n_core == comm size)
+          PyDDStore(None, method=1,                — method 1 without MPI:
+                    handshake_dir="/path",            this process is rank r
+                    rank=r, size=N)                   of N
+          PyDDStore(None, method=2,                — method 2 core member
+                    handshake_dir="/path",            without MPI (size= also
+                    rank=r, n_core=N)                 accepted for n_core)
           PyDDStore(None, method=2,                — method 2, extra member
                     handshake_dir="/path", n_core=N)
+
+        Without a communicator, ranks exchange their handshake records
+        through files in handshake_dir (on a filesystem all ranks see), and
+        every rank must create its stores in the same order. exchange_ns
+        names this store's exchange files; by default stores are numbered
+        in creation order.
 
         nic_map: optional precomputed CPU->NIC map string (see
           cpu_nic_map.py --env) used to select FABRIC_IFACE for this rank's
@@ -160,7 +266,6 @@ cdef class PyDDStore:
           DDSTORE_NIC_MAP env var. Only used if FABRIC_IFACE isn't already
           set in the environment.
         """
-        cdef MPI.Comm mpi_comm
         self.method = method
         self._gpu_owned_buffers = {}
         self._recv_buffers = {}
@@ -168,9 +273,27 @@ cdef class PyDDStore:
         self._prof_get_s = 0.0
         self._prof_sync_s = 0.0
         self._prof_gets = 0
+        if comm_or_none is _NO_STORE:
+            return
         if method != 0:
             cpu_nic_map.select_fabric_iface(nic_map=nic_map)
-        if method == 2:
+        if comm_or_none is None and rank is not None:
+            # Methods 1/2 without MPI.
+            if method not in (1, 2):
+                raise ValueError(
+                    "a store without an MPI communicator needs method=1 or 2 "
+                    "(got method=%d)" % method)
+            if not handshake_dir:
+                raise ValueError(
+                    "a store without an MPI communicator needs handshake_dir "
+                    "(a directory every rank sees)")
+            if size <= 0:
+                size = n_core
+            if size <= 0:
+                raise ValueError("rank= needs size= (or n_core= for method=2) > 0")
+            self.c_ddstore = new DDStore(method, s2b(handshake_dir), <int>rank,
+                                         size, s2b(exchange_ns))
+        elif method == 2:
             if not handshake_dir:
                 raise ValueError(
                     "method=2 requires handshake_dir (got handshake_dir=%r)"
@@ -186,17 +309,16 @@ cdef class PyDDStore:
             else:
                 # Core member with file-based handshake; n_core is derived
                 # from the communicator size.
-                mpi_comm = comm_or_none
-                self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi,
-                                             s2b(handshake_dir))
+                self.c_ddstore = DDStore_from_fortran_comm(
+                    method, _fortran_comm(comm_or_none), s2b(handshake_dir))
         else:
             # Methods 0 and 1: standard MPI constructor
             if comm_or_none is None:
                 raise ValueError(
                     "method=%d requires a valid MPI communicator "
                     "(got comm_or_none=None)" % method)
-            mpi_comm = comm_or_none
-            self.c_ddstore = new DDStore(method, mpi_comm.ob_mpi)
+            self.c_ddstore = DDStore_from_fortran_comm(
+                method, _fortran_comm(comm_or_none), b"")
 
     def __dealloc__(self):
         if self.c_ddstore != NULL:
@@ -235,7 +357,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             disp = arr.size // nrows
             iface = 0
@@ -282,7 +404,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             iface = 0
 
@@ -345,7 +467,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             iface = 0
 
@@ -380,7 +502,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             nbytes = arr.nbytes
             iface = 0
         if nbytes == 0:
@@ -390,7 +512,7 @@ cdef class PyDDStore:
 
     def unregister_recv(self, str name, arr):
         """Undo register_recv(name, arr)."""
-        cdef size_t ptr = arr.data_ptr() if _is_cuda_tensor(arr) else arr.ctypes.data
+        cdef size_t ptr = arr.data_ptr() if _is_cuda_tensor(arr) else _host_ptr(arr)
         if (name, ptr) not in self._recv_buffers:
             if self.method == 0:
                 return
@@ -459,6 +581,16 @@ cdef class PyDDStore:
     def join(self, str name):
         """Method 2 extra member: discover variable published by core members."""
         self.c_ddstore.join(s2b(name))
+
+    def fork_reader(self):
+        """A read-only store for a process forked from this one (a PyTorch
+        DataLoader worker), reading the same variables through its own
+        libfabric endpoint. Call it in the forked process; don't use this
+        store there. Methods 1 and 2; read into host buffers (a forked
+        process can't use the GPU)."""
+        cdef PyDDStore r = PyDDStore(_NO_STORE, method=self.method)
+        r.c_ddstore = self.c_ddstore.fork_reader()
+        return r
 
     def info(self, str name):
         """Return (total_rows, disp, itemsize) for an added or joined variable."""

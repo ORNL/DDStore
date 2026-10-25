@@ -115,6 +115,71 @@ to fetch ≈ 0.006 s / total ≈ 0.15 s. Pinned memory with
 `.to(device, non_blocking=True)` gave no gain (and was ~3× slower with 0
 workers, where pinning runs on the training thread).
 
+## Loaders with batched reads (`mpi-optional` branch)
+
+Frontier, `vae-ddp.py` via `job-vae-single.sh` (3 epochs, epochs 2–3 timed),
+method 1, `get_batch()` reads, `--replicate=2`, S = `--image-scale`, s/epoch
+(fetch + compute). Losses are identical within every table.
+
+**Workers with batched reads** (8 nodes × 8 ranks, host destination):
+
+| | S=1 | S=2 | S=4 |
+|---|---|---|---|
+| `DataLoader`, 0 workers (reads on the training thread) | 0.112 | 0.241 | 1.198 |
+| `ThreadDataLoader`, 1 thread (`num_workers=0`) | 0.092 | 0.224 | 1.115 |
+| `ThreadDataLoader`, 2 threads | 0.086 | 0.232 | 1.124 |
+| `ThreadDataLoader`, 4 threads | 0.090 | 0.230 | 1.176 |
+
+One background thread hides the fetch (0.03–0.05 → 0.003 s/epoch); more
+add nothing, since batched reads are a few percent of a step.
+
+**Thread readers (`DDSTORE_THREAD_READERS`, default 1) vs one shared store.**
+`bench_threads.py` (16 ranks, batch 64, `get_batch()` in a loop, speedup
+over one thread):
+
+| row | dest | threads | shared store (lock) | own reader each |
+|---|---|---|---|---|
+| 3 KB | host | 2 | 1.13× | 1.67× |
+| 3 KB | GPU | 4 | 1.41× | 1.70× |
+| 12.5 KB | GPU | 4 | 1.20× | 1.39× |
+| 200 KB | host/GPU | 4 | ~1.0× | 1.1–1.15× |
+
+VAE (4 and 8 nodes, 2–4 workers, host and GPU): equal epoch times. Per read
+call (`DDSTORE_PROFILE=1`, 8 nodes): lock wait 2–267 µs shared, 0.1 µs with
+own readers; Python-side time outside DDStore 65 µs → 1.6–3.3 ms with own
+readers and 4 workers, unchanged by `sys.setswitchinterval` (5 / 1 / 0.5 ms)
+and hidden by prefetch. Not investigated further.
+
+**Forked `DataLoader` workers vs `ThreadDataLoader`** (2 nodes × 8 ranks,
+host destination):
+
+| | S=1 | S=4 |
+|---|---|---|
+| `DataLoader`, 2 workers, new workers every epoch | 1.05 | 3.19 |
+| `DataLoader`, 2 workers, `persistent_workers=True` | 0.34 | 2.51 |
+| `DataLoader`, 4 workers, `persistent_workers=True` | 0.27 | 2.50 |
+| `ThreadDataLoader`, 2 workers | 0.27 | 2.52 |
+
+New workers every epoch (PyTorch's default) add 0.7–0.9 s per epoch at 2
+and 8 nodes, with every MR cache monitor (S=1 compute: `memhooks` 0.93,
+`userfaultfd` 1.24, `disabled` 0.98; 0 workers: `kdreg2` 0.21, `memhooks`
+0.22). Persistent workers still wait longer for batches than threads (fetch
+0.04–0.05 vs 0.007 s/epoch).
+
+**Direct batch reads (`DDSTORE_FAST_COLLATE`)** (8 nodes × 8 ranks,
+`ThreadDataLoader`, two repeats):
+
+| | fetch on / off | compute on / off |
+|---|---|---|
+| S=1, GPU, 2 workers | 0.002 / 0.004 | 0.077 / 0.089 |
+| S=1, GPU, 4 workers | 0.003 / 0.008 | 0.078 / 0.083 |
+| S=1, host, 4 workers | 0.002 / 0.008 | 0.076 / 0.089 |
+| S=4, GPU, 2 workers | 0.003 / 0.004 | 1.13 / 1.15 |
+| S=4, GPU, 4 workers | 0.004 / 0.008 | 1.17 / 1.11 |
+| S=4, host, 4 workers | 0.004 / 0.008 | 1.24 / 1.25 |
+
+Fetch waits halve; S=1 is 5–15% faster, S=4 within noise.
+
 ## Correctness experiments
 
 - **GPU sync in `get()`**: removing it made every `--gpu-dest` VAE run abort
@@ -158,3 +223,21 @@ One 2-node debug job covering what Frontier could not:
   (`--gpus-per-node=4`, each picks `cuda:$SLURM_LOCALID`); with
   `--gpus-per-task=1`, NCCL 2.29 fails in DDP setup with "Cuda failure 101
   'invalid device ordinal'". The job scripts handle this.
+- **`mpi-optional` branch** (commit `a258bfc`, 2 nodes × 4 ranks): both builds
+  pass the tests (126 `test_torch` + `test_get_batch`, 14 `test_gpu_rdma`, 14
+  `test_torch_nompi`, 12 `test_file_exchange`) with `DDSTORE_TEST_DIR` on
+  `$SCRATCH`. VAE `--method=1`, all loaders give epoch-3 loss 19.8601;
+  core/extra, torch and thread loaders give the same per-rank losses.
+
+  | VAE run (epoch 3) | fetch (s) | compute (s) |
+  |---|---|---|
+  | 0 workers | 0.059 | 0.176 |
+  | forked, 4 persistent workers | 0.045 | 0.172 |
+  | threads, 2 workers (own readers) | 0.005 | 0.156 |
+  | threads, `DDSTORE_THREAD_READERS=0` | 0.005 | 0.153 |
+  | threads, `DDSTORE_FAST_COLLATE=0` | 0.007 | 0.218 |
+  | threads, `--gpudirect` | 0.007 | 0.156 |
+
+  Forked workers run with every MR cache monitor except `kdreg2`;
+  `FI_CXI_DISABLE_HOST_REGISTER=0` fails after fork (`fi_enable` -262), as on
+  Frontier.

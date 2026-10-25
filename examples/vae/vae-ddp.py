@@ -1,7 +1,7 @@
 ## torch (and the RCCL/HIP shared libraries it pulls in) must finish loading
 ## before mpi4py triggers MPI_Init, or their static destructors run in the
 ## wrong order at interpreter exit and corrupt the heap.
-## Do not reorder these imports.
+## Do not reorder these imports (mpi4py is imported below, after torch).
 import argparse
 import os
 import time
@@ -12,8 +12,7 @@ from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import torch.distributed as dist
 
-from mpi4py import MPI
-
+import pyddstore
 from pyddstore.torch import DistDataset, ThreadDataLoader
 
 from ddp_utils import setup_ddp, get_local_rank
@@ -74,13 +73,20 @@ parser.add_argument(
     type=int,
     default=0,
     metavar="N",
-    help="Number of DataLoader workers. 0 uses PyTorch's standard "
-    "DataLoader in the main process (no worker processes, no fork). "
-    "> 0 switches to ThreadDataLoader "
-    "(pyddstore.torch), with that many worker threads "
-    "-- forked processes can't safely own GPU state or MPI's live state, "
-    "so any --num-workers > 0 goes through threads, never a fork. "
-    "Requires DDSTORE_METHOD 1 or 2 when > 0. Default: 0.",
+    help="Number of DataLoader workers: threads for --loader=thread, "
+    "forked processes for --loader=torch (0 reads in the main process). "
+    "Default: 0.",
+)
+parser.add_argument(
+    "--loader",
+    choices=["torch", "thread"],
+    default=None,
+    help="torch: PyTorch's standard DataLoader; with --num-workers > 0 its "
+    "workers are forked processes, each reading through its own DDStore "
+    "endpoint into host memory (DDSTORE_METHOD 1 or 2). thread: "
+    "ThreadDataLoader (pyddstore.torch), worker threads in this process "
+    "(DDSTORE_METHOD 1 or 2). Default: thread if --num-workers > 0, else "
+    "torch.",
 )
 parser.add_argument(
     "--replicate",
@@ -96,14 +102,43 @@ parser.add_argument(
     metavar="S",
     help="Upscale MNIST images to (28*S)x(28*S) (bilinear), so each sample is S^2 times larger; the VAE hidden layer grows to 400*S. Default: 1 (plain 28x28).",
 )
+parser.add_argument(
+    "--comm",
+    choices=["mpi", "torch"],
+    default=None,
+    help="Communicator for DistDataset and this script's barriers and "
+    "reductions: mpi (mpi4py COMM_WORLD) or torch (the torch.distributed "
+    "group set up for DDP; stores then exchange their records through "
+    "files, methods 1 and 2 only). Default: mpi if pyddstore was built "
+    "with MPI, else torch.",
+)
 args = parser.parse_args()
+if args.comm is None:
+    args.comm = "mpi" if pyddstore.HAVE_MPI else "torch"
+if args.loader is None:
+    args.loader = "thread" if args.num_workers > 0 else "torch"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
 torch.manual_seed(args.seed)
 
-comm = MPI.COMM_WORLD
 comm_size, rank = setup_ddp()
+if args.comm == "mpi":
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    barrier = comm.Barrier
+    allreduce = comm.allreduce
+else:
+    comm = dist.group.WORLD
+    barrier = dist.barrier
+
+    def allreduce(v):
+        out = [None] * comm_size
+        dist.all_gather_object(out, v)
+        return sum(out)
+
+
 local_rank = get_local_rank(rank)
 
 if args.cuda:
@@ -137,7 +172,7 @@ print(
 
 if rank == 0:
     os.makedirs("results", exist_ok=True)
-comm.Barrier()
+barrier()
 
 side = 28 * args.image_scale
 model = VAE(input_dim=side * side, hidden=400 * args.image_scale).to(device)
@@ -155,12 +190,14 @@ trainset = DistDataset(
     add_device=device if args.gpu_source else None,
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
-comm.Barrier()
+barrier()
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.num_workers > 0:
-    if int(os.environ.get("DDSTORE_METHOD", "0")) == 0:
-        raise RuntimeError("--num-workers > 0 requires DDSTORE_METHOD=1 or 2")
+if args.num_workers > 0 and trainset.method == 0:
+    raise RuntimeError("--num-workers > 0 requires DDSTORE_METHOD=1 or 2")
+if args.loader == "thread":
+    if trainset.method == 0:
+        raise RuntimeError("--loader=thread requires DDSTORE_METHOD=1 or 2")
     train_loader = ThreadDataLoader(
         trainset,
         batch_size=args.batch_size,
@@ -170,7 +207,14 @@ if args.num_workers > 0:
     )
 else:
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        # keep the workers (and their stores) across epochs: forking new ones
+        # every epoch cost ~0.7 s/epoch in the training loop
+        persistent_workers=args.num_workers > 0,
     )
 
 print(
@@ -303,16 +347,17 @@ if __name__ == "__main__":
     # DDSTORE_PROFILE=1: where get() time goes, summed over all ranks and
     # both variables (data + labels), all epochs.
     if os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0"):
-        ds = trainset.ddstore
+        # all of trainset's variables (image, label), over the store and the
+        # ThreadDataLoader threads' readers
         tot = {}
-        for var in ("traindata", "trainlabels"):
-            for k, v in ds.get_profile(var).items():
+        for var in trainset._var:
+            for k, v in trainset.get_profile(var).items():
                 if not k.startswith("py_"):
                     tot[k] = tot.get(k, 0) + v
-        prof = ds.get_profile("traindata")
+        prof = trainset.get_profile(trainset._var[0])
         for k in ("py_gets", "py_get", "py_sync"):
             tot[k] = prof[k]
-        tot = {k: comm.allreduce(v) for k, v in tot.items()}
+        tot = {k: allreduce(v) for k, v in tot.items()}
         if rank == 0:
             n = max(tot["calls"], 1)
             us = lambda x: 1e6 * x / n

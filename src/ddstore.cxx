@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Forward-declare the C helper from common.cxx so we can call it here.     */
 extern "C" const char *resolve_handshake_dir(const char *user_dir);
@@ -26,6 +27,13 @@ int sortedsearch(const std::vector<long> &vec, long num)
                               std::upper_bound(vec.begin(), vec.end(), num));
 }
 
+static void check_method(int method)
+{
+    if (method < 0 || method > 2)
+        throw std::invalid_argument("method must be 0, 1 or 2 (got " + std::to_string(method) + ")");
+}
+
+#ifdef DDSTORE_HAVE_MPI
 DDStore::DDStore() : method(0), comm_size(1), rank(0), n_core(0), is_extra(false)
 {
     this->comm = MPI_COMM_SELF;
@@ -42,10 +50,13 @@ DDStore::DDStore(MPI_Comm comm) : method(0), n_core(0), is_extra(false)
 
 DDStore::DDStore(int method, MPI_Comm comm) : n_core(0), is_extra(false)
 {
+    check_method(method);
     this->method = method;
     this->comm = comm;
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
+    if (method != 0)
+        this->exchange.reset(new MpiExchange(comm, this->rank, this->comm_size));
 }
 
 /* Method 2: core member constructor. n_core is derived from comm_size —
@@ -54,25 +65,70 @@ DDStore::DDStore(int method, MPI_Comm comm,
                  const std::string &handshake_dir)
     : is_extra(false)
 {
+    check_method(method);
     this->method        = method;
     this->comm          = comm;
     this->handshake_dir = resolve_dir(handshake_dir);
     MPI_Comm_size(this->comm, &this->comm_size);
     MPI_Comm_rank(this->comm, &this->rank);
     this->n_core        = this->comm_size;
+    if (method != 0)
+        this->exchange.reset(new MpiExchange(comm, this->rank, this->comm_size));
     fprintf(stderr, "[DDStore] method=2 core: handshake_dir=%s, n_core=%d\n",
             this->handshake_dir.c_str(), this->n_core);
+}
+#endif
+
+/* Methods 1/2 without MPI: records are exchanged through files in dir.     */
+DDStore::DDStore(int method, const std::string &dir, int rank, int size,
+                 const std::string &ns)
+    : comm_size(size), rank(rank), n_core(0), is_extra(false)
+{
+    if (method != 1 && method != 2)
+        throw std::invalid_argument(
+            "a store without an MPI communicator needs method 1 or 2 (got " +
+            std::to_string(method) + ")");
+    this->method        = method;
+    this->handshake_dir = resolve_dir(dir);
+    if (method == 2)
+        this->n_core = size;
+    this->exchange.reset(new FileExchange(this->handshake_dir, rank, size,
+                                          ns.empty() ? next_exchange_ns() : ns));
+    if (method == 2)
+        fprintf(stderr, "[DDStore] method=2 core (no MPI): handshake_dir=%s, rank=%d, n_core=%d\n",
+                this->handshake_dir.c_str(), rank, size);
 }
 
 /* Method 2: extra member constructor (no MPI communicator needed). */
 DDStore::DDStore(int method, const std::string &handshake_dir, int n_core)
-    : comm(MPI_COMM_SELF), comm_size(1), rank(0), is_extra(true)
+    : comm_size(1), rank(0), is_extra(true)
 {
+    if (method != 2)
+        throw std::invalid_argument("an extra member needs method 2 (got " +
+                                    std::to_string(method) + ")");
     this->method        = method;
     this->handshake_dir = resolve_dir(handshake_dir);
     this->n_core        = n_core;
     fprintf(stderr, "[DDStore] method=2 extra: handshake_dir=%s\n",
             this->handshake_dir.c_str());
+}
+
+DDStore *DDStore::from_fortran_comm(int method, long long fcomm,
+                                    const std::string &handshake_dir)
+{
+#ifdef DDSTORE_HAVE_MPI
+    MPI_Comm comm = MPI_Comm_f2c((MPI_Fint)fcomm);
+    if (method == 2)
+        return new DDStore(method, comm, handshake_dir);
+    return new DDStore(method, comm);
+#else
+    (void)method;
+    (void)fcomm;
+    (void)handshake_dir;
+    throw std::runtime_error(
+        "DDStore was built without MPI (DDSTORE_MPI=0): pass no communicator "
+        "and use method 1 or 2 with rank/size");
+#endif
 }
 
 DDStore::~DDStore()
@@ -85,34 +141,49 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
     varinfo = this->varlist.at(name);
 }
 
+/* Method 0: synchronization points, not RMA epochs. get() locks its target
+ * itself (MPI_Win_lock/unlock), which MPI doesn't allow inside a fence epoch
+ * (Open MPI then reads nothing). epoch_begin() makes this rank's writes
+ * (update()) visible to the others' reads (MPI_Win_sync, in a passive-target
+ * epoch of its own), then waits for every rank; epoch_end() waits until
+ * every rank is done reading, so no rank updates while others read.       */
 void DDStore::epoch_begin()
 {
-    if (!this->method)
+#ifdef DDSTORE_HAVE_MPI
+    if (!this->method && !this->varlist.empty())
     {
         for (auto &x : this->varlist)
+            if (x.second.active && x.second.epoch_active)
+                throw std::logic_error("Epoch already begun");
+        for (auto &x : this->varlist)
         {
-            if (x.second.fence_active)
-                throw std::logic_error("Fence already activated");
-            MPI_Win_fence(0, x.second.win);
-            x.second.fence_active = true;
+            if (!x.second.active)
+                continue;
+            ddstore_mpi_check(MPI_Win_lock_all(MPI_MODE_NOCHECK, x.second.win), "MPI_Win_lock_all");
+            ddstore_mpi_check(MPI_Win_sync(x.second.win), "MPI_Win_sync");
+            ddstore_mpi_check(MPI_Win_unlock_all(x.second.win), "MPI_Win_unlock_all");
+            x.second.epoch_active = true;
         }
+        MPI_Barrier(this->comm);
     }
-    /* Methods 1 and 2 use libfabric — no fence needed. */
+#endif
+    /* Methods 1 and 2 use libfabric: no epoch needed. */
 }
 
 void DDStore::epoch_end()
 {
-    if (!this->method)
+#ifdef DDSTORE_HAVE_MPI
+    if (!this->method && !this->varlist.empty())
     {
         for (auto &x : this->varlist)
-        {
-            if (not x.second.fence_active)
-                throw std::logic_error("Fence is not activated");
-            MPI_Win_fence(0, x.second.win);
-            x.second.fence_active = false;
-        }
+            if (x.second.active && !x.second.epoch_active)
+                throw std::logic_error("Epoch not begun");
+        for (auto &x : this->varlist)
+            x.second.epoch_active = false;
+        MPI_Barrier(this->comm);
     }
-    /* Methods 1 and 2 use libfabric — no fence needed. */
+#endif
+    /* Methods 1 and 2 use libfabric: no epoch needed. */
 }
 
 /* --------------------------------------------------------------------------
@@ -148,11 +219,13 @@ void DDStore::join(std::string name)
     fs->key           = 0;
 
     std::vector<long> raw_lens(this->n_core);
+    std::vector<struct CoreRecord> records(this->n_core);
     int out_disp = 0, out_itemsize = 0;
     if (handshake_join(fs,
                        this->handshake_dir.c_str(), name.c_str(),
                        this->n_core,
-                       raw_lens.data(), &out_disp, &out_itemsize) != 0)
+                       raw_lens.data(), &out_disp, &out_itemsize,
+                       records.data()) != 0)
         throw std::runtime_error("handshake_join failed for variable: " + name);
 
     /* Build prefix-sum lenlist. */
@@ -168,14 +241,79 @@ void DDStore::join(std::string name)
     var.name         = name;
     var.itemsize     = out_itemsize;
     var.disp         = out_disp;
-    var.win          = MPI_WIN_NULL;
     var.lenlist      = lenlist;
     var.active       = true;
-    var.fence_active = false;
+    var.epoch_active = false;
     var.base         = NULL; /* extra member owns no data */
     var.owns_base    = false;
     var.fabric_state = fs;
+    var.records      = records;
     this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+}
+
+DDStore::DDStore(int method, int n_core, reader_tag)
+    : method(method), comm_size(1), rank(0), n_core(n_core), is_extra(true)
+{
+}
+
+/* --------------------------------------------------------------------------
+ * fork_reader() — read-only store for a forked process (see ddstore.hpp).
+ *
+ * Per variable: a new fabric_state with its own fabric/domain/endpoint/AV
+ * (init_fabric), the records inserted into that AV (use_records), and no
+ * send MR. get() and get_batch() then work as for an extra member.
+ * -------------------------------------------------------------------------- */
+DDStore *DDStore::fork_reader() const
+{
+    if (this->method != 1 && this->method != 2)
+        throw std::runtime_error(
+            "a forked process can only read a method 1 or 2 store "
+            "(method 0 is MPI, which a forked process can't use)");
+    const char *mon = getenv("FI_MR_CACHE_MONITOR");
+    if (getpid() != this->owner_pid && mon && strcmp(mon, "kdreg2") == 0)
+        throw std::runtime_error(
+            "DDStore read from a forked process (DataLoader worker) needs "
+            "DDSTORE_FORK_WORKERS=1 (or FI_MR_CACHE_MONITOR=memhooks) set "
+            "before the store is created: the kdreg2 MR cache monitor "
+            "doesn't survive fork and the worker's reads would hang");
+
+    std::unique_ptr<DDStore> r(new DDStore(this->method, this->n_core, reader_tag()));
+    for (const auto &x : this->varlist)
+    {
+        const VarInfo_t &src = x.second;
+        if (!src.active)
+            continue;
+        if (src.records.empty())
+            throw std::logic_error("no records for variable " + src.name);
+
+        struct fabric_state *fs =
+            (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+        if (!fs)
+            throw std::bad_alloc();
+        pthread_mutex_init(&fs->recv_lock, NULL);
+        fs->rank = -1;
+
+        VarInfo_t var;
+        var.name         = src.name;
+        var.itemsize     = src.itemsize;
+        var.disp         = src.disp;
+        var.lenlist      = src.lenlist;
+        var.active       = true;
+        var.epoch_active = false;
+        var.base         = NULL;
+        var.owns_base    = false;
+        var.fabric_state = fs;
+        var.records      = src.records;
+        /* In the map before anything can throw, so r's free() cleans up. */
+        r->varlist.insert(std::pair<std::string, VarInfo_t>(var.name, var));
+
+        init_fabric(fs);
+        if (!fs->info)
+            throw std::runtime_error("init_fabric failed in forked reader (variable " +
+                                     src.name + ")");
+        use_records(fs, src.records.data(), (int)src.records.size());
+    }
+    return r.release();
 }
 
 /* --------------------------------------------------------------------------
@@ -188,8 +326,24 @@ void DDStore::join(std::string name)
  * -------------------------------------------------------------------------- */
 void DDStore::free()
 {
-    int finalized;
+    if (getpid() != this->owner_pid)
+    {
+        /* Inherited through fork: the parent still owns these resources. */
+        for (auto &x : this->varlist)
+        {
+            x.second.fabric_state = NULL;
+            x.second.base = NULL;
+            x.second.owns_base = false;
+            x.second.active = false;
+        }
+        return;
+    }
+
+    int finalized = 0;
+#ifdef DDSTORE_HAVE_MPI
     MPI_Finalized(&finalized);
+#endif
+    (void)finalized;
     for (auto &x : this->varlist)
     {
         VarInfo_t &var = x.second;
@@ -198,8 +352,10 @@ void DDStore::free()
 
         if (this->method == 0)
         {
+#ifdef DDSTORE_HAVE_MPI
             if (!finalized)
                 MPI_Win_free(&var.win);
+#endif
         }
         else if (var.fabric_state)
         {
@@ -222,12 +378,24 @@ void DDStore::free()
             var.fabric_state = NULL;
         }
 
-        if (var.owns_base && var.base && !finalized)
-            MPI_Free_mem(var.base);
+        if (var.owns_base && var.base)
+        {
+#ifdef DDSTORE_HAVE_MPI
+            if (var.mpi_mem)
+            {
+                if (!finalized)
+                    MPI_Free_mem(var.base);
+            }
+            else
+#endif
+                ::free(var.base);
+        }
         var.base = NULL;
         var.owns_base = false;
         var.active = false;
     }
+#ifdef DDSTORE_HAVE_MPI
     if (this->coll_comm != MPI_COMM_NULL && !finalized)
         MPI_Comm_free(&this->coll_comm);
+#endif
 }

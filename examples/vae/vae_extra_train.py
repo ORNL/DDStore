@@ -24,6 +24,7 @@ from __future__ import print_function
 
 import argparse
 import os
+import time
 
 ## torch (and the RCCL/HIP shared libraries it pulls in) must finish loading
 ## before mpi4py triggers MPI_Init, or their static destructors run in the
@@ -35,8 +36,6 @@ from torch import optim
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
 import torch.distributed as dist
-
-from mpi4py import MPI
 
 from ddp_utils import setup_ddp, get_local_rank
 from pyddstore.torch import DistDatasetReader, ThreadDataLoader
@@ -99,14 +98,25 @@ parser.add_argument(
     type=int,
     default=0,
     metavar="N",
-    help="Number of DataLoader workers. 0 uses PyTorch's standard "
-    "DataLoader in the main process (no worker processes, no fork). "
-    "> 0 switches to ThreadDataLoader "
-    "(pyddstore.torch), with that many worker threads "
-    "-- forked processes can't safely own GPU state, so any "
-    "--num-workers > 0 goes through threads, never a fork. Default: 0.",
+    help="Number of DataLoader workers: threads for --loader=thread, "
+    "forked processes for --loader=torch (0 reads in the main process). "
+    "Default: 0.",
+)
+parser.add_argument(
+    "--loader",
+    choices=["torch", "thread"],
+    default=None,
+    help="torch: PyTorch's standard DataLoader; with --num-workers > 0 its "
+    "workers are forked processes, each reading through its own DDStore "
+    "endpoint into host memory (needs DDSTORE_FORK_WORKERS=1, which "
+    "job-vae-core-extra.sh sets). thread: ThreadDataLoader "
+    "(pyddstore.torch), worker threads in this process; reads straight "
+    "into GPU memory with --gpu-dest. Default: thread if --num-workers > 0, "
+    "else torch.",
 )
 args = parser.parse_args()
+if args.loader is None:
+    args.loader = "thread" if args.num_workers > 0 else "torch"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
@@ -150,9 +160,9 @@ model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.num_workers > 0:
-    # DistDatasetReader always joins via method=2 (file-based handshake),
-    # so no DDSTORE_METHOD=0 guard is needed here (unlike vae-ddp.py).
+# DistDatasetReader always joins via method=2 (file-based handshake), so
+# both loaders can use workers (no DDSTORE_METHOD=0 guard, unlike vae-ddp.py).
+if args.loader == "thread":
     train_loader = ThreadDataLoader(
         trainset,
         batch_size=args.batch_size,
@@ -162,7 +172,14 @@ if args.num_workers > 0:
     )
 else:
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        # keep the workers (and their stores) across epochs: forking new ones
+        # every epoch cost ~0.7 s/epoch in the training loop
+        persistent_workers=args.num_workers > 0,
     )
 
 print(
@@ -177,11 +194,19 @@ test_loader = torch.utils.data.DataLoader(
 )
 
 
+# VAE_PROFILE=1: fetch vs compute time per epoch, as in vae-ddp.py
+PROFILE = os.environ.get("VAE_PROFILE") == "1"
+
+
 def train(epoch):
     model.train()
     train_loss = 0
+    fetch_time = 0.0
+    compute_time = 0.0
     train_loader.dataset.ddstore.epoch_begin()
+    t0 = time.perf_counter()
     for batch_idx, (data, _) in enumerate(train_loader):
+        t1 = time.perf_counter()
         train_loader.dataset.ddstore.epoch_end()
         data = data.to(device)
         optimizer.zero_grad()
@@ -190,6 +215,17 @@ def train(epoch):
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
+        # skip epoch 1 (warmup), as in vae-ddp.py
+        if PROFILE and epoch > 1:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device=device)
+            elif device.type == "xpu":
+                torch.xpu.synchronize(device=device)
+            elif device.type == "mps":
+                torch.mps.synchronize()
+            t2 = time.perf_counter()
+            fetch_time += t1 - t0
+            compute_time += t2 - t1
         if batch_idx % args.log_interval == 0:
             print(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
@@ -202,6 +238,7 @@ def train(epoch):
             )
 
         train_loader.dataset.ddstore.epoch_begin()
+        t0 = time.perf_counter()
 
     train_loader.dataset.ddstore.epoch_end()
     print(
@@ -209,6 +246,13 @@ def train(epoch):
             epoch, train_loss / len(train_loader.dataset)
         )
     )
+    if PROFILE and epoch > 1:
+        print(
+            "[profile] epoch {}: fetch={:.3f}s compute={:.3f}s".format(
+                epoch, fetch_time, compute_time
+            ),
+            flush=True,
+        )
 
 
 def test(epoch):

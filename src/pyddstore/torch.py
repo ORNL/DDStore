@@ -12,6 +12,10 @@
   handshake directory.
 - ``ThreadDataLoader``: a ``DataLoader`` whose workers are threads instead of
   forked processes (safe with MPI and GPU-resident buffers).
+- PyTorch's own ``DataLoader`` with forked workers also reads ``DistDataset``
+  and ``DistDatasetReader`` (methods 1 and 2): each worker opens its own store
+  (``PyDDStore.fork_reader()``) and reads into host memory. Set
+  ``DDSTORE_FORK_WORKERS=1`` before libfabric starts (see ``pyddstore``).
 - ``WindowedDataset``: samples made of several stored rows (time windows,
   clips), read with ``read_rows()``; ``row_of()`` maps a sample of one source
   in a ``ConcatDataset`` to its row.
@@ -23,12 +27,14 @@ Import torch before mpi4py/MPI starts; ``from pyddstore.torch import ...``
 does that by itself.
 """
 
+import hashlib
 import json
 import logging
 import multiprocessing as mp
 import os
 import queue
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,6 +70,25 @@ _TORCH_DTYPE = {
 }
 
 
+# ThreadDataLoader worker threads: .slot = the thread's index in its loader.
+_loader_thread = threading.local()
+
+
+class _as_slot:
+    """Act as ThreadDataLoader worker thread `slot` in this thread (e.g. to
+    register a buffer set with that thread's reader)."""
+
+    def __init__(self, slot):
+        self.slot = slot
+
+    def __enter__(self):
+        self.prev = getattr(_loader_thread, "slot", None)
+        _loader_thread.slot = self.slot
+
+    def __exit__(self, *exc):
+        _loader_thread.slot = self.prev
+
+
 def _nsplit(n, parts):
     """Contiguous index ranges [lo, hi) splitting range(n) into `parts`."""
     k, m = divmod(n, parts)
@@ -83,6 +108,181 @@ def _meta_path(handshake_dir, name):
 # ---------------------------------------------------------------------------
 # sample structure <-> flat fields
 # ---------------------------------------------------------------------------
+
+
+# --- communicators -------------------------------------------------------
+# DistDataset needs rank/size, an allgather of Python objects, a split into
+# ddstore_width groups, and a way to make a store on a group. _MpiComm does
+# that with mpi4py (any method); _NoMpiComm with torch.distributed or a
+# FileComm for the allgather, and stores without a communicator (methods 1
+# and 2, records exchanged through files in handshake_dir).
+
+
+def _env_rank_size():
+    """(rank, size) from the launcher's environment, or None."""
+    for r, n in (
+        ("SLURM_PROCID", "SLURM_NTASKS"),  # srun
+        ("RANK", "WORLD_SIZE"),
+        ("PMI_RANK", "PMI_SIZE"),
+        ("OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE"),
+    ):
+        if r in os.environ and n in os.environ:
+            return int(os.environ[r]), int(os.environ[n])
+    return None
+
+
+_ns_counts = {}
+
+
+def _next_ns(ns):
+    # Exchange names for group ns's subgroups and stores, "{ns}-{k}": counted
+    # per group, so they agree across its members as long as they create the
+    # group's datasets in the same order, whatever other groups they are in.
+    k = _ns_counts.get(ns, 0)
+    _ns_counts[ns] = k + 1
+    return f"{ns}-{k}"
+
+
+class _MpiComm:
+    is_mpi = True
+
+    def __init__(self, comm):
+        self.comm = comm
+        self.rank, self.size = comm.Get_rank(), comm.Get_size()
+
+    def allgather(self, obj):
+        return self.comm.allgather(obj)
+
+    def split(self, color, key):
+        return _MpiComm(self.comm.Split(color, key))
+
+    def store(self, method, handshake_dir):
+        from ._core import PyDDStore
+
+        if method == 2:
+            return PyDDStore(self.comm, method=2, handshake_dir=handshake_dir)
+        return PyDDStore(self.comm, method=method)
+
+
+class _NoMpiComm:
+    is_mpi = False
+
+    def __init__(self, rank, size, allgather, handshake_dir, ns):
+        # ns: this group's name, part of its stores' exchange names, so
+        # groups of one split never share files
+        self.rank, self.size, self.ns = rank, size, ns
+        self._allgather = allgather
+        self.handshake_dir = handshake_dir
+
+    def allgather(self, obj):
+        return self._allgather(obj)
+
+    def split(self, color, key):
+        from ._core import FileComm
+
+        ns = _next_ns(self.ns)
+        peers = self.allgather((color, key, self.rank))
+        members = sorted((k, r) for c, k, r in peers if c == color)
+        rank = members.index((key, self.rank))
+        if len(members) == self.size and rank == self.rank:
+            return self
+        ns = f"{ns}g{color}"
+        fc = FileComm(self.handshake_dir, rank, len(members), ns)
+        return _NoMpiComm(rank, len(members), fc.allgather, self.handshake_dir, ns)
+
+    def store(self, method, handshake_dir):
+        from ._core import PyDDStore
+
+        if method not in (1, 2):
+            raise ValueError(
+                f"method={method} needs an MPI communicator; without MPI use "
+                "method=1 or 2"
+            )
+        return PyDDStore(
+            None,
+            method=method,
+            handshake_dir=handshake_dir,
+            rank=self.rank,
+            size=self.size,
+            exchange_ns=_next_ns(self.ns),
+        )
+
+
+_file_comms = {}
+
+
+def _file_comm(handshake_dir):
+    # One per directory: a second FileComm with the same ns in one directory
+    # could make a slow rank miss the first one's last exchange.
+    key = os.path.realpath(handshake_dir)
+    if key not in _file_comms:
+        from ._core import FileComm
+
+        rs = _env_rank_size()
+        if rs is None:
+            raise RuntimeError(
+                "no MPI and no torch.distributed: can't tell this process's rank; "
+                "launch with srun (or set RANK and WORLD_SIZE)"
+            )
+        os.makedirs(handshake_dir, exist_ok=True)
+        fc = FileComm(handshake_dir, rs[0], rs[1], "pw")
+        _file_comms[key] = _NoMpiComm(
+            fc.rank, fc.size, fc.allgather, handshake_dir, "pw"
+        )
+    return _file_comms[key]
+
+
+def _torch_comm(group, handshake_dir):
+    import torch.distributed as dist
+
+    rank, size = dist.get_rank(group), dist.get_world_size(group)
+
+    def allgather(obj):
+        out = [None] * size
+        dist.all_gather_object(out, obj, group=group)
+        return out
+
+    # Named by its members, so that disjoint groups sharing handshake_dir
+    # never use the same exchange files
+    members = dist.get_process_group_ranks(group or dist.group.WORLD)
+    ns = "t" + hashlib.sha1(repr(sorted(members)).encode()).hexdigest()[:12]
+    return _NoMpiComm(rank, size, allgather, handshake_dir, ns)
+
+
+def _resolve_comm(comm, handshake_dir):
+    """A DistDataset communicator from the comm= argument (see DistDataset)."""
+    if comm is None:
+        kind = os.environ.get("DDSTORE_COMM", "").lower()
+        if not kind:
+            from ._core import HAVE_MPI
+
+            if HAVE_MPI:
+                kind = "mpi"
+            elif (
+                torch.distributed.is_available() and torch.distributed.is_initialized()
+            ):
+                kind = "torch"
+            else:
+                kind = "file"
+        if kind == "mpi":
+            from mpi4py import MPI
+
+            return _MpiComm(MPI.COMM_WORLD)
+        if kind == "torch":
+            return _torch_comm(None, handshake_dir)
+        if kind == "file":
+            return _file_comm(handshake_dir)
+        raise ValueError(f"DDSTORE_COMM must be mpi, torch or file (got {kind!r})")
+    if hasattr(comm, "Get_rank") and hasattr(comm, "Split"):
+        return _MpiComm(comm)
+    if torch.distributed.is_available() and isinstance(
+        comm, torch.distributed.ProcessGroup
+    ):
+        return _torch_comm(comm, handshake_dir)
+    raise TypeError(
+        "comm must be an mpi4py communicator, a torch.distributed ProcessGroup "
+        f"or None (got {type(comm).__name__})"
+    )
 
 
 def _record_descr(dtype):
@@ -215,7 +415,63 @@ class _Encoded(Dataset):
 
 
 class _StoreDataset(Dataset):
-    """Reads samples described by `self.schema` from `self.ddstore`."""
+    """Reads samples described by `self.schema` from `self.ddstore`.
+
+    In a process forked from the one that made the store (a PyTorch
+    DataLoader worker), `ddstore` is a store of that process's own
+    (``PyDDStore.fork_reader()``, opened on first use) and `device` is None:
+    the inherited store's endpoint and the GPU belong to the parent."""
+
+    _owner_pid = None
+
+    @property
+    def ddstore(self):
+        pid = os.getpid()
+        if pid != self._owner_pid:
+            if self._fork_pid != pid:
+                self._fork_store = self._ddstore.fork_reader()
+                self._fork_pid = pid
+            return self._fork_store
+        slot = getattr(_loader_thread, "slot", None)
+        if slot is None or not self._thread_readers:
+            return self._ddstore
+        store = self._readers.get(slot)
+        if store is None:
+            with self._readers_lock:
+                store = self._readers.get(slot)
+                if store is None:
+                    store = self._readers[slot] = self._ddstore.fork_reader()
+        return store
+
+    @ddstore.setter
+    def ddstore(self, store):
+        self._ddstore, self._owner_pid = store, os.getpid()
+        self._fork_store = self._fork_pid = None
+        # ThreadDataLoader worker thread i reads through reader i (see
+        # ThreadDataLoader): its own endpoint, so threads don't wait on each
+        # other's reads. Kept per slot, so later loaders reuse them.
+        self._thread_readers = store.method in (1, 2) and os.environ.get(
+            "DDSTORE_THREAD_READERS", "1"
+        ) not in ("", "0")
+        self._readers, self._readers_lock = {}, threading.Lock()
+
+    def get_profile(self, name):
+        """``PyDDStore.get_profile(name)`` summed over the store and the
+        ThreadDataLoader worker threads' readers of this process."""
+        stores = [self._ddstore, *self._readers.values()]
+        tot = {}
+        for st in stores:
+            for k, v in st.get_profile(name).items():
+                tot[k] = tot.get(k, 0) + v
+        return tot
+
+    @property
+    def device(self):
+        return self._device if self._owner_pid in (None, os.getpid()) else None
+
+    @device.setter
+    def device(self, device):
+        self._device = device
 
     def _setup_fields(self, schema, name, device):
         self.schema = schema
@@ -232,6 +488,14 @@ class _StoreDataset(Dataset):
             for f, rec in zip(schema["fields"], self._record)
         ]
         self._batch_get = os.environ.get("DDSTORE_BATCH_GET", "1") != "0"
+        # torch/numpy arrays and numbers collate to a stacked tensor of the
+        # same dtype, so a batch buffer is already the collated batch
+        self._fast_collate = os.environ.get("DDSTORE_FAST_COLLATE", "1") not in (
+            "",
+            "0",
+        ) and all(
+            f["kind"] in ("torch", "numpy", "npscalar", "py") for f in schema["fields"]
+        )
         if not hasattr(self, "_decode"):
             self._decode = None
 
@@ -404,6 +668,33 @@ class _StoreDataset(Dataset):
             samples = [self._decode(sm, int(i)) for sm, i in zip(samples, idx)]
         return samples
 
+    # -- whole batches, collated (ThreadDataLoader's fast path) -----------
+    def _collated(self, idx, out=None):
+        """``default_collate(self.__getitems__(idx))`` without the per-sample
+        values: each field's batch buffer becomes the batch tensor directly
+        (copied when `out` buffers are reused). None when the result would
+        differ: record fields, ``decode``, or DDSTORE_BATCH_GET=0."""
+        if (
+            not self._fast_collate
+            or self._decode is not None
+            or (not self._batch_get and out is None)
+        ):
+            return None
+        idx = np.asarray(idx, dtype=np.int64)
+        values = []
+        for j in range(len(self._var)):
+            buf = self._read_field(j, idx, out)
+            t = buf if isinstance(buf, torch.Tensor) else torch.from_numpy(buf)
+            t = t.reshape((len(idx),) + tuple(self.schema["fields"][j]["shape"]))
+            values.append(t.clone() if out is not None else t)
+        # default_collate's containers: a tuple collates to a list
+        s = self.schema["structure"]
+        if s == "single":
+            return values[0]
+        if s == "dict":
+            return dict(zip(self.schema["keys"], values))
+        return values
+
 
 def _rows(values, dtype):
     """Stack per-sample values into contiguous (n, size) rows of `dtype`."""
@@ -420,15 +711,24 @@ class DistDataset(_StoreDataset):
             rank loads only its contiguous share. Every sample must have the
             same structure, and each field the same shape and dtype.
         name: dataset name; field ``k`` is stored as variable ``name/k``.
-        comm: MPI communicator (default ``MPI.COMM_WORLD``). All its ranks
-            must construct the dataset together.
+        comm: an mpi4py communicator, a ``torch.distributed`` process group,
+            or None (default) for ``MPI.COMM_WORLD`` in an MPI build, else
+            the default ``torch.distributed`` group if initialized, else
+            files in ``handshake_dir`` with rank and size from the launcher
+            (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
+            ``WORLD_SIZE``, PMI). ``DDSTORE_COMM``
+            = ``mpi``, ``torch`` or ``file`` forces one for None. All its
+            ranks must construct the dataset together. Without MPI, stores
+            exchange their records through files (methods 1 and 2 only).
         ddstore_width: ranks per independent store (default: all of
             ``comm``); each group holds a full copy of the dataset.
         device: put tensor fields of read samples on this device
             (GPUDirect RDMA; needs ``method`` 1/2 and ``DDSTORE_FABRIC=cxi``).
         add_device: keep this rank's share of tensor fields on this device.
-        method: DDStore backend (default ``DDSTORE_METHOD`` or 0).
-        handshake_dir: ``method=2`` directory (default
+        method: DDStore backend (default ``DDSTORE_METHOD``, else 0 with an
+            MPI communicator and 1 without).
+        handshake_dir: directory on a filesystem every rank sees, for
+            ``method=2`` and for any store without MPI (default
             ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
         chunk_size: load this rank's share ``chunk_size`` samples at a time,
             writing each chunk into the store before reading the next, so
@@ -473,8 +773,6 @@ class DistDataset(_StoreDataset):
         fields=None,
     ):
         super().__init__()
-        from mpi4py import MPI
-
         if fields is not None:
             if encode is not None:
                 raise ValueError("pass either fields or encode, not both")
@@ -483,28 +781,27 @@ class DistDataset(_StoreDataset):
             source = _Encoded(source, encode)
         self._decode = decode
 
-        from ._core import PyDDStore
-
-        self.comm = comm if comm is not None else MPI.COMM_WORLD
-        self.rank = self.comm.Get_rank()
-        self.comm_size = self.comm.Get_size()
+        hs = _handshake_dir(handshake_dir)
+        self._comm = _resolve_comm(comm, hs)
+        self.rank = self._comm.rank
+        self.comm_size = self._comm.size
         self.add_device = add_device
         self.ddstore_width = (
             ddstore_width if ddstore_width is not None else self.comm_size
         )
-        self.method = (
-            int(os.environ.get("DDSTORE_METHOD", "0"))
-            if method is None
-            else int(method)
-        )
+        if method is None:
+            method = os.environ.get("DDSTORE_METHOD", "0" if self._comm.is_mpi else "1")
+        self.method = int(method)
+        if self.method == 0 and not self._comm.is_mpi:
+            raise ValueError("method=0 needs an MPI communicator; use method=1 or 2")
         if self.method == 2 and self.ddstore_width != self.comm_size:
             raise NotImplementedError(
                 "method=2 does not support ddstore_width < comm size (groups would "
                 "collide on the same handshake directory)"
             )
-        self.ddstore_comm = self.comm.Split(self.rank // self.ddstore_width, self.rank)
-        group_rank = self.ddstore_comm.Get_rank()
-        group_size = self.ddstore_comm.Get_size()
+        self._group = self._comm.split(self.rank // self.ddstore_width, self.rank)
+        group_rank = self._group.rank
+        group_size = self._group.size
 
         # This rank's share of the source. Errors found locally are raised
         # only after comparing with every rank (_raise_on_all), so a bad
@@ -547,9 +844,8 @@ class DistDataset(_StoreDataset):
                     f"({other} vs {self.schema}); DistDataset needs fixed-shape samples"
                 )
 
-        hs = _handshake_dir(handshake_dir)
+        self.ddstore = self._group.store(self.method, hs)
         if self.method == 2:
-            self.ddstore = PyDDStore(self.ddstore_comm, method=2, handshake_dir=hs)
             if group_rank == 0:
                 # published before the variables, so a reader that sees a
                 # variable's record file always finds the schema too
@@ -558,8 +854,6 @@ class DistDataset(_StoreDataset):
                 with open(tmp, "w") as fh:
                     json.dump({"total_ns": self.total_ns, **self.schema}, fh)
                 os.replace(tmp, path)
-        else:
-            self.ddstore = PyDDStore(self.ddstore_comm, method=self.method)
 
         fields = self.schema["fields"]
         if chunk_size is None:
@@ -624,7 +918,7 @@ class DistDataset(_StoreDataset):
         """Allgather (value, error) over comm; if any rank had an error,
         raise it on every rank. Returns the gathered values."""
         local = None if error is None else (type(error).__name__, str(error))
-        gathered = self.comm.allgather((value, local))
+        gathered = self._comm.allgather((value, local))
         errors = [e for _, e in gathered if e is not None]
         if errors:
             cls = TypeError if errors[0][0] == "TypeError" else ValueError
@@ -722,8 +1016,9 @@ class WindowedDataset(Dataset):
         return len(self.starts)
 
     def _rows(self, indices):
-        return (self.starts[np.asarray(indices, dtype=np.int64)][:, None]
-                + self._offsets).reshape(-1)
+        return (
+            self.starts[np.asarray(indices, dtype=np.int64)][:, None] + self._offsets
+        ).reshape(-1)
 
     def _sample(self, values):
         if self.fields is not None:
@@ -770,9 +1065,19 @@ def row_of(concat, source, index):
 class ThreadDataLoader(DataLoader):
     """A ``DataLoader`` that fetches batches in a thread pool instead of forked
     worker processes. Threads share the process's MPI state, CUDA context and
-    Python objects, so it is safe with DDStore and GPU-resident buffers, where
-    forked workers are not. Takes the same arguments as ``DataLoader``;
+    Python objects, so it works with every method and reads straight into
+    GPU buffers; forked workers (methods 1 and 2, ``DDSTORE_FORK_WORKERS=1``)
+    read into host memory only. Takes the same arguments as ``DataLoader``;
     ``num_workers`` is the number of threads (0 means 1).
+
+    Methods 1 and 2: each worker thread reads a ``DistDataset`` /
+    ``DistDatasetReader`` through its own reader (``PyDDStore.fork_reader()``,
+    kept for later loaders over the dataset), so threads read in parallel.
+    ``DDSTORE_THREAD_READERS=0``: the threads share the store.
+
+    With the default ``collate_fn``, a batch whose fields are tensors, numpy
+    arrays or numbers is read directly into its batch tensors, with the same
+    result as ``default_collate``. ``DDSTORE_FAST_COLLATE=0``: off.
 
     Each batch is fetched (via ``dataset.__getitems__`` when present),
     collated and optionally pinned in a worker thread; at most
@@ -782,10 +1087,9 @@ class ThreadDataLoader(DataLoader):
     ``[offset + i*width, offset + (i+1)*width)`` of the process's affinity.
 
     ``reuse_buffers=True`` (dataset with ``alloc()``, e.g. ``DistDataset``):
-    read every batch into one of a fixed pool of ``num_workers`` buffer sets
-    from ``dataset.alloc(batch_size)``, registered once, instead of fresh
-    buffers that are registered on every read. A worker takes a set, reads
-    and collates the batch, and returns the set, so the collate must copy:
+    read every batch into a buffer set from ``dataset.alloc(batch_size)``,
+    one per worker thread, registered once, instead of fresh buffers that are registered on every read. A worker
+    reads and collates a batch, then reuses its set, so the collate must copy:
     needs ``batch_size`` and the default ``collate_fn``, or
     ``collate_copies=True`` to declare that a custom ``collate_fn`` copies.
     ``close()`` (or deleting the loader) waits for running fetches and
@@ -795,9 +1099,9 @@ class ThreadDataLoader(DataLoader):
     def __init__(self, dataset, reuse_buffers=False, collate_copies=False, **kwargs):
         super().__init__(dataset, **kwargs)
 
-        # Fixed pool of registered read buffers, one set per worker thread,
-        # owned by this loader (see reuse_buffers in the class docstring).
-        self._pool, self._pool_sets = None, []
+        # Registered read buffers, set i for worker thread i, owned by this
+        # loader (see reuse_buffers in the class docstring).
+        self._pool_sets = []
         if reuse_buffers:
             if not hasattr(dataset, "alloc"):
                 raise TypeError(
@@ -817,11 +1121,9 @@ class ThreadDataLoader(DataLoader):
                     "reuse_buffers with a custom collate_fn: pass collate_copies=True "
                     "if it copies the samples (the buffer is reused right after it)"
                 )
-            self._pool = queue.Queue()
-            for _ in range(self.num_workers or 1):
-                bufs = dataset.alloc(self.batch_size)
-                self._pool_sets.append(bufs)
-                self._pool.put(bufs)
+            for slot in range(self.num_workers or 1):
+                with _as_slot(slot):
+                    self._pool_sets.append(dataset.alloc(self.batch_size))
 
         # Persistent across epochs -- recreating the pool in every __iter__()
         # would leak OS threads since the old pool is never shut down.
@@ -831,20 +1133,24 @@ class ThreadDataLoader(DataLoader):
             initializer=self.worker_init,
             initargs=(self._counter,),
         )
+        self._pool = self._pool_sets or None
 
         logger.debug("num_workers: %s", self.num_workers)
         logger.debug("len: %s", len(self._index_sampler))
 
     @staticmethod
     def worker_init(counter):
+        # The pool starts at most max_workers threads and keeps them, so the
+        # slots are 0 .. num_workers-1.
+        with counter.get_lock():
+            wid = counter.value
+            counter.value += 1
+        _loader_thread.slot = wid
+
         core_width = int(os.environ.get("DDSTORE_AFFINITY_WIDTH", "0"))
         core_offset = int(os.environ.get("DDSTORE_AFFINITY_OFFSET", "0"))
         if core_width <= 0 or not hasattr(os, "sched_getaffinity"):
             return 0
-
-        with counter.get_lock():
-            wid = counter.value
-            counter.value += 1
 
         affinity = list(os.sched_getaffinity(0))
         affinity_mask = set(
@@ -864,6 +1170,17 @@ class ThreadDataLoader(DataLoader):
         return 0
 
     @staticmethod
+    def _fast(dataset, index, collate_fn, out=None):
+        """The collated batch read straight into its tensors (DistDataset /
+        DistDatasetReader with the default collate_fn), or None. Skips one
+        Python object per sample and field, and the collate's copy, which
+        run under the GIL."""
+        collated = getattr(dataset, "_collated", None)
+        if collated is None or collate_fn is not torch.utils.data.default_collate:
+            return None
+        return collated(index, out=out)
+
+    @staticmethod
     def fetch(
         dataset,
         ibatch,
@@ -874,15 +1191,14 @@ class ThreadDataLoader(DataLoader):
         pool=None,
     ):
         if pool is not None:
-            # Read into one of the loader's registered buffer sets; collate
-            # copies the batch out, then the set goes back to the pool. For a
+            # Read into this thread's registered buffer set; collate copies
+            # the batch out before the thread's next fetch refills it. For a
             # GPU buffer, get_batch() synchronizes the device before reading,
-            # so the collate's copy has finished before the set is refilled.
-            bufs = pool.get()
-            try:
+            # so the collate's copy has finished by then.
+            bufs = pool[_loader_thread.slot]
+            batch = ThreadDataLoader._fast(dataset, index, collate_fn, bufs)
+            if batch is None:
                 batch = collate_fn(dataset.__getitems__(index, out=bufs))
-            finally:
-                pool.put(bufs)
             if pin_memory:
                 batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
             return (ibatch, batch)
@@ -892,14 +1208,20 @@ class ThreadDataLoader(DataLoader):
         # has one, like torch's own map-style fetcher. With batch_size=None
         # (no auto-collation) the sampler's index goes to dataset[index] as
         # is, also as torch does (e.g. samplers that yield whole batches).
-        if not auto_collation:
-            batch = dataset[index]
-        elif getattr(dataset, "__getitems__", None):
-            batch = dataset.__getitems__(index)
-        else:
-            batch = [dataset[i] for i in index]
-        if collate_fn is not None:
-            batch = collate_fn(batch)
+        batch = (
+            ThreadDataLoader._fast(dataset, index, collate_fn)
+            if auto_collation
+            else None
+        )
+        if batch is None:
+            if not auto_collation:
+                batch = dataset[index]
+            elif getattr(dataset, "__getitems__", None):
+                batch = dataset.__getitems__(index)
+            else:
+                batch = [dataset[i] for i in index]
+            if collate_fn is not None:
+                batch = collate_fn(batch)
         if pin_memory:
             batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
         return (ibatch, batch)
@@ -917,15 +1239,19 @@ class ThreadDataLoader(DataLoader):
         sets = getattr(self, "_pool_sets", [])
         if executor is not None:
             executor.shutdown(wait=bool(sets), cancel_futures=True)
-        for bufs in sets:
+        for slot, bufs in enumerate(sets):
             try:
-                self.dataset.release(bufs)
+                with _as_slot(slot):
+                    self.dataset.release(bufs)
             except (ValueError, KeyError):
                 pass  # the store was freed first: nothing left to unregister
         self._pool_sets = []
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass  # at interpreter exit, modules close() needs may be gone
 
 
 class _ThreadLoaderIter:

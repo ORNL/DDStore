@@ -4,12 +4,21 @@ from os.path import dirname, join, abspath
 
 import numpy as np
 from Cython.Build import cythonize
+from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.extension import Extension
 
 import os
 import subprocess
 
+# DDSTORE_MPI=0 builds without MPI: methods 1 and 2 only, with ranks
+# exchanging handshake records through files (no mpi.h, no mpi4py). The
+# default (1) needs an MPI compiler wrapper, e.g. CC=mpicc CXX=mpicxx, or
+# CC=cc CXX=CC on Cray.
+with_mpi = os.environ.get("DDSTORE_MPI", "1").lower() not in ("0", "off", "no", "false")
+print("DDSTORE_MPI:", int(with_mpi))
 defs = [("NPY_NO_DEPRECATED_API", 0)]
+if with_mpi:
+    defs.append(("DDSTORE_HAVE_MPI", 1))
 include_dirs = list()
 library_dirs = list()
 libraries = list()
@@ -33,7 +42,12 @@ include_dirs.append("include")
 
 extending = Extension(
     "pyddstore._core",
-    sources=["src/pyddstore/_core.pyx", "src/ddstore.cxx", "src/common.cxx"],
+    sources=[
+        "src/pyddstore/_core.pyx",
+        "src/ddstore.cxx",
+        "src/common.cxx",
+        "src/exchange.cxx",
+    ],
     include_dirs=include_dirs,
     extra_compile_args=["-std=c++11"],
     define_macros=defs,
@@ -60,9 +74,34 @@ except OSError:
 with open(stamp, "w") as f:
     f.write(numpy_major + "\n")
 
+# DDSTORE_MPI changes only macros, so build_ext would reuse the object files
+# and module of a build in the other mode: rebuild everything when the mode
+# differs from the last successful build in this checkout.
+mode = str(int(with_mpi))
+mode_stamp = join("src", "pyddstore", "_core.mpi-mode")
+try:
+    with open(mode_stamp) as f:
+        mode_changed = f.read().strip() != mode
+except OSError:
+    mode_changed = True
+
+
+class build_ext(_build_ext):
+    def finalize_options(self):
+        super().finalize_options()
+        if mode_changed:
+            self.force = True
+
+    def run(self):
+        super().run()
+        with open(mode_stamp, "w") as f:
+            f.write(mode + "\n")
+
+
 # Left over from the layout before pyddstore became a package.
 for old in ("src/pyddstore.cpp",) + tuple(
-    join("src", f) for f in os.listdir("src")
+    join("src", f)
+    for f in os.listdir("src")
     if f.startswith("pyddstore.") and f.endswith(".so")
 ):
     if os.path.exists(old):
@@ -70,10 +109,12 @@ for old in ("src/pyddstore.cpp",) + tuple(
 
 setup(
     name="PyDDStore",
-    version="2.0",
+    version="2.1",
     description="Distributed Data Store",
     package_dir={"": "src"},
     packages=["pyddstore"],
     py_modules=["cpu_nic_map"],
+    install_requires=["numpy"] + (["mpi4py"] if with_mpi else []),
     ext_modules=cythonize(extensions, force=regenerate),
+    cmdclass={"build_ext": build_ext},
 )

@@ -8,16 +8,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <mpi.h>
 
 #define DP_AV_DEF_SIZE 512
 #define COMM_FILE_WRITER_TO_READER "./writer_address.bin"
 
 /* -----------------------------------------------------------------------
- * Method 2: file-based handshake record, one per core rank.
- * All n_core records for a variable are gathered in memory (via MPI among
- * core ranks) and published as a single combined file, written once by
- * core rank 0:
+ * Handshake record, one per core rank.
+ * Method 1 and 2 core ranks exchange these with exchange_records() (over
+ * MPI or files, see exchange.hpp). Method 2 core rank 0 also publishes the
+ * combined array for extra members as a single file:
  *   {handshake_dir}/{varname}.bin
  * ----------------------------------------------------------------------- */
 struct CoreRecord
@@ -61,8 +60,7 @@ extern "C"
         /* FI_HMEM_SYSTEM (0) if send_data is host memory; otherwise the
          * fi_hmem_iface value identifying what kind of GPU memory it is.
          * Set by the caller (see ddstore.hpp's add()) and forwarded into
-         * fi_mr_regattr()'s attr.iface in handshake() (method=1) / add()'s
-         * inline registration (method=2). A separate field from
+         * fi_mr_regattr()'s attr.iface in register_send_mr(). A separate field from
          * recv_hmem_iface: one fabric_state can be simultaneously the send
          * side (registered once at add() time) and the recv side
          * (re-registered per get() call, including self-reads) -- these
@@ -206,7 +204,6 @@ extern "C"
     }
 
     void init_fabric(struct fabric_state *fabric);
-    int handshake(struct fabric_state *fabric_state, MPI_Comm comm);
     int read_from_remote(struct fabric_state *fabric_state, int src, uint64_t offset);
     /* n rows of row_len bytes into recv_data (recv_data_len == n * row_len);
      * row i from rank src[i] at byte offset offset[i]. All reads are posted
@@ -231,30 +228,49 @@ extern "C"
      * Returns pointer to a static buffer — copy if needed across calls.     */
     const char *resolve_handshake_dir(const char *user_dir);
 
-    /* Core rank: exchange CoreRecords with all other core ranks via
-     * MPI_Allgather over `comm` (no filesystem round-trip needed for
-     * core-to-core discovery), populate this rank's fs->comm_partner[],
-     * remote_key[], remote_address[], and fill lenlist[0..n_core-1] (raw
-     * row counts, NOT yet prefix-summed).  Rank 0 additionally publishes
-     * the combined record set to {dir}/{varname}.bin (tmp + fsync + rename)
-     * so extra members can join later.                                       */
-    int handshake_write(struct fabric_state *fs, MPI_Comm comm,
-                        const char *dir, const char *varname,
-                        int n_core, long nrows, int disp, int itemsize,
-                        long *lenlist);
-
     /* Extra member: poll for {dir}/{varname}.bin (single file holding all
      * n_core CoreRecords), read it, and populate this process's
      * fs->comm_partner[], remote_key[], remote_address[], and
-     * lenlist[0..n_core-1] (raw row counts, NOT yet prefix-summed).  Does
+     * lenlist[0..n_core-1] (raw row counts, NOT yet prefix-summed), and,
+     * if out_recs is not NULL, out_recs[0..n_core-1] (the records).  Does
      * NOT write anything.  Blocks until the file appears (with timeout).     */
     int handshake_join(struct fabric_state *fs,
                        const char *dir, const char *varname,
                        int n_core,
-                       long *lenlist, int *out_disp, int *out_itemsize);
+                       long *lenlist, int *out_disp, int *out_itemsize,
+                       struct CoreRecord *out_recs);
 
 #ifdef __cplusplus
 }
+
+#include <vector>
+#include "exchange.hpp"
+
+/* Register fs->send_data (fs->send_hmem_iface) for remote reads and set
+ * fs->key. Throws std::runtime_error. Methods 1 and 2 core ranks.         */
+void register_send_mr(struct fabric_state *fs);
+
+/* Collective over ex: gather every rank's CoreRecord (fabric address, MR
+ * key, base address, nrows/disp/itemsize) into all[0..ex.size-1] and set
+ * up fs->comm_partner[], remote_key[], remote_address[] and world_size to
+ * read from every rank. Call after register_send_mr(). Throws.            */
+void exchange_records(struct fabric_state *fs, Exchange &ex,
+                      long nrows, int disp, int itemsize,
+                      std::vector<struct CoreRecord> &all);
+
+/* DDSTORE_FORK_WORKERS set (and not "0"): forked readers are wanted, so
+ * init_fabric() picks an MR cache monitor that survives fork.            */
+bool fork_workers_enabled();
+
+/* Fill fs->comm_partner/remote_key/remote_address and world_size (n
+ * entries) from the records, inserting each fabric address into fs->av.
+ * Throws.                                                                 */
+void use_records(struct fabric_state *fs, const struct CoreRecord *all, int n);
+
+/* Method 2 core rank 0: publish the combined records to
+ * {dir}/{varname}.bin (temp + fsync + rename) for extra members. Throws.  */
+void publish_records(const char *dir, const char *varname,
+                     const std::vector<struct CoreRecord> &all);
 
 /* RAII guard for struct fabric_state::recv_lock -- locks on construction,
  * unlocks on destruction (including when leaving via an exception), so

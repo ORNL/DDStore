@@ -1,25 +1,31 @@
 # `PyDDStore` reference
 
-## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None)`
+## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None, rank=None, size=0, exchange_ns="")`
 
 | Parameter | Type | Description |
 |---|---|---|
-| `comm_or_none` | `mpi4py.MPI.Comm` or `None` | MPI communicator covering all ranks. `None` only for a `method=2` extra member |
+| `comm_or_none` | `mpi4py.MPI.Comm` or `None` | MPI communicator covering all ranks. `None` for a `method=2` extra member, or for a store [without MPI](backends.md#without-mpi-methods-1-and-2) (with `rank=`) |
 | `method` | `int` | `0` = MPI RMA (default), `1` = libfabric RDMA, `2` = file-based handshake (see [below](backends.md#file-based-handshake-method2)) |
-| `handshake_dir` | `str` | Required for `method=2`: shared-filesystem directory used to exchange RDMA addresses |
-| `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data |
+| `handshake_dir` | `str` | Required for `method=2` and without MPI: shared-filesystem directory used to exchange RDMA addresses |
+| `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data. Without MPI, also accepted for `size` with `method=2` |
+| `rank`, `size` | `int` | Without MPI (`comm_or_none=None`, `method=1`/`2`): this process is rank `rank` of `size` (e.g. `SLURM_PROCID`, `SLURM_NTASKS`) |
+| `exchange_ns` | `str` | Without MPI: names this store's exchange files; default `s0`, `s1`, … in creation order, which is right as long as every rank creates its stores in the same order. Avoid `.` in it |
 | `nic_map` | `str` or `None` | Optional, `method=1`/`2` only: a precomputed CPU→NIC map string (see [`DDSTORE_NIC_MAP`](backends.md#libfabric-rdma-method1) below) to use instead of the environment variable. Ignored if `FABRIC_IFACE` is already set |
 
-Four call shapes:
+Call shapes:
 
 ```python
 PyDDStore(comm)                                     # method 0, MPI RMA
 PyDDStore(comm, method=1)                            # method 1, libfabric RDMA
 PyDDStore(comm, method=2, handshake_dir="/path")      # method 2, core member (n_core == comm size)
 PyDDStore(None, method=2, handshake_dir="/path", n_core=N)  # method 2, extra member (no comm)
+PyDDStore(None, method=1, handshake_dir="/path", rank=r, size=N)  # method 1 without MPI
+PyDDStore(None, method=2, handshake_dir="/path", rank=r, size=N)  # method 2 core member without MPI
 ```
 
-Note: grouping ranks into independent stores (the "sub-communicator" pattern below) is done by splitting `comm` yourself before constructing `PyDDStore` — there is no `ddstore_width` constructor parameter. `pyddstore.torch.DistDataset` does this for you (`ddstore_width`) and shows the pattern (`comm.Split()` then `PyDDStore(sub_comm)`).
+In a build without MPI (`DDSTORE_MPI=0`, `pyddstore.HAVE_MPI` is `False`) only the last three work; a communicator raises `RuntimeError`.
+
+Independent stores per group of ranks: `comm.Split()` and pass the sub-communicator (`DistDataset(ddstore_width=)` does this).
 
 ---
 
@@ -61,7 +67,7 @@ Overwrite a region of the local shard for a variable registered with `init()`. L
 
 ## `get(name, arr, start=0)`
 
-Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`. The range must fall within a single rank's shard. Must be called inside an `epoch_begin` / `epoch_end` pair when using the MPI backend.
+Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`. The range must fall within a single rank's shard. With `method=0`, call it between `epoch_begin()` and `epoch_end()` so that other ranks' `update()` writes are visible.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -73,11 +79,11 @@ Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`
 
 ## `get_batch(name, arr, indices)`
 
-Read rows `indices` (global row ids; any order, any ranks, repeats allowed) into `arr`: row `i` of `arr` receives row `indices[i]`, so `arr.shape[0]` must equal `len(indices)` (else `ValueError`). Same buffer rules as `get()` (NumPy array or CUDA/HIP tensor). Every index is checked before anything is read; an out-of-range one raises `IndexError` and leaves the store usable.
+Read rows `indices` (global ids; any order, repeats allowed) into `arr`; row `i` of `arr` gets row `indices[i]`, so `arr.shape[0] == len(indices)` (else `ValueError`). Buffers as for `get()`. Indices are checked first; an out-of-range one raises `IndexError`.
 
-For `method=1`/`2` the whole batch is one call: one lock acquisition, at most one memory registration (none into a [registered](api-pyddstore.md#register_recvname-arr--unregister_recvname-arr) buffer), and (GPU destination) one device sync, with all of the batch's `fi_read`s posted before any is waited for, so the reads overlap on the network. It is one `fi_read` per row, or several for a row longer than `DDSTORE_MAX_READ_BYTES` (default 1 GiB).
+`method=1`/`2`: all rows' `fi_read`s are in flight together, with one lock acquisition, at most one memory registration (none into a [registered](api-pyddstore.md#register_recvname-arr--unregister_recvname-arr) buffer) and one device sync (GPU destination). Rows over `DDSTORE_MAX_READ_BYTES` (1 GiB) are split.
 
-For `method=0`, `get_batch()` is **collective**, after the collective module of [MDLoader](https://ieeexplore.ieee.org/abstract/document/10820758) (see [Citation](citation.md)): every rank all-gathers all ranks' indices (`MPI_Allgatherv`), packs the rows it owns for each requester, and one `MPI_Alltoallv` delivers them, on a private duplicate of the store's communicator, in rounds of at most `DDSTORE_ALLTOALL_MAX_BYTES` (default 2 MiB) received per rank so large rows don't turn into one huge exchange. So every rank must call it for the variable the same number of times, in the same order, from one thread at a time; the number of indices may differ per rank (including 0). Indices are checked on the gathered list, so a bad index raises on every rank together. `DistributedSampler` gives every rank the same number of batches, and `vae-ddp.py` allows no worker threads with `method=0`, so the data loaders meet this automatically.
+`method=0`: **collective**, after [MDLoader](https://ieeexplore.ieee.org/abstract/document/10820758) ([Citation](citation.md)): indices are all-gathered (`MPI_Allgatherv`) and rows delivered by `MPI_Alltoallv`, in rounds of at most `DDSTORE_ALLTOALL_MAX_BYTES` (2 MiB) per rank. Every rank calls it the same number of times, in the same order, from one thread; index counts may differ (including 0). A bad index raises on every rank. `DistributedSampler` meets this.
 
 ```python
 idx = np.array([2048, 7, 4096, 7])
@@ -85,13 +91,13 @@ out = np.zeros((len(idx), 64), dtype=np.float32)
 store.get_batch("features", out, idx)
 ```
 
-`DistDataset`/`DistDatasetReader` use it by default through `__getitems__`, which PyTorch's `DataLoader` (and `ThreadDataLoader`) calls with a whole batch's indices, so the VAE examples and job scripts read in batches with no extra flag. Set `DDSTORE_BATCH_GET=0` to fall back to one `get()` per sample.
+`DistDataset`/`DistDatasetReader` use it through `__getitems__` by default; `DDSTORE_BATCH_GET=0` reads per sample.
 
 ---
 
 ## `register_recv(name, arr)` / `unregister_recv(name, arr)`
 
-Register `arr` (a C-contiguous NumPy array or CUDA/HIP tensor) once as a destination for `get()`/`get_batch()` of `name`. Reads into `arr` or any slice of it then skip memory registration, which otherwise happens whenever the destination isn't the buffer registered by the previous read. For large rows, registration can cost more than the transfer. Use it for buffers you reuse, such as a pool per loader thread: several can be registered per variable and none is evicted. The store holds a reference to `arr` until `unregister_recv()` or `free()`. No-op for `method=0`.
+Register a reused destination (C-contiguous array or CUDA/HIP tensor) once, so reads into it or any slice skip memory registration, which can cost more than the transfer for large rows. Several buffers per variable; none evicted. The store keeps a reference until `unregister_recv()` or `free()`. No-op for `method=0`.
 
 ```python
 pool = np.empty((batch_size, ncols), dtype=np.float32)
@@ -104,17 +110,28 @@ for idx in batches:
 
 ## `get_profile(name)`
 
-With `DDSTORE_PROFILE=1` set before the process starts: timing of `get()`/`get_batch()` for `name` (`method=1`/`2`), in seconds unless noted. C++ counters for this variable: `calls` (get + get_batch), `rows`, `lock_wait`, `mr` (receive-buffer registration, including cache checks), `mr_miss` (registrations, a count), `read` (posting `fi_read`), `cq` (waiting for completions). Python counters for the whole store: `py_gets`, `py_get` (whole calls), `py_sync` (`torch.cuda.synchronize()` on the GPU path). All zero for `method=0` or without profiling. See [Performance](performance.md).
+With `DDSTORE_PROFILE=1`: `get()`/`get_batch()` timing for `name` (`method=1`/`2`), seconds unless noted. Per variable: `calls`, `rows`, `lock_wait`, `mr` (registration), `mr_miss` (count), `read` (posting `fi_read`), `cq` (completion wait). Per store: `py_gets`, `py_get` (whole calls), `py_sync` (GPU sync). Zero for `method=0` or without profiling. See [Performance](performance.md).
 
 ---
 
 ## `join(name)`
 
-`method=2` extra member only. Discovers a variable published by the core group by polling the handshake directory until the combined record file (`{name}.bin`) written by core rank 0 reaches its expected size (up to `DDSTORE_HANDSHAKE_TIMEOUT_S` seconds), then registers it for `get()`.
+`method=2` extra member: wait for the core group's `{name}.bin` record file (up to `DDSTORE_HANDSHAKE_TIMEOUT_S`), then read the variable with `get()`/`get_batch()`.
 
 | Parameter | Type | Description |
 |---|---|---|
 | `name` | `str` | Variable identifier, matching the `name` used in the core group's `add()` |
+
+---
+
+## `fork_reader()`
+
+A read-only `PyDDStore` for the same variables, with its own libfabric endpoints. Methods 1 and 2.
+
+- **Forked process** (`DataLoader` worker): call it in the child; host buffers only. On CXI needs `DDSTORE_FORK_WORKERS=1` before the parent's store is created (raises under `kdreg2`).
+- **Same process**: one reader per thread, so threads read in parallel.
+
+`DistDataset` and `DistDatasetReader` use it automatically. See [Forked DataLoader workers](pytorch.md#forked-dataloader-workers).
 
 ---
 
@@ -126,10 +143,22 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 ## `epoch_begin()` / `epoch_end()`
 
-Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. Required around `get()` calls when using `method=0`. No-op for `method=1`/`2`.
+**Collective** synchronization points for `method=0`: `epoch_begin()` makes each rank's `update()` writes visible and waits for every rank; `epoch_end()` waits until every rank is done reading. Each `get()` locks its target itself (`MPI_Win_lock`), so these hold no RMA epoch. No-op for `method=1`/`2`.
 
 ---
 
 ## `free()`
 
-Release every variable's MPI window (`method=0`) or libfabric endpoints and memory registrations, including [`register_recv()`](api-pyddstore.md#register_recvname-arr--unregister_recvname-arr) buffers (`method=1`/`2`), then the host buffer DDStore allocated for it in `add()`/`init()` (a GPU tensor passed to `add()` is the caller's and is not freed). Safe to call more than once. After `MPI_Finalize` the MPI window and buffer can no longer be released and are skipped.
+Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`.
+
+---
+
+## `pyddstore.HAVE_MPI`
+
+`False` for a `DDSTORE_MPI=0` build (methods 1 and 2 without a communicator).
+
+---
+
+## `pyddstore.FileComm(dir, rank, size, ns)`
+
+File-based collectives without MPI: `allgather(obj)` (list by rank) and `barrier()`. `dir` on a shared filesystem; every rank creates its `FileComm`s and makes calls in the same order, with an `ns` unique in `dir` (also among stores' `exchange_ns`). Attributes: `rank`, `size`, `dir`, `ns`. Rank 0 leaves `barrier()` once it has written the combined file, so don't remove `dir` right after one.

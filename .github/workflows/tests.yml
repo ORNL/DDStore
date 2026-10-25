@@ -1,0 +1,111 @@
+name: tests
+
+# Build both variants and run what a CPU-only runner can: method 0 (MPI RMA)
+# with 1, 2 and 4 ranks. Tests that need a CXI device, Slurm or a GPU skip
+# themselves; run those on an HPC system (docs/testing.md). Runs on pull
+# requests (not drafts: they run when marked ready), on main after a merge,
+# and by hand (Actions > Run workflow); no path filters, so a required check
+# is never left pending.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  black:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "black==26.5.1"
+      - run: black --check $(git ls-files '*.py')
+
+  mpi:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mpi: [openmpi, mpich]
+    env:
+      OMPI_MCA_rmaps_base_oversubscribe: "1"
+      # Ubuntu's Open MPI 4.1 disables the ucx and pt2pt RMA components
+      # (/etc/openmpi/openmpi-mca-params.conf: osc = ^ucx,pt2pt); osc/rdma
+      # needs an RDMA NIC and osc/sm only serves shared windows, so
+      # MPI_Win_create fails. pt2pt rejects MPI_THREAD_MULTIPLE (mpi4py's
+      # default) anyway. osc/ucx over UCX shared memory works once its
+      # device/transport filters (mlx* by default) are opened up. MPICH
+      # ignores these.
+      OMPI_MCA_osc: ucx
+      OMPI_MCA_opal_common_ucx_tls: any
+      OMPI_MCA_opal_common_ucx_devices: any
+      # Both stacks run on UCX (Ubuntu's MPICH is ch4:ucx). Some runner VMs
+      # (Azure MANA NICs) expose an RDMA device whose verbs transport fails
+      # (ibv_create_srq: Operation not supported), and MPI_Init aborts with a
+      # silent exit code 15. Keep UCX on shared memory and TCP.
+      UCX_TLS: self,sm,tcp
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: System packages
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.mpi }}" = openmpi ]; then
+            sudo apt-get install -y libopenmpi-dev openmpi-bin libfabric-dev pkg-config
+          else
+            sudo apt-get install -y libmpich-dev mpich libfabric-dev pkg-config
+          fi
+      - name: Python packages
+        run: |
+          pip install numpy Cython pytest setuptools wheel
+          pip install --no-binary mpi4py mpi4py
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build
+        run: CC=mpicc CXX=mpicxx pip install --no-build-isolation --no-deps -e .
+      - run: python -c "import pyddstore; assert pyddstore.HAVE_MPI"
+      - if: matrix.mpi == 'openmpi'
+        run: ompi_info | grep -E "MCA (osc|pml|btl)"
+      - name: 1 rank
+        run: mpirun -n 1 python -m pytest -q -rfs test/test_single.py
+      - name: 2 ranks
+        run: mpirun -n 2 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
+      - name: 4 ranks
+        run: mpirun -n 4 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
+
+  nompi:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libfabric-dev pkg-config
+      - run: pip install numpy Cython pytest setuptools wheel
+      - name: Build (DDSTORE_MPI=0)
+        run: DDSTORE_MPI=0 CC=gcc CXX=g++ pip install --no-build-isolation --no-deps -e .
+      - name: Import without MPI
+        run: |
+          python - <<'PY'
+          import sys, pyddstore
+          assert not pyddstore.HAVE_MPI
+          assert "mpi4py" not in sys.modules
+          PY

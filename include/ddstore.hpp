@@ -1,18 +1,38 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#ifdef DDSTORE_HAVE_MPI
 #include <mpi.h>
+#endif
 #include <string>
 #include <typeinfo>
 #include <vector>
+#include <unistd.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_rma.h>
 #include "common.h"
+
+#ifdef DDSTORE_HAVE_MPI
+/* Throw on an MPI error. mpi4py sets MPI_ERRORS_RETURN on its
+ * communicators, so an unchecked failure (MPI_Win_create with no usable
+ * RMA component, say) would leave a dead window and reads of zeros.     */
+static inline void ddstore_mpi_check(int rc, const char *what, const char *hint = "")
+{
+    if (rc == MPI_SUCCESS)
+        return;
+    char msg[MPI_MAX_ERROR_STRING];
+    int len = 0;
+    if (MPI_Error_string(rc, msg, &len) != MPI_SUCCESS)
+        len = 0;
+    throw std::runtime_error(std::string(what) + " failed: " + std::string(msg, len) + hint);
+}
+#endif
 
 struct VarInfo
 {
@@ -20,23 +40,37 @@ struct VarInfo
     int itemsize;
     int disp;
     std::vector<long> lenlist;
-    MPI_Win win;
+#ifdef DDSTORE_HAVE_MPI
+    MPI_Win win = MPI_WIN_NULL;
+#endif
     bool active;
-    bool fence_active;
+    bool epoch_active;
     void *base;
-    /* true if base came from MPI_Alloc_mem() in add()/init() and free()
+    /* true if base was allocated by add()/init() (alloc_base()) and free()
      * must release it; false for a caller-owned GPU buffer (add() with
      * hmem_iface != 0) or a joined variable (base == NULL).               */
     bool owns_base;
+    bool mpi_mem = false; /* base came from MPI_Alloc_mem, not posix_memalign */
     struct fabric_state *fabric_state;
+    /* Methods 1/2: every core rank's record (address, key, rows), kept so
+     * fork_reader() can open a new endpoint onto the same data.          */
+    std::vector<struct CoreRecord> records;
 };
 typedef struct VarInfo VarInfo_t;
 
 int sortedsearch(const std::vector<long> &vec, long num);
 
+/* 1 if built with MPI (DDSTORE_HAVE_MPI: method 0 and MPI communicators), 0 if not. */
+#ifdef DDSTORE_HAVE_MPI
+static const int ddstore_have_mpi = 1;
+#else
+static const int ddstore_have_mpi = 0;
+#endif
+
 class DDStore
 {
 public:
+#ifdef DDSTORE_HAVE_MPI
     DDStore();
     DDStore(MPI_Comm comm);
     DDStore(int method, MPI_Comm comm);
@@ -47,10 +81,36 @@ public:
      * are assumed to be core members).                                      */
     DDStore(int method, MPI_Comm comm,
             const std::string &handshake_dir);
+#endif
+
+    /* Methods 1 and 2 without MPI: this process is rank `rank` of `size`
+     * (for method 2, the core members; n_core == size). Ranks exchange
+     * their handshake records through files in `dir` (FileExchange, see
+     * exchange.hpp), which must be on a filesystem every rank sees. `ns`
+     * separates stores sharing `dir` in one session; empty = "s0", "s1",
+     * ... in construction order, the same on every rank as long as every
+     * rank creates its stores in the same order.                           */
+    DDStore(int method, const std::string &dir, int rank, int size,
+            const std::string &ns = "");
 
     /* Method 2: extra member constructor (no MPI communicator required).
      * The extra member calls join() per variable to discover the data.      */
     DDStore(int method, const std::string &handshake_dir, int n_core);
+
+    /* The MPI constructors above, from a Fortran communicator handle
+     * (mpi4py's comm.py2f()), so a binding needs no MPI headers: method 2
+     * with handshake_dir uses the core-member constructor. Throws
+     * std::runtime_error in a build without MPI.                           */
+    static DDStore *from_fortran_comm(int method, long long fcomm,
+                                      const std::string &handshake_dir);
+
+    /* A read-only store with its own fabric, endpoint and address vector
+     * per variable, from the records this store holds, reading the same
+     * data with get()/get_batch(). For a process forked from the one that
+     * made this store (a PyTorch DataLoader worker; the inherited store
+     * must not be used there), or for a second independent reader in the
+     * same process. Methods 1 and 2 only. Caller deletes the result.       */
+    DDStore *fork_reader() const;
 
     ~DDStore();
 
@@ -111,325 +171,29 @@ public:
             throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
 
         void *base = NULL;
+        bool mpi_mem = false;
         if (hmem_iface == 0)
         {
-            // (2025/03) jyc: necessary to avoid memory error
-            int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * sizeof(T)), MPI_INFO_NULL, &base);
-            if (err)
-            {
-                exit(1);
-            }
-            memcpy(base, buffer, nrows * disp * sizeof(T));
+            base = alloc_base((size_t)nrows * disp * sizeof(T), mpi_mem);
+            memcpy(base, buffer, (size_t)nrows * disp * sizeof(T));
         }
         else
         {
             /* GPU source buffer: register the caller's own pointer
-             * directly. No MPI_Alloc_mem, no copy -- see lifetime
-             * contract above.                                              */
+             * directly. No allocation, no copy -- see lifetime contract
+             * above.                                                       */
             base = (void *)buffer;
         }
-
-        MPI_Win win = MPI_WIN_NULL;
-        struct fabric_state *fabric_state = NULL;
-
-        if (this->method == 0)
-        {
-            MPI_Win_create(base,                               /* pre-allocated buffer */
-                           (MPI_Aint)nrows * disp * sizeof(T), /* size in bytes */
-                           disp * sizeof(T),                   /* displacement units */
-                           MPI_INFO_NULL,                      /* info object */
-                           this->comm,                         /* communicator */
-                           &win /* window object */);
-        }
-        else if (this->method == 1)
-        {
-            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            pthread_mutex_init(&fabric_state->recv_lock, NULL);
-            fabric_state->send_data       = (char *)base;
-            fabric_state->send_data_len   = nrows * disp * sizeof(T);
-            fabric_state->send_hmem_iface = hmem_iface;
-            fabric_state->world_size      = this->comm_size;
-            fabric_state->rank            = this->rank;
-
-            init_fabric(fabric_state);
-            if (!fabric_state->info)
-                throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            if (hmem_iface != 0 && !is_hmem_capable(fabric_state))
-                throw std::runtime_error(
-                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
-                    "(current fabric does not support FI_HMEM)");
-            if (handshake(fabric_state, this->comm) != 0)
-                throw std::runtime_error("handshake failed (method=1)");
-        }
-        else if (this->method == 2)
-        {
-            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            pthread_mutex_init(&fabric_state->recv_lock, NULL);
-            fabric_state->send_data       = (char *)base;
-            fabric_state->send_data_len   = nrows * disp * sizeof(T);
-            fabric_state->send_hmem_iface = hmem_iface;
-            fabric_state->world_size      = this->n_core;
-            fabric_state->rank            = this->rank;
-
-            init_fabric(fabric_state);
-            if (!fabric_state->info)
-                throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            if (hmem_iface != 0 && !is_hmem_capable(fabric_state))
-                throw std::runtime_error(
-                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
-                    "(current fabric does not support FI_HMEM)");
-
-            /* Register the send buffer as an MR before writing the record --
-             * same fi_mr_reg-vs-fi_mr_regattr branch as handshake(),
-             * duplicated here the same way the host-only version already
-             * is (method=2 registers inline instead of via handshake()). */
-            bool send_is_hmem = hmem_iface != 0;
-            int mr_rc;
-            if (send_is_hmem)
-            {
-                struct iovec iov = {fabric_state->send_data, fabric_state->send_data_len};
-                struct fi_mr_attr attr;
-                memset(&attr, 0, sizeof(attr));
-                attr.mr_iov    = &iov;
-                attr.iov_count = 1;
-                attr.access    = FI_WRITE | FI_REMOTE_READ;
-                attr.iface     = (enum fi_hmem_iface)hmem_iface;
-                attr.device.reserved = 0;
-                mr_rc = fi_mr_regattr(fabric_state->domain, &attr, 0, &fabric_state->mr);
-            }
-            else
-            {
-                mr_rc = fi_mr_reg(
-                    fabric_state->domain,
-                    fabric_state->send_data,
-                    fabric_state->send_data_len,
-                    FI_WRITE | FI_REMOTE_READ,
-                    0, 0, 0,
-                    &fabric_state->mr,
-                    NULL);
-            }
-            if (mr_rc != FI_SUCCESS)
-                throw std::runtime_error(
-                    std::string(send_is_hmem ? "fi_mr_regattr failed: " : "fi_mr_reg failed: ")
-                    + fi_strerror(mr_rc));
-
-            /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before
-             * use. The provider-assigned key is only valid after
-             * fi_mr_enable() — same requirement as method=1's handshake().
-             * No-op for hsn (is_mr_endpoint() is false).                     */
-            if (is_mr_endpoint(fabric_state))
-            {
-                int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
-                if (rc != FI_SUCCESS)
-                    throw std::runtime_error(std::string("fi_mr_bind failed: ") + fi_strerror(rc));
-                rc = fi_mr_enable(fabric_state->mr);
-                if (rc != FI_SUCCESS)
-                    throw std::runtime_error(std::string("fi_mr_enable failed: ") + fi_strerror(rc));
-            }
-            fabric_state->key = fi_mr_key(fabric_state->mr);
-
-            /* Exchange records with all core ranks via MPI_Allgather, and
-             * (rank 0 only) publish the combined record set for extra
-             * members to join later. */
-            std::vector<long> raw_lens(this->n_core);
-            if (handshake_write(fabric_state, this->comm,
-                                this->handshake_dir.c_str(), name.c_str(),
-                                this->n_core, nrows, disp, (int)sizeof(T),
-                                raw_lens.data()) != 0)
-                throw std::runtime_error("handshake_write failed");
-
-            /* Build prefix-sum lenlist from the raw per-rank row counts. */
-            long sum = 0;
-            std::vector<long> lenlist(this->n_core);
-            for (int i = 0; i < this->n_core; i++)
-            {
-                sum += raw_lens[i];
-                lenlist[i] = sum;
-            }
-
-            VarInfo_t var;
-            var.name         = name;
-            var.itemsize     = (int)sizeof(T);
-            var.disp         = disp;
-            var.win          = MPI_WIN_NULL;
-            var.lenlist      = lenlist;
-            var.active       = true;
-            var.fence_active = false;
-            var.base         = base;
-            var.owns_base    = (hmem_iface == 0);
-            var.fabric_state = fabric_state;
-            this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
-            return; /* lenlist already stored; skip the MPI_Allgather block below */
-        }
-
-        std::vector<long> lenlist(this->comm_size);
-        MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
-
-        int max_disp = 0;
-        // We assume disp is same for all
-        MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
-        if (max_disp != disp)
-            throw std::invalid_argument("Invalid disp");
-
-        long sum = 0;
-        for (long unsigned int i = 0; i < lenlist.size(); i++)
-        {
-            sum += lenlist[i];
-            lenlist[i] = sum;
-        }
-
-        VarInfo_t var;
-        var.name = name;
-        var.itemsize = sizeof(T);
-        var.disp = disp;
-        var.win = win;
-        var.lenlist = lenlist;
-        var.active = true;
-        var.fence_active = false;
-        var.base = base;
-        var.owns_base = (hmem_iface == 0);
-        var.fabric_state = fabric_state;
-
-        this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+        this->add_base(name, base, nrows, disp, (int)sizeof(T), hmem_iface,
+                       hmem_iface == 0, mpi_mem);
     }
 
     void init(std::string name, long nrows, int disp, int itemsize)
     {
-        void *base = NULL;
-        // std::cout << "Init: " << name << ", nrows: " << nrows << ", disp: " << disp << ", itemsize: " << itemsize << std::endl;
-        // std::cout << "Pre-allocating memory: " << (nrows * disp * itemsize)/1024/1024/1024 << " GB" << std::endl;
-        int err = MPI_Alloc_mem((MPI_Aint)(nrows * disp * itemsize), MPI_INFO_NULL, &base);
-        if (err)
-        {
-            exit(1);
-        }
-        memset(base, 0, nrows * disp * itemsize);
-
-        MPI_Win win = MPI_WIN_NULL;
-        struct fabric_state *fabric_state = NULL;
-
-        if (this->method == 0)
-        {
-            MPI_Win_create(base,                               /* pre-allocated buffer */
-                           (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
-                           disp * itemsize,                   /* displacement units */
-                           MPI_INFO_NULL,                      /* info object */
-                           this->comm,                         /* communicator */
-                           &win /* window object */);
-        }
-        else if (this->method == 1)
-        {
-            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            pthread_mutex_init(&fabric_state->recv_lock, NULL);
-            fabric_state->send_data = (char *)base;
-            fabric_state->send_data_len = nrows * disp * itemsize;
-            fabric_state->world_size = this->comm_size;
-            fabric_state->rank = this->rank;
-
-            init_fabric(fabric_state);
-            if (!fabric_state->info)
-                throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            if (handshake(fabric_state, this->comm) != 0)
-                throw std::runtime_error("handshake failed (method=1)");
-        }
-        else if (this->method == 2)
-        {
-            fabric_state = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            pthread_mutex_init(&fabric_state->recv_lock, NULL);
-            fabric_state->send_data     = (char *)base;
-            fabric_state->send_data_len = nrows * disp * itemsize;
-            fabric_state->world_size    = this->n_core;
-            fabric_state->rank          = this->rank;
-
-            init_fabric(fabric_state);
-            if (!fabric_state->info)
-                throw std::runtime_error("init_fabric failed: no suitable fabric found");
-
-            int mr_rc = fi_mr_reg(
-                fabric_state->domain,
-                fabric_state->send_data,
-                fabric_state->send_data_len,
-                FI_WRITE | FI_REMOTE_READ,
-                0, 0, 0,
-                &fabric_state->mr,
-                NULL);
-            if (mr_rc != FI_SUCCESS)
-                throw std::runtime_error(std::string("fi_mr_reg failed: ") + fi_strerror(mr_rc));
-
-            /* CXI (FI_MR_ENDPOINT): bind MR to endpoint and enable it before
-             * use. The provider-assigned key is only valid after
-             * fi_mr_enable() — same requirement as method=1's handshake().
-             * No-op for hsn (is_mr_endpoint() is false).                     */
-            if (is_mr_endpoint(fabric_state))
-            {
-                int rc = fi_mr_bind(fabric_state->mr, &fabric_state->signal->fid, 0);
-                if (rc != FI_SUCCESS)
-                    throw std::runtime_error(std::string("fi_mr_bind failed: ") + fi_strerror(rc));
-                rc = fi_mr_enable(fabric_state->mr);
-                if (rc != FI_SUCCESS)
-                    throw std::runtime_error(std::string("fi_mr_enable failed: ") + fi_strerror(rc));
-            }
-            fabric_state->key = fi_mr_key(fabric_state->mr);
-
-            std::vector<long> raw_lens(this->n_core);
-            if (handshake_write(fabric_state, this->comm,
-                                this->handshake_dir.c_str(), name.c_str(),
-                                this->n_core, nrows, disp, itemsize,
-                                raw_lens.data()) != 0)
-                throw std::runtime_error("handshake_write failed");
-
-            long sum = 0;
-            std::vector<long> lenlist(this->n_core);
-            for (int i = 0; i < this->n_core; i++)
-            {
-                sum += raw_lens[i];
-                lenlist[i] = sum;
-            }
-
-            VarInfo_t var;
-            var.name         = name;
-            var.itemsize     = itemsize;
-            var.disp         = disp;
-            var.win          = MPI_WIN_NULL;
-            var.lenlist      = lenlist;
-            var.active       = true;
-            var.fence_active = false;
-            var.base         = base;
-            var.owns_base    = true;
-            var.fabric_state = fabric_state;
-            this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
-            return;
-        }
-
-        std::vector<long> lenlist(this->comm_size);
-        MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
-
-        int max_disp = 0;
-        // We assume disp is same for all
-        MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
-        if (max_disp != disp)
-            throw std::invalid_argument("Invalid disp");
-
-        long sum = 0;
-        for (long unsigned int i = 0; i < lenlist.size(); i++)
-        {
-            sum += lenlist[i];
-            lenlist[i] = sum;
-        }
-
-        VarInfo_t var;
-        var.name = name;
-        var.itemsize = itemsize;
-        var.disp = disp;
-        var.win = win;
-        var.lenlist = lenlist;
-        var.active = true;
-        var.fence_active = false;
-        var.base = base;
-        var.owns_base = true;
-        var.fabric_state = fabric_state;
-
-        this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+        bool mpi_mem = false;
+        void *base = alloc_base((size_t)nrows * disp * itemsize, mpi_mem);
+        memset(base, 0, (size_t)nrows * disp * itemsize);
+        this->add_base(name, base, nrows, disp, itemsize, 0, true, mpi_mem);
     }
 
     template <typename T>
@@ -477,26 +241,30 @@ public:
         {
             throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
         }
+#ifdef DDSTORE_HAVE_MPI
         else if (this->method == 0)
         {
             MPI_Win win = varinfo.win;
-            MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+            ddstore_mpi_check(MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win), "MPI_Win_lock");
             /*
             int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
                         origin_datatype, int target_rank, MPI_Aint target_disp,
                         int target_count, MPI_Datatype target_datatype, MPI_Win
                         win)
             */
-            MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
-                    varinfo.disp * varinfo.itemsize * count, /* count on RMA origin process */
-                    MPI_BYTE,                         /* type on RMA origin process */
-                    target,                           /* rank of RMA target process */
-                    start - offset,                   /* displacement on RMA target process */
-                    varinfo.disp * varinfo.itemsize * count, /* count on RMA target process */
-                    MPI_BYTE,                         /* type on RMA target process */
-                    win /* window object */);
-            MPI_Win_unlock(target, win);
+            ddstore_mpi_check(
+                MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
+                        varinfo.disp * varinfo.itemsize * count, /* count on RMA origin process */
+                        MPI_BYTE,                         /* type on RMA origin process */
+                        target,                           /* rank of RMA target process */
+                        start - offset,                   /* displacement on RMA target process */
+                        varinfo.disp * varinfo.itemsize * count, /* count on RMA target process */
+                        MPI_BYTE,                         /* type on RMA target process */
+                        win /* window object */),
+                "MPI_Get");
+            ddstore_mpi_check(MPI_Win_unlock(target, win), "MPI_Win_unlock");
         }
+#endif
         else if (this->method == 1 || this->method == 2)
         {
             /* Methods 1 and 2 both use libfabric fi_read — same path.
@@ -582,7 +350,9 @@ public:
         {
             if (hmem_iface != 0)
                 throw std::runtime_error("GPU destination buffer is not supported with method=0 (MPI_Win)");
+#ifdef DDSTORE_HAVE_MPI
             this->get_batch_alltoall(varinfo, idx, n, (char *)buffer);
+#endif
             return;
         }
 
@@ -625,6 +395,135 @@ public:
     }
 
 private:
+    /* Allocate `bytes` for a store's own copy of a variable: MPI_Alloc_mem
+     * when MPI is built in and initialized (needed for MPI windows, and it
+     * was needed to avoid memory errors with Cray MPICH), otherwise
+     * page-aligned posix_memalign. mpi_mem says which, for free().        */
+    static void *alloc_base(size_t bytes, bool &mpi_mem)
+    {
+        void *base = NULL;
+        mpi_mem = false;
+#ifdef DDSTORE_HAVE_MPI
+        int initialized = 0, finalized = 0;
+        MPI_Initialized(&initialized);
+        MPI_Finalized(&finalized);
+        if (initialized && !finalized)
+        {
+            if (MPI_Alloc_mem((MPI_Aint)bytes, MPI_INFO_NULL, &base) != MPI_SUCCESS)
+                throw std::bad_alloc();
+            mpi_mem = true;
+            return base;
+        }
+#endif
+        if (posix_memalign(&base, 4096, bytes > 0 ? bytes : 1) != 0)
+            throw std::bad_alloc();
+        return base;
+    }
+
+    /* add()/init() after the buffer is in place: expose `base` (nrows rows
+     * of disp items of itemsize bytes) through this store's method and
+     * record the variable. Collective over the store's ranks.              */
+    void add_base(const std::string &name, void *base, long nrows, int disp, int itemsize,
+                  int hmem_iface, bool owns_base, bool mpi_mem)
+    {
+        VarInfo_t var;
+        var.name         = name;
+        var.itemsize     = itemsize;
+        var.disp         = disp;
+        var.active       = true;
+        var.epoch_active = false;
+        var.base         = base;
+        var.owns_base    = owns_base;
+        var.mpi_mem      = mpi_mem;
+        var.fabric_state = NULL;
+
+        if (this->method == 0)
+        {
+#ifdef DDSTORE_HAVE_MPI
+            int rc = MPI_Win_create(base,                              /* pre-allocated buffer */
+                                    (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
+                                    disp * itemsize,                   /* displacement units */
+                                    MPI_INFO_NULL,                     /* info object */
+                                    this->comm,                        /* communicator */
+                                    &var.win /* window object */);
+            if (rc != MPI_SUCCESS)
+            {
+                if (owns_base)
+                    mpi_mem ? (void)MPI_Free_mem(base) : ::free(base);
+                /* Typically no RMA (osc) component accepts the window: with
+                 * Open MPI 4.1 and no RDMA NIC, osc/pt2pt is the only choice
+                 * and it rejects MPI_THREAD_MULTIPLE (mpi4py's default);
+                 * osc/ucx over shared memory works (see .github/workflows). */
+                ddstore_mpi_check(rc, "MPI_Win_create",
+                                  " (no MPI RMA component usable with this build's "
+                                  "thread level/network? With Open MPI 4.1 try "
+                                  "OMPI_MCA_osc=ucx OMPI_MCA_opal_common_ucx_tls=any "
+                                  "OMPI_MCA_opal_common_ucx_devices=any)");
+            }
+
+            std::vector<long> lenlist(this->comm_size);
+            MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
+
+            int max_disp = 0;
+            // We assume disp is same for all
+            MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
+            if (max_disp != disp)
+                throw std::invalid_argument("Invalid disp");
+
+            long sum = 0;
+            for (long unsigned int i = 0; i < lenlist.size(); i++)
+            {
+                sum += lenlist[i];
+                lenlist[i] = sum;
+            }
+            var.lenlist = lenlist;
+#endif
+        }
+        else
+        {
+            /* Methods 1 and 2 (core): open the fabric, register the buffer,
+             * and exchange records with every rank of the store. Method 2
+             * rank 0 also publishes them for extra members to join.        */
+            struct fabric_state *fs = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+            pthread_mutex_init(&fs->recv_lock, NULL);
+            fs->send_data       = (char *)base;
+            fs->send_data_len   = (size_t)nrows * disp * itemsize;
+            fs->send_hmem_iface = hmem_iface;
+            fs->world_size      = this->comm_size;
+            fs->rank            = this->rank;
+            var.fabric_state    = fs;
+
+            init_fabric(fs);
+            if (!fs->info)
+                throw std::runtime_error("init_fabric failed: no suitable fabric found");
+            if (hmem_iface != 0 && !is_hmem_capable(fs))
+                throw std::runtime_error(
+                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
+                    "(current fabric does not support FI_HMEM)");
+            register_send_mr(fs);
+
+            std::vector<struct CoreRecord> &all = var.records;
+            exchange_records(fs, *this->exchange, nrows, disp, itemsize, all);
+            if (this->method == 2 && this->rank == 0)
+                publish_records(this->handshake_dir.c_str(), name.c_str(), all);
+
+            /* Every rank sees the same records, so every rank throws
+             * together if the shapes disagree.                             */
+            long sum = 0;
+            var.lenlist.resize(all.size());
+            for (size_t i = 0; i < all.size(); i++)
+            {
+                if (all[i].disp != disp || all[i].itemsize != itemsize)
+                    throw std::invalid_argument("Invalid disp");
+                sum += all[i].nrows;
+                var.lenlist[i] = sum;
+            }
+        }
+
+        this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));
+    }
+
+#ifdef DDSTORE_HAVE_MPI
     /* Method 0 batched get, after MDLoader's collective module (Bae et al.,
      * IPDPSW 2024): every rank all-gathers the batch indices of all ranks,
      * packs the rows it owns for each requester, and one MPI_Alltoallv
@@ -732,6 +631,7 @@ private:
         }
         MPI_Type_free(&rowtype);
     }
+#endif
 
     /* DDSTORE_ALLTOALL_MAX_BYTES: method 0 get_batch() bytes received per
      * rank per exchange round (default 2 MiB; read once). Must be the same
@@ -749,17 +649,32 @@ private:
     }
 
     int method; // 0: MPI, 1: libfabric, 2: file-based handshake (libfabric transport)
+#ifdef DDSTORE_HAVE_MPI
     MPI_Comm   coll_comm = MPI_COMM_NULL; /* method 0 get_batch; see above  */
     std::mutex coll_mutex;                /* one get_batch_alltoall at a time */
 
-    MPI_Comm    comm;
+    MPI_Comm    comm = MPI_COMM_NULL;
+#endif
     int         comm_size;
     int         rank;
+
+    /* Methods 1/2 core: how add()/init() gather the ranks' records
+     * (MpiExchange over comm, or FileExchange). NULL for extra members.    */
+    std::unique_ptr<Exchange> exchange;
 
     /* Method 2 fields */
     std::string handshake_dir;  /* shared directory for CoreRecord files     */
     int         n_core;         /* number of core ranks                      */
     bool        is_extra;       /* true if this is an extra (read-only) node */
+
+    /* Process that made this store. In a process forked from it, free()
+     * leaves the libfabric objects alone: their file descriptors are shared
+     * with the parent, so closing them would tear down the parent's.       */
+    pid_t       owner_pid = getpid();
+
+    /* fork_reader(): an empty read-only store for method 1 or 2.          */
+    struct reader_tag {};
+    DDStore(int method, int n_core, reader_tag);
 
     std::unordered_map<std::string, VarInfo_t> varlist;
 };

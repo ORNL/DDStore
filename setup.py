@@ -4,6 +4,7 @@ from os.path import dirname, join, abspath
 
 import numpy as np
 from Cython.Build import cythonize
+from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.extension import Extension
 
 import os
@@ -73,6 +74,30 @@ except OSError:
 with open(stamp, "w") as f:
     f.write(numpy_major + "\n")
 
+# DDSTORE_MPI changes only macros, so build_ext would reuse the object files
+# and module of a build in the other mode: rebuild everything when the mode
+# differs from the last successful build in this checkout.
+mode = str(int(with_mpi))
+mode_stamp = join("src", "pyddstore", "_core.mpi-mode")
+try:
+    with open(mode_stamp) as f:
+        mode_changed = f.read().strip() != mode
+except OSError:
+    mode_changed = True
+
+
+class build_ext(_build_ext):
+    def finalize_options(self):
+        super().finalize_options()
+        if mode_changed:
+            self.force = True
+
+    def run(self):
+        super().run()
+        with open(mode_stamp, "w") as f:
+            f.write(mode + "\n")
+
+
 # Left over from the layout before pyddstore became a package.
 for old in ("src/pyddstore.cpp",) + tuple(
     join("src", f)
@@ -91,4 +116,5 @@ setup(
     py_modules=["cpu_nic_map"],
     install_requires=["numpy"] + (["mpi4py"] if with_mpi else []),
     ext_modules=cythonize(extensions, force=regenerate),
+    cmdclass={"build_ext": build_ext},
 )

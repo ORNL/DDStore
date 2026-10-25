@@ -3,6 +3,7 @@ build/
 src/pyddstore.cpp
 src/pyddstore/_core.cpp
 src/pyddstore/_core.numpy-version
+src/pyddstore/_core.mpi-mode
 # built module
 PyDDStore.egg-info/
 pyddstore.cpython-*.so

@@ -189,12 +189,20 @@ def test_shapes_and_dtypes(comm, monkeypatch):
 
 @pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("loader", ["DataLoader", "ThreadDataLoader"])
-def test_loaders_match_plain_source(comm, monkeypatch, method, loader):
+@pytest.mark.parametrize("source_cls", [TupleSource, DictSource, SingleSource])
+@pytest.mark.parametrize("fast", ["1", "0"])
+def test_loaders_match_plain_source(comm, monkeypatch, method, loader, source_cls, fast):
     """A whole epoch through the loader equals the same loader over the plain
-    source (same order, same collation). Collective for method 0: every rank
-    iterates the same number of batches."""
-    src = TupleSource()
+    source (same order, same collation), with ThreadDataLoader's collated
+    batch reads (DDSTORE_FAST_COLLATE) on and off. Collective for method 0:
+    every rank iterates the same number of batches."""
+    monkeypatch.setenv("DDSTORE_FAST_COLLATE", fast)
+    src = source_cls()
     ds = make(comm, monkeypatch, src, method)
+    taken = ds._collated(np.arange(3)) is not None  # collective for method 0
+    if taken != (fast == "1"):
+        finish(comm, ds)
+        assert all_ok(comm, False)
     cls = DataLoader if loader == "DataLoader" else ThreadDataLoader
     kw = {} if cls is DataLoader else {"num_workers": 1 if method == 0 else 2}
     got = list(cls(ds, batch_size=8, **kw))
@@ -434,6 +442,16 @@ def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
         for i, g in enumerate(got)
     )
     copying.close()
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize("form", ["void", "array"])
+def test_fast_collate_falls_back_for_records(comm, monkeypatch, form):
+    """Record fields don't collate to a plain tensor: no collated batch read,
+    so ThreadDataLoader takes the per-sample path."""
+    ds = make(comm, monkeypatch, RecordSource(form), 0)
+    ok = ds._collated(np.arange(3)) is None
     finish(comm, ds)
     assert all_ok(comm, ok)
 

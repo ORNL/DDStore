@@ -47,10 +47,13 @@ Options:
                  use split-node there. Default: split-node.
   --core-nnodes=N  Number of nodes for the core step in split-node layout.
                  Ignored in colocate layout. Default: 1.
-  --num-workers=N  DataLoader workers for the extra (training) step. 0 uses
-                 PyTorch's standard DataLoader in the main process. > 0
-                 switches to ThreadDataLoader with that many worker threads.
-                 Default: 0.
+  --num-workers=N  DataLoader workers for the extra (training) step:
+                 threads with --loader=thread, forked processes with
+                 --loader=torch, 0 = main process. Default: 0.
+  --loader=X     torch: PyTorch's standard DataLoader (forked workers,
+                 each with its own DDStore endpoint, host memory).
+                 thread: ThreadDataLoader. Default: thread if
+                 --num-workers > 0, else torch.
   --replicate=R  Repeat the MNIST training set R times on the core side
                  (longer epochs, same per-sample cost). Default: 1.
   --image-scale=S  Upscale images to (28*S)x(28*S) on the core side (the
@@ -71,6 +74,7 @@ GPUDIRECT=0
 LAYOUT=
 CORE_NNODES_OPT=
 NUM_WORKERS=
+LOADER=
 REPLICATE=
 IMAGE_SCALE=
 for arg in "$@"; do
@@ -81,6 +85,7 @@ for arg in "$@"; do
         --layout=*) LAYOUT="${arg#--layout=}" ;;
         --core-nnodes=*) CORE_NNODES_OPT="${arg#--core-nnodes=}" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
+        --loader=*) LOADER="${arg#--loader=}" ;;
         --replicate=*) REPLICATE="${arg#--replicate=}" ;;
         --image-scale=*) IMAGE_SCALE="${arg#--image-scale=}" ;;
     esac
@@ -92,6 +97,11 @@ IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
 export DDSTORE_METHOD="${METHOD:-2}"
+# Forked DataLoader workers read DDStore through their own endpoints; that
+# needs a fork-safe libfabric MR cache monitor (see docs/pytorch.md).
+if [ "$LOADER" = torch ] && [ "$NUM_WORKERS" -gt 0 ]; then
+    export DDSTORE_FORK_WORKERS=1
+fi
 
 if [ "$GPUDIRECT" == "1" ]; then
     CORE_GPUS_PER_TASK=1
@@ -150,7 +160,7 @@ MASTER_PORT=8889 srun ${OVERLAP:-} -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-
 sleep 5
 
 MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun ${OVERLAP:-} -N$EXTRA_NNODES -n$EXTRA_NTASKS -c$EXTRA_CPUS_PER_TASK $EXTRA_GPU_ARGS --cpu-bind=verbose,core -l \
-    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS $EXTRA_EXTRA_ARGS \
+    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS${LOADER:+ --loader=$LOADER} $EXTRA_EXTRA_ARGS \
     > >(sed 's/^/[extr] /') 2> >(sed 's/^/[extr] /')
 sleep 5
 

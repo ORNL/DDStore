@@ -115,6 +115,77 @@ to fetch ≈ 0.006 s / total ≈ 0.15 s. Pinned memory with
 `.to(device, non_blocking=True)` gave no gain (and was ~3× slower with 0
 workers, where pinning runs on the training thread).
 
+## Loaders with batched reads (`mpi-optional` branch)
+
+Frontier, `vae-ddp.py` via `job-vae-single.sh` (3 epochs, epochs 2–3 timed),
+method 1, `get_batch()` reads, `--replicate=2` unless noted, s/epoch
+(fetch + compute). Losses are identical within every table.
+
+**Workers with batched reads** (8 nodes × 8 ranks, host destination):
+
+| | S=1 | S=2 | S=4 |
+|---|---|---|---|
+| `DataLoader`, 0 workers (reads on the training thread) | 0.112 | 0.241 | 1.198 |
+| `ThreadDataLoader`, 1 thread (`num_workers=0`) | 0.092 | 0.224 | 1.115 |
+| `ThreadDataLoader`, 2 threads | 0.086 | 0.232 | 1.124 |
+| `ThreadDataLoader`, 4 threads | 0.090 | 0.230 | 1.176 |
+
+One background thread hides the whole fetch (0.03–0.05 → 0.003 s/epoch);
+more threads have nothing left to hide. Batching made reads a few percent
+of a training step.
+
+**Thread readers (`DDSTORE_THREAD_READERS`, default 1) vs one shared store.**
+`bench_threads.py` (16 ranks, batch 64, `get_batch()` in a loop, speedup
+over one thread):
+
+| row | dest | threads | shared store (lock) | own reader each |
+|---|---|---|---|---|
+| 3 KB | host | 2 | 1.13× | 1.67× |
+| 3 KB | GPU | 4 | 1.41× | 1.70× |
+| 12.5 KB | GPU | 4 | 1.20× | 1.39× |
+| 200 KB | host/GPU | 4 | ~1.0× | 1.1–1.15× |
+
+In the VAE (4 and 8 nodes, 2 and 4 workers, host and GPU) epoch times were
+equal within noise. `DDSTORE_PROFILE=1` (8 nodes, µs per read call): lock
+wait 2–267 µs with a shared store (growing with workers and row size; 267 at
+S=4, host, 4 workers), 0.1 µs with own readers. With own readers and 4
+workers the Python-side time per call that isn't spent in DDStore ("other")
+rose from ~65 µs to 1.6–3.3 ms. It is not the GIL switch interval
+(`sys.setswitchinterval` 5 / 1 / 0.5 ms gave the same) and was hidden by
+prefetch; not investigated further.
+
+**Forked `DataLoader` workers vs `ThreadDataLoader`** (2 nodes × 8 ranks,
+host destination):
+
+| | S=1 | S=4 |
+|---|---|---|
+| `DataLoader`, 2 workers, new workers every epoch | 1.05 | 3.19 |
+| `DataLoader`, 2 workers, `persistent_workers=True` | 0.34 | 2.51 |
+| `DataLoader`, 4 workers, `persistent_workers=True` | 0.27 | 2.50 |
+| `ThreadDataLoader`, 2 workers | 0.27 | 2.52 |
+
+Forking new workers every epoch (PyTorch's default) added 0.7–0.9 s per epoch
+to the training loop, at 2 and 8 nodes alike and with every MR cache monitor
+(`memhooks` 0.93, `userfaultfd` 1.24, `disabled` 0.98 s compute at S=1;
+0 workers: `kdreg2` 0.21, `memhooks` 0.22), so it is the fork, not the
+monitor. Persistent forked workers still wait longer for batches than
+threads (fetch 0.04–0.05 vs 0.007 s/epoch; batches cross processes).
+
+**Collated batch reads (`DDSTORE_FAST_COLLATE`)** (8 nodes × 8 ranks,
+`ThreadDataLoader`, two repeats):
+
+| | fetch on / off | compute on / off |
+|---|---|---|
+| S=1, GPU, 2 workers | 0.002 / 0.004 | 0.077 / 0.089 |
+| S=1, GPU, 4 workers | 0.003 / 0.008 | 0.078 / 0.083 |
+| S=1, host, 4 workers | 0.002 / 0.008 | 0.076 / 0.089 |
+| S=4, GPU, 2 workers | 0.003 / 0.004 | 1.13 / 1.15 |
+| S=4, GPU, 4 workers | 0.004 / 0.008 | 1.17 / 1.11 |
+| S=4, host, 4 workers | 0.004 / 0.008 | 1.24 / 1.25 |
+
+Fetch waits halve and S=1 (small samples, most Python work per byte) is
+5–15% faster; at S=4 the difference is noise.
+
 ## Correctness experiments
 
 - **GPU sync in `get()`**: removing it made every `--gpu-dest` VAE run abort

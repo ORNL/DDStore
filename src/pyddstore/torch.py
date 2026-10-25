@@ -482,6 +482,14 @@ class _StoreDataset(Dataset):
             for f, rec in zip(schema["fields"], self._record)
         ]
         self._batch_get = os.environ.get("DDSTORE_BATCH_GET", "1") != "0"
+        # torch/numpy arrays and numbers collate to a stacked tensor of the
+        # same dtype, so a batch buffer is already the collated batch
+        self._fast_collate = os.environ.get("DDSTORE_FAST_COLLATE", "1") not in (
+            "",
+            "0",
+        ) and all(
+            f["kind"] in ("torch", "numpy", "npscalar", "py") for f in schema["fields"]
+        )
         if not hasattr(self, "_decode"):
             self._decode = None
 
@@ -653,6 +661,33 @@ class _StoreDataset(Dataset):
         if self._decode is not None:
             samples = [self._decode(sm, int(i)) for sm, i in zip(samples, idx)]
         return samples
+
+    # -- whole batches, collated (ThreadDataLoader's fast path) -----------
+    def _collated(self, idx, out=None):
+        """``default_collate(self.__getitems__(idx))`` without the per-sample
+        values: each field's batch buffer becomes the batch tensor directly
+        (copied when `out` buffers are reused). None when the result would
+        differ: record fields, ``decode``, or DDSTORE_BATCH_GET=0."""
+        if (
+            not self._fast_collate
+            or self._decode is not None
+            or (not self._batch_get and out is None)
+        ):
+            return None
+        idx = np.asarray(idx, dtype=np.int64)
+        values = []
+        for j in range(len(self._var)):
+            buf = self._read_field(j, idx, out)
+            t = buf if isinstance(buf, torch.Tensor) else torch.from_numpy(buf)
+            t = t.reshape((len(idx),) + tuple(self.schema["fields"][j]["shape"]))
+            values.append(t.clone() if out is not None else t)
+        # default_collate's containers: a tuple collates to a list
+        s = self.schema["structure"]
+        if s == "single":
+            return values[0]
+        if s == "dict":
+            return dict(zip(self.schema["keys"], values))
+        return values
 
 
 def _rows(values, dtype):
@@ -1036,6 +1071,11 @@ class ThreadDataLoader(DataLoader):
     run in parallel instead of taking turns on the store's per-variable
     lock. ``DDSTORE_THREAD_READERS=0``: all threads share the store.
 
+    With the default ``collate_fn``, a ``DistDataset`` / ``DistDatasetReader``
+    batch whose fields are tensors, numpy arrays or numbers is read straight
+    into its batch tensors (``default_collate``'s result, without building
+    per-sample values under the GIL). ``DDSTORE_FAST_COLLATE=0``: off.
+
     Each batch is fetched (via ``dataset.__getitems__`` when present),
     collated and optionally pinned in a worker thread; at most
     ``num_workers * prefetch_factor`` batches are in flight. Random draws
@@ -1128,6 +1168,17 @@ class ThreadDataLoader(DataLoader):
         return 0
 
     @staticmethod
+    def _fast(dataset, index, collate_fn, out=None):
+        """The collated batch read straight into its tensors (DistDataset /
+        DistDatasetReader with the default collate_fn), or None. Skips one
+        Python object per sample and field, and the collate's copy, which
+        run under the GIL."""
+        collated = getattr(dataset, "_collated", None)
+        if collated is None or collate_fn is not torch.utils.data.default_collate:
+            return None
+        return collated(index, out=out)
+
+    @staticmethod
     def fetch(
         dataset,
         ibatch,
@@ -1143,7 +1194,9 @@ class ThreadDataLoader(DataLoader):
             # GPU buffer, get_batch() synchronizes the device before reading,
             # so the collate's copy has finished by then.
             bufs = pool[_loader_thread.slot]
-            batch = collate_fn(dataset.__getitems__(index, out=bufs))
+            batch = ThreadDataLoader._fast(dataset, index, collate_fn, bufs)
+            if batch is None:
+                batch = collate_fn(dataset.__getitems__(index, out=bufs))
             if pin_memory:
                 batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
             return (ibatch, batch)
@@ -1153,14 +1206,20 @@ class ThreadDataLoader(DataLoader):
         # has one, like torch's own map-style fetcher. With batch_size=None
         # (no auto-collation) the sampler's index goes to dataset[index] as
         # is, also as torch does (e.g. samplers that yield whole batches).
-        if not auto_collation:
-            batch = dataset[index]
-        elif getattr(dataset, "__getitems__", None):
-            batch = dataset.__getitems__(index)
-        else:
-            batch = [dataset[i] for i in index]
-        if collate_fn is not None:
-            batch = collate_fn(batch)
+        batch = (
+            ThreadDataLoader._fast(dataset, index, collate_fn)
+            if auto_collation
+            else None
+        )
+        if batch is None:
+            if not auto_collation:
+                batch = dataset[index]
+            elif getattr(dataset, "__getitems__", None):
+                batch = dataset.__getitems__(index)
+            else:
+                batch = [dataset[i] for i in index]
+            if collate_fn is not None:
+                batch = collate_fn(batch)
         if pin_memory:
             batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
         return (ibatch, batch)

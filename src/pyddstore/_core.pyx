@@ -11,6 +11,16 @@ import cpu_nic_map
 import numpy as np
 cimport numpy as np
 
+np.import_array()
+
+
+cdef inline size_t _host_ptr(arr) except? 0:
+    # Data address of a host buffer: the C field for an ndarray, without
+    # arr.ctypes building a ctypes object on every read.
+    if isinstance(arr, np.ndarray):
+        return <size_t> np.PyArray_DATA(<np.ndarray> arr)
+    return arr.ctypes.data
+
 from libcpp.string cimport string
 from libcpp.typeinfo cimport type_info
 
@@ -347,7 +357,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             disp = arr.size // nrows
             iface = 0
@@ -394,7 +404,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             iface = 0
 
@@ -457,7 +467,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             itemsize = arr.itemsize
             iface = 0
 
@@ -492,7 +502,7 @@ cdef class PyDDStore:
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
-            ptr = arr.ctypes.data
+            ptr = _host_ptr(arr)
             nbytes = arr.nbytes
             iface = 0
         if nbytes == 0:
@@ -502,7 +512,7 @@ cdef class PyDDStore:
 
     def unregister_recv(self, str name, arr):
         """Undo register_recv(name, arr)."""
-        cdef size_t ptr = arr.data_ptr() if _is_cuda_tensor(arr) else arr.ctypes.data
+        cdef size_t ptr = arr.data_ptr() if _is_cuda_tensor(arr) else _host_ptr(arr)
         if (name, ptr) not in self._recv_buffers:
             if self.method == 0:
                 return

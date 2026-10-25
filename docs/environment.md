@@ -28,6 +28,7 @@
 | `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S` | `./ddstore_hs`, `300` | `method=2` directory (also the exchange directory without MPI), and how long `DistDatasetReader` waits for the core group to publish. |
 | `DDSTORE_N_CORE` | unset | `DistDatasetReader`'s number of core ranks when `n_core=` isn't passed (the examples default it to 4). |
 | `DDSTORE_THREAD_READERS` | `1` | `ThreadDataLoader`, methods 1/2: each worker thread reads through its own reader (`fork_reader()`, own endpoint) instead of sharing the store and its per-variable lock. `0` = share. |
+| `DDSTORE_FAST_COLLATE` | `1` | `ThreadDataLoader` with the default `collate_fn`: read a `DistDataset` batch straight into its batch tensors instead of building per-sample values and collating them. `0` = per-sample path. |
 | `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` | `0` / `0` | `ThreadDataLoader`: pin worker thread *i* to CPUs `[offset + i·width, offset + (i+1)·width)` of the process's affinity; width `0` = no pinning. |
 
 **Read by the examples** (`examples/vae/`, `examples/scripts/`, job scripts):

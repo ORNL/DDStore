@@ -97,14 +97,25 @@ parser.add_argument(
     type=int,
     default=0,
     metavar="N",
-    help="Number of DataLoader workers. 0 uses PyTorch's standard "
-    "DataLoader in the main process (no worker processes, no fork). "
-    "> 0 switches to ThreadDataLoader "
-    "(pyddstore.torch), with that many worker threads "
-    "-- forked processes can't safely own GPU state, so any "
-    "--num-workers > 0 goes through threads, never a fork. Default: 0.",
+    help="Number of DataLoader workers: threads for --loader=thread, "
+    "forked processes for --loader=torch (0 reads in the main process). "
+    "Default: 0.",
+)
+parser.add_argument(
+    "--loader",
+    choices=["torch", "thread"],
+    default=None,
+    help="torch: PyTorch's standard DataLoader; with --num-workers > 0 its "
+    "workers are forked processes, each reading through its own DDStore "
+    "endpoint into host memory (needs DDSTORE_FORK_WORKERS=1, which "
+    "job-vae-core-extra.sh sets). thread: ThreadDataLoader "
+    "(pyddstore.torch), worker threads in this process; reads straight "
+    "into GPU memory with --gpu-dest. Default: thread if --num-workers > 0, "
+    "else torch.",
 )
 args = parser.parse_args()
+if args.loader is None:
+    args.loader = "thread" if args.num_workers > 0 else "torch"
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 use_mps = not args.no_mps and torch.backends.mps.is_available()
 
@@ -148,9 +159,9 @@ model = torch.nn.parallel.DistributedDataParallel(model)
 optimizer = optim.Adam(model.parameters(), lr=1e-3)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
 
-if args.num_workers > 0:
-    # DistDatasetReader always joins via method=2 (file-based handshake),
-    # so no DDSTORE_METHOD=0 guard is needed here (unlike vae-ddp.py).
+# DistDatasetReader always joins via method=2 (file-based handshake), so
+# both loaders can use workers (no DDSTORE_METHOD=0 guard, unlike vae-ddp.py).
+if args.loader == "thread":
     train_loader = ThreadDataLoader(
         trainset,
         batch_size=args.batch_size,
@@ -160,7 +171,14 @@ if args.num_workers > 0:
     )
 else:
     train_loader = torch.utils.data.DataLoader(
-        trainset, batch_size=args.batch_size, shuffle=False, sampler=sampler
+        trainset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        # keep the workers (and their stores) across epochs: forking new ones
+        # every epoch cost ~0.7 s/epoch in the training loop
+        persistent_workers=args.num_workers > 0,
     )
 
 print(

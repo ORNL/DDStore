@@ -8,7 +8,7 @@ Each MPI rank holds a shard of the full dataset in memory. DDStore exposes a glo
 
 - **Batched reads**: `get_batch()` fetches a whole training batch in one call (one-sided RDMA reads in flight together, or an MPI collective for `method=0`).
 - **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory.
-- **PyTorch integration**: `pyddstore.torch` turns any map-style dataset into a distributed one (`DistDataset`), reads samples made of several stored rows (`WindowedDataset`), and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers. PyTorch's own `DataLoader` with forked workers works too (methods 1 and 2, `DDSTORE_FORK_WORKERS=1`).
+- **PyTorch integration**: `pyddstore.torch` turns any map-style dataset into a distributed one (`DistDataset`), reads samples made of several stored rows (`WindowedDataset`), and provides a thread-based `ThreadDataLoader` that is safe with MPI and GPU buffers (one DDStore reader per worker thread, batches read straight into their tensors). PyTorch's own `DataLoader` with forked workers works too (methods 1 and 2, `DDSTORE_FORK_WORKERS=1`).
 - **Thread-safe** reads, a profiler for where read time goes, and a split mode (`method=2`) where a separate job reads data published by another.
 - **MPI optional**: the libfabric backends also run without MPI (`DDSTORE_MPI=0` build), with ranks launched by `srun`.
 

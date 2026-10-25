@@ -403,12 +403,13 @@ def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
     loader = ThreadDataLoader(ds, batch_size=8, num_workers=nw, reuse_buffers=True)
     ok = len(loader._pool_sets) == nw
     prof = os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0") and method != 0
-    miss0 = [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var] if prof else None
+    # summed over the store and the threads' readers
+    miss0 = [ds.get_profile(v)["mr_miss"] for v in ds._var] if prof else None
     for _ in range(2):
         got = list(loader)
         ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
     if prof:
-        ok &= [ds.ddstore.get_profile(v)["mr_miss"] for v in ds._var] == miss0
+        ok &= [ds.get_profile(v)["mr_miss"] for v in ds._var] == miss0
     sets = loader._pool_sets
     loader.close()
     if method != 0:  # unregistered: releasing again raises
@@ -433,6 +434,30 @@ def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
         for i, g in enumerate(got)
     )
     copying.close()
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize("method", [m for m in METHODS if m != 0])
+@pytest.mark.parametrize("own", [True, False])
+def test_thread_loader_readers(comm, monkeypatch, method, own):
+    """Methods 1/2: worker thread i reads through the dataset's reader i;
+    a second loader reuses them; the main thread keeps the store.
+    DDSTORE_THREAD_READERS=0: every thread shares the store."""
+    if not own:
+        monkeypatch.setenv("DDSTORE_THREAD_READERS", "0")
+    src = TupleSource()
+    ds = make(comm, monkeypatch, src, method)
+    ref = list(DataLoader(src, batch_size=4))
+    ok = True
+    for nw in (3, 2):
+        got = list(ThreadDataLoader(ds, batch_size=4, num_workers=nw))
+        ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
+    # created on a thread's first read: slots of threads that read
+    ok &= (set(ds._readers) <= {0, 1, 2} and 0 in ds._readers) if own else not ds._readers
+    ok &= ds.ddstore is ds._ddstore and same(ds[3], src[3])
+    calls = sum(ds.get_profile(v)["calls"] for v in ds._var)
+    ok &= calls == 0 or calls >= 2 * len(ref) * len(ds._var)  # 0 unless DDSTORE_PROFILE
     finish(comm, ds)
     assert all_ok(comm, ok)
 

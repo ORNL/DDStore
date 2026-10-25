@@ -47,8 +47,8 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
 
 - **`comm`**: an mpi4py communicator, a `torch.distributed` process group, or `None` (see [Without MPI](#without-mpi) below).
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)`**: the same dataset read by a separate `method=2` extra job; it learns the fields from a `{name}.meta.json` file the core group writes next to the handshake records.
-- **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. One or two workers are enough: reads on one variable are serialized by its lock, and one batched read already keeps the network busy.
-  - `reuse_buffers=True` reads every batch into one of a fixed pool of `num_workers` buffer sets from `dataset.alloc(batch_size)`, registered once, instead of fresh buffers registered on every read (for large rows, registration can cost more than the transfer). A worker reads and collates its batch, then returns the set, so the collate must copy: it needs `batch_size` and the default `collate_fn`, or `collate_copies=True` to declare that your `collate_fn` copies; other setups raise. `loader.close()` (or deleting the loader) waits for running fetches and unregisters the pool. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
+- **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: a `DataLoader` whose workers are threads, not forked processes, so it is safe with MPI and GPU buffers. Each batch is fetched, collated and optionally pinned in a worker thread; random draws match `DataLoader`'s. As with `DataLoader`, `iter(loader)` returns a separate iterator for one epoch (`list(it)` or `islice(it, …)` after `next(it)` continue the epoch; iterators over one loader are independent), and while the training step holds a batch, `num_workers * prefetch_factor` more are being fetched, so that many plus one are in memory. With methods 1 and 2, worker thread *i* reads through the dataset's reader *i* (`PyDDStore.fork_reader()`, opened on a thread's first read and kept for later loaders over the dataset): its own libfabric endpoint, so the threads' reads run in parallel instead of taking turns on the store's per-variable lock (1.4–1.7× over one thread for 3 KB rows, about 1.1× for 200 KB rows, which are bandwidth-bound). Each reader costs one endpoint per variable. `DDSTORE_THREAD_READERS=0` shares the store across threads. Two to four workers are enough. The main thread keeps reading through the store; `dataset.get_profile(name)` sums the profile counters over the store and the readers.
+  - `reuse_buffers=True` reads every batch into a buffer set from `dataset.alloc(batch_size)`, one per worker thread, registered once (with that thread's reader), instead of fresh buffers registered on every read (for large rows, registration can cost more than the transfer). A worker reads and collates its batch, then reuses its set for the next one, so the collate must copy: it needs `batch_size` and the default `collate_fn`, or `collate_copies=True` to declare that your `collate_fn` copies; other setups raise. `loader.close()` (or deleting the loader) waits for running fetches and unregisters the pool. `DDSTORE_AFFINITY_WIDTH` / `DDSTORE_AFFINITY_OFFSET` pin worker threads to CPUs.
 
 ## Forked `DataLoader` workers
 
@@ -65,13 +65,22 @@ from pyddstore.torch import DistDataset
 
 trainset = DistDataset(my_dataset, "train", handshake_dir=hs)            # method 1 without MPI
 loader = torch.utils.data.DataLoader(trainset, batch_size=128, sampler=sampler,
-                                     num_workers=4, pin_memory=True)
+                                     num_workers=4, pin_memory=True,
+                                     persistent_workers=True)
 for x, y in loader:
     x = x.to(device, non_blocking=True)
 ```
 
 - **How it works**: a worker never uses the store it inherited from the parent (its endpoint belongs to the parent). On its first read it opens a store of its own (`PyDDStore.fork_reader()`), with its own libfabric endpoint, from the record table it inherited, and reads the same data. The parent's store keeps working.
-- **Host memory only**: in a worker, `device=` is ignored and samples come back on the CPU, since a forked process can't use the GPU. Move batches in the training loop (`pin_memory=True` helps). GPUDirect (`device=`/`add_device=`) still applies to reads in the parent.
+- **Host memory only**: in a worker, `device=` is ignored and samples come back on the CPU. After the parent has used the GPU, a forked child can't use CUDA/HIP (PyTorch: "Cannot re-initialize CUDA in forked subprocess"; ROCm doesn't support HIP across fork either), so it can't allocate or register GPU memory, and the parent's device pointers mean nothing in the child. Move batches in the training loop (`pin_memory=True` helps). Only the destination is limited: data stored in GPU memory (`add_device=`) is still read from a worker, because the remote NIC reads it directly and the worker never touches the GPU.
+
+  | GPUDirect | forked `DataLoader` worker | `ThreadDataLoader` thread |
+  |---|---|---|
+  | read from remote GPU memory (`add_device=`, VAE `--gpu-source`) | yes | yes |
+  | read into local GPU memory (`device=`, VAE `--gpu-dest`) | no (host) | yes |
+
+  GPU destinations from separate processes would need `spawn`/`forkserver` workers, which don't work with MPI on Frontier; use `ThreadDataLoader`.
+- **Use `persistent_workers=True`**: by default PyTorch forks new workers every epoch, and each new worker opens its own stores again. In the VAE example (Frontier, 2 nodes) that added 0.7–0.9 s of training-loop time per epoch, whatever the MR cache monitor; with persistent workers, forked workers matched `ThreadDataLoader` (S=1, 4 workers: 1.19 → 0.27 s/epoch; `ThreadDataLoader` 0.27).
 - **`method=0`** can't be read from a worker (MPI doesn't work after fork): use `ThreadDataLoader`.
 - **Libfabric settings** (Slingshot/CXI; read when libfabric starts, so import pyddstore before mpi4py, or export them in the job script):
 
@@ -82,7 +91,7 @@ for x, y in loader:
 
   On Frontier, `memhooks` measured the same as `kdreg2` (`bench_get`, 16 ranks, host and GPU destinations, single and batched reads). `FI_MR_CACHE_MONITOR=disabled` also works with workers but makes host reads 2× (single row) to 10× (batched) slower.
 - **Tested** on Frontier with both builds (MPI and `DDSTORE_MPI=0`): methods 1 and 2, 2 to 8 workers, a parent that reads before forking and uses the GPU (GPUDirect), new workers every epoch, and the VAE example over MPI, `torch.distributed` and file communicators. With MPI, import pyddstore (or `pyddstore.torch`) before mpi4py, or export `FI_MR_CACHE_MONITOR=memhooks` in the job script: MPI starts libfabric when mpi4py is imported.
-- **Which loader**: `ThreadDataLoader` avoids the fork and reads straight into GPU memory, and was faster in the VAE example (fetch 0.01 s vs 0.09 s per epoch with 4 workers). Forked workers help when the rest of the pipeline (decoding, augmentation in Python) needs separate processes.
+- **Which loader**: `ThreadDataLoader` avoids the fork and reads straight into GPU memory. In the VAE example it waited less for data than persistent forked workers (fetch 0.007 s vs 0.04–0.05 s per epoch; batches don't pass between processes) at the same epoch time. Forked workers help when the rest of the pipeline (decoding, augmentation in Python) needs separate processes.
 
 ## Without MPI
 

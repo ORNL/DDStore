@@ -212,6 +212,9 @@ else:
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
+        # keep the workers (and their stores) across epochs: forking new ones
+        # every epoch cost ~0.7 s/epoch in the training loop
+        persistent_workers=args.num_workers > 0,
     )
 
 print(
@@ -344,13 +347,14 @@ if __name__ == "__main__":
     # DDSTORE_PROFILE=1: where get() time goes, summed over all ranks and
     # both variables (data + labels), all epochs.
     if os.environ.get("DDSTORE_PROFILE", "0") not in ("", "0"):
-        ds = trainset.ddstore
+        # all of trainset's variables (image, label), over the store and the
+        # ThreadDataLoader threads' readers
         tot = {}
-        for var in ("traindata", "trainlabels"):
-            for k, v in ds.get_profile(var).items():
+        for var in trainset._var:
+            for k, v in trainset.get_profile(var).items():
                 if not k.startswith("py_"):
                     tot[k] = tot.get(k, 0) + v
-        prof = ds.get_profile("traindata")
+        prof = trainset.get_profile(trainset._var[0])
         for k in ("py_gets", "py_get", "py_sync"):
             tot[k] = prof[k]
         tot = {k: allreduce(v) for k, v in tot.items()}

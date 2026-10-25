@@ -73,7 +73,7 @@ for x, y in loader:
 
 Run with `mpirun -n 4 python my_script.py` (or `srun`).
 
-PyTorch's standard `DataLoader` with `num_workers > 0` (forked workers) also works for methods 1 and 2: export `DDSTORE_FORK_WORKERS=1` in the job script. Each worker opens its own endpoint and returns samples on the CPU. On Frontier this switches the libfabric MR cache monitor from the default `kdreg2`, which hangs forked workers, to `memhooks` (same speed); with MPI, import pyddstore before mpi4py. See [Forked DataLoader workers](docs/pytorch.md#forked-dataloader-workers).
+PyTorch's standard `DataLoader` with `num_workers > 0` (forked workers) also works for methods 1 and 2: export `DDSTORE_FORK_WORKERS=1` in the job script, and pass `persistent_workers=True` (new workers every epoch cost ~0.7 s per epoch in the VAE example). Each worker opens its own endpoint and returns samples on the CPU: a forked process can't use the GPU, so reads into GPU memory (`device=`) need `ThreadDataLoader`; data stored on the GPU (`add_device=`) is still readable from workers. On Frontier this switches the libfabric MR cache monitor from the default `kdreg2`, which hangs forked workers, to `memhooks` (same speed); with MPI, import pyddstore before mpi4py. See [Forked DataLoader workers](docs/pytorch.md#forked-dataloader-workers).
 
 Without MPI (a `DDSTORE_MPI=0` build, or `DDSTORE_COMM=file`), stores exchange their RDMA records through files in a shared directory, and ranks come from `srun`:
 

@@ -213,7 +213,7 @@ _NO_STORE = object()
 
 cdef class PyDDStore:
     cdef DDStore *c_ddstore
-    cdef int method
+    cdef readonly int method
     # Keepalive for GPU tensors passed to add(): C++ holds a raw pointer
     # into them with no copy and no refcounting (see ddstore.hpp add()'s
     # lifetime-contract comment) -- this dict keeps the Python reference

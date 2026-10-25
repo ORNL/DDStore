@@ -126,7 +126,7 @@ With `DDSTORE_PROFILE=1` set before the process starts: timing of `get()`/`get_b
 
 ## `fork_reader()`
 
-Returns a new read-only `PyDDStore` for a process forked from this one (a PyTorch `DataLoader` worker). It opens its own libfabric endpoint per variable from the records this store holds and reads the same data with `get()`/`get_batch()`, into host buffers. Call it in the forked process, and don't use the inherited store there. Methods 1 and 2 only; on CXI it needs `DDSTORE_FORK_WORKERS=1` set before the parent's store was created (it raises under the `kdreg2` MR cache monitor). `DistDataset` and `DistDatasetReader` call it by themselves. See [Forked DataLoader workers](pytorch.md#forked-dataloader-workers).
+Returns a new read-only `PyDDStore` for a process forked from this one (a PyTorch `DataLoader` worker). It opens its own libfabric endpoint per variable from the records this store holds and reads the same data with `get()`/`get_batch()`, into host buffers. Call it in the forked process, and don't use the inherited store there. Methods 1 and 2 only; on CXI it needs `DDSTORE_FORK_WORKERS=1` set before the parent's store was created (it raises under the `kdreg2` MR cache monitor). In the same process it gives a second reader with its own endpoint, so threads holding separate readers don't wait on each other's per-variable lock; there the kdreg2 restriction doesn't apply and GPU buffers work. `DistDataset` and `DistDatasetReader` call it by themselves, for forked workers and for `ThreadDataLoader` worker threads. See [Forked DataLoader workers](pytorch.md#forked-dataloader-workers).
 
 ---
 

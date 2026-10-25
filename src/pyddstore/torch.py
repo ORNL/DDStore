@@ -33,6 +33,7 @@ import multiprocessing as mp
 import os
 import queue
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -66,6 +67,25 @@ _TORCH_DTYPE = {
     "float32": torch.float32,
     "float64": torch.float64,
 }
+
+
+# ThreadDataLoader worker threads: .slot = the thread's index in its loader.
+_loader_thread = threading.local()
+
+
+class _as_slot:
+    """Act as ThreadDataLoader worker thread `slot` in this thread (e.g. to
+    register a buffer set with that thread's reader)."""
+
+    def __init__(self, slot):
+        self.slot = slot
+
+    def __enter__(self):
+        self.prev = getattr(_loader_thread, "slot", None)
+        _loader_thread.slot = self.slot
+
+    def __exit__(self, *exc):
+        _loader_thread.slot = self.prev
 
 
 def _nsplit(n, parts):
@@ -401,17 +421,43 @@ class _StoreDataset(Dataset):
     @property
     def ddstore(self):
         pid = os.getpid()
-        if pid == self._owner_pid:
+        if pid != self._owner_pid:
+            if self._fork_pid != pid:
+                self._fork_store = self._ddstore.fork_reader()
+                self._fork_pid = pid
+            return self._fork_store
+        slot = getattr(_loader_thread, "slot", None)
+        if slot is None or not self._thread_readers:
             return self._ddstore
-        if self._fork_pid != pid:
-            self._fork_store = self._ddstore.fork_reader()
-            self._fork_pid = pid
-        return self._fork_store
+        store = self._readers.get(slot)
+        if store is None:
+            with self._readers_lock:
+                store = self._readers.get(slot)
+                if store is None:
+                    store = self._readers[slot] = self._ddstore.fork_reader()
+        return store
 
     @ddstore.setter
     def ddstore(self, store):
         self._ddstore, self._owner_pid = store, os.getpid()
         self._fork_store = self._fork_pid = None
+        # ThreadDataLoader worker thread i reads through reader i (see
+        # ThreadDataLoader): its own endpoint, so threads don't wait on each
+        # other's reads. Kept per slot, so later loaders reuse them.
+        self._thread_readers = store.method in (1, 2) and os.environ.get(
+            "DDSTORE_THREAD_READERS", "1"
+        ) not in ("", "0")
+        self._readers, self._readers_lock = {}, threading.Lock()
+
+    def get_profile(self, name):
+        """``PyDDStore.get_profile(name)`` summed over the store and the
+        ThreadDataLoader worker threads' readers of this process."""
+        stores = [self._ddstore, *self._readers.values()]
+        tot = {}
+        for st in stores:
+            for k, v in st.get_profile(name).items():
+                tot[k] = tot.get(k, 0) + v
+        return tot
 
     @property
     def device(self):
@@ -983,6 +1029,13 @@ class ThreadDataLoader(DataLoader):
     read into host memory only. Takes the same arguments as ``DataLoader``;
     ``num_workers`` is the number of threads (0 means 1).
 
+    Methods 1 and 2: worker thread *i* reads a ``DistDataset`` /
+    ``DistDatasetReader`` through the dataset's reader *i*
+    (``PyDDStore.fork_reader()``, opened on first use and kept for later
+    loaders), which has its own libfabric endpoint, so the threads' reads
+    run in parallel instead of taking turns on the store's per-variable
+    lock. ``DDSTORE_THREAD_READERS=0``: all threads share the store.
+
     Each batch is fetched (via ``dataset.__getitems__`` when present),
     collated and optionally pinned in a worker thread; at most
     ``num_workers * prefetch_factor`` batches are in flight. Random draws
@@ -991,10 +1044,10 @@ class ThreadDataLoader(DataLoader):
     ``[offset + i*width, offset + (i+1)*width)`` of the process's affinity.
 
     ``reuse_buffers=True`` (dataset with ``alloc()``, e.g. ``DistDataset``):
-    read every batch into one of a fixed pool of ``num_workers`` buffer sets
-    from ``dataset.alloc(batch_size)``, registered once, instead of fresh
-    buffers that are registered on every read. A worker takes a set, reads
-    and collates the batch, and returns the set, so the collate must copy:
+    read every batch into a buffer set from ``dataset.alloc(batch_size)``,
+    one per worker thread, registered once (with that thread's reader),
+    instead of fresh buffers that are registered on every read. A worker
+    reads and collates a batch, then reuses its set, so the collate must copy:
     needs ``batch_size`` and the default ``collate_fn``, or
     ``collate_copies=True`` to declare that a custom ``collate_fn`` copies.
     ``close()`` (or deleting the loader) waits for running fetches and
@@ -1004,9 +1057,9 @@ class ThreadDataLoader(DataLoader):
     def __init__(self, dataset, reuse_buffers=False, collate_copies=False, **kwargs):
         super().__init__(dataset, **kwargs)
 
-        # Fixed pool of registered read buffers, one set per worker thread,
-        # owned by this loader (see reuse_buffers in the class docstring).
-        self._pool, self._pool_sets = None, []
+        # Registered read buffers, set i for worker thread i, owned by this
+        # loader (see reuse_buffers in the class docstring).
+        self._pool_sets = []
         if reuse_buffers:
             if not hasattr(dataset, "alloc"):
                 raise TypeError(
@@ -1026,11 +1079,9 @@ class ThreadDataLoader(DataLoader):
                     "reuse_buffers with a custom collate_fn: pass collate_copies=True "
                     "if it copies the samples (the buffer is reused right after it)"
                 )
-            self._pool = queue.Queue()
-            for _ in range(self.num_workers or 1):
-                bufs = dataset.alloc(self.batch_size)
-                self._pool_sets.append(bufs)
-                self._pool.put(bufs)
+            for slot in range(self.num_workers or 1):
+                with _as_slot(slot):
+                    self._pool_sets.append(dataset.alloc(self.batch_size))
 
         # Persistent across epochs -- recreating the pool in every __iter__()
         # would leak OS threads since the old pool is never shut down.
@@ -1040,20 +1091,24 @@ class ThreadDataLoader(DataLoader):
             initializer=self.worker_init,
             initargs=(self._counter,),
         )
+        self._pool = self._pool_sets or None
 
         logger.debug("num_workers: %s", self.num_workers)
         logger.debug("len: %s", len(self._index_sampler))
 
     @staticmethod
     def worker_init(counter):
+        # The pool starts at most max_workers threads and keeps them, so the
+        # slots are 0 .. num_workers-1.
+        with counter.get_lock():
+            wid = counter.value
+            counter.value += 1
+        _loader_thread.slot = wid
+
         core_width = int(os.environ.get("DDSTORE_AFFINITY_WIDTH", "0"))
         core_offset = int(os.environ.get("DDSTORE_AFFINITY_OFFSET", "0"))
         if core_width <= 0 or not hasattr(os, "sched_getaffinity"):
             return 0
-
-        with counter.get_lock():
-            wid = counter.value
-            counter.value += 1
 
         affinity = list(os.sched_getaffinity(0))
         affinity_mask = set(
@@ -1083,15 +1138,12 @@ class ThreadDataLoader(DataLoader):
         pool=None,
     ):
         if pool is not None:
-            # Read into one of the loader's registered buffer sets; collate
-            # copies the batch out, then the set goes back to the pool. For a
+            # Read into this thread's registered buffer set; collate copies
+            # the batch out before the thread's next fetch refills it. For a
             # GPU buffer, get_batch() synchronizes the device before reading,
-            # so the collate's copy has finished before the set is refilled.
-            bufs = pool.get()
-            try:
-                batch = collate_fn(dataset.__getitems__(index, out=bufs))
-            finally:
-                pool.put(bufs)
+            # so the collate's copy has finished by then.
+            bufs = pool[_loader_thread.slot]
+            batch = collate_fn(dataset.__getitems__(index, out=bufs))
             if pin_memory:
                 batch = torch.utils.data._utils.pin_memory.pin_memory(batch)
             return (ibatch, batch)
@@ -1126,9 +1178,10 @@ class ThreadDataLoader(DataLoader):
         sets = getattr(self, "_pool_sets", [])
         if executor is not None:
             executor.shutdown(wait=bool(sets), cancel_futures=True)
-        for bufs in sets:
+        for slot, bufs in enumerate(sets):
             try:
-                self.dataset.release(bufs)
+                with _as_slot(slot):
+                    self.dataset.release(bufs)
             except (ValueError, KeyError):
                 pass  # the store was freed first: nothing left to unregister
         self._pool_sets = []

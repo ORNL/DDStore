@@ -206,14 +206,14 @@ class _NoMpiComm:
         )
 
 
-_default_file_comm = None
+_file_comms = {}
 
 
 def _file_comm(handshake_dir):
-    # One per process: a second FileComm with the same ns could make a slow
-    # rank miss the first one's last exchange.
-    global _default_file_comm
-    if _default_file_comm is None:
+    # One per directory: a second FileComm with the same ns in one directory
+    # could make a slow rank miss the first one's last exchange.
+    key = os.path.realpath(handshake_dir)
+    if key not in _file_comms:
         from ._core import FileComm
 
         rs = _env_rank_size()
@@ -224,10 +224,10 @@ def _file_comm(handshake_dir):
             )
         os.makedirs(handshake_dir, exist_ok=True)
         fc = FileComm(handshake_dir, rs[0], rs[1], "pw")
-        _default_file_comm = _NoMpiComm(
+        _file_comms[key] = _NoMpiComm(
             fc.rank, fc.size, fc.allgather, handshake_dir, "pw"
         )
-    return _default_file_comm
+    return _file_comms[key]
 
 
 def _torch_comm(group, handshake_dir):

@@ -127,6 +127,23 @@ def test_default_method_is_1_without_mpi(file_comm, hs, monkeypatch):
     assert all(file_comm.allgather(ok))
 
 
+def test_new_handshake_dir_after_removal(file_comm, hs):
+    """Each handshake_dir gets its own file communicator: a dataset in a new
+    directory still works after an earlier directory is removed."""
+    a, b = os.path.join(hs, "dir_a"), os.path.join(hs, "dir_b")
+    ds = DistDataset(Source(), "da", handshake_dir=a, method=1)
+    ok = read_all(ds)
+    finish(ds)
+    file_comm.allgather(None)  # every rank done with dir_a
+    if file_comm.rank == 0:
+        shutil.rmtree(a)
+    file_comm.allgather(None)
+    ds = DistDataset(Source(), "db", handshake_dir=b, method=1)
+    ok &= ds._comm.handshake_dir == b and read_all(ds)
+    finish(ds)
+    assert all(file_comm.allgather(ok))
+
+
 def test_ddstore_width_groups(file_comm, hs):
     if file_comm.size < 2 or file_comm.size % 2:
         pytest.skip("needs an even number of ranks")

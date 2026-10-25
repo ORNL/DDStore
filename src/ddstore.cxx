@@ -159,9 +159,9 @@ void DDStore::epoch_begin()
         {
             if (!x.second.active)
                 continue;
-            MPI_Win_lock_all(MPI_MODE_NOCHECK, x.second.win);
-            MPI_Win_sync(x.second.win);
-            MPI_Win_unlock_all(x.second.win);
+            ddstore_mpi_check(MPI_Win_lock_all(MPI_MODE_NOCHECK, x.second.win), "MPI_Win_lock_all");
+            ddstore_mpi_check(MPI_Win_sync(x.second.win), "MPI_Win_sync");
+            ddstore_mpi_check(MPI_Win_unlock_all(x.second.win), "MPI_Win_unlock_all");
             x.second.epoch_active = true;
         }
         MPI_Barrier(this->comm);

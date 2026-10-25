@@ -36,25 +36,23 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Open MPI: method-0 reads return zeros on this runner; not gating while
-    # under investigation. osc: Open MPI's RMA component selection
-    # (OMPI_MCA_osc), "^ucx" to rule out UCX.
-    continue-on-error: ${{ matrix.mpi == 'openmpi' }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - mpi: openmpi
-            osc: ""
-          - mpi: openmpi
-            osc: "^ucx"
-          - mpi: mpich
-            osc: ""
+        mpi: [openmpi, mpich]
     env:
       OMPI_MCA_rmaps_base_oversubscribe: "1"
+      # Ubuntu's Open MPI 4.1 disables the ucx and pt2pt RMA components
+      # (/etc/openmpi/openmpi-mca-params.conf: osc = ^ucx,pt2pt); osc/rdma
+      # needs an RDMA NIC and osc/sm only serves shared windows, so
+      # MPI_Win_create fails. pt2pt rejects MPI_THREAD_MULTIPLE (mpi4py's
+      # default) anyway. osc/ucx over UCX shared memory works once its
+      # device/transport filters (mlx* by default) are opened up. MPICH
+      # ignores these.
+      OMPI_MCA_osc: ucx
+      OMPI_MCA_opal_common_ucx_tls: any
+      OMPI_MCA_opal_common_ucx_devices: any
     steps:
-      - if: matrix.osc != ''
-        run: echo "OMPI_MCA_osc=${{ matrix.osc }}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:

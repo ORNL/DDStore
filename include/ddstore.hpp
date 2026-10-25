@@ -18,6 +18,22 @@
 #include <rdma/fi_rma.h>
 #include "common.h"
 
+#ifdef DDSTORE_HAVE_MPI
+/* Throw on an MPI error. mpi4py sets MPI_ERRORS_RETURN on its
+ * communicators, so an unchecked failure (MPI_Win_create with no usable
+ * RMA component, say) would leave a dead window and reads of zeros.     */
+static inline void ddstore_mpi_check(int rc, const char *what, const char *hint = "")
+{
+    if (rc == MPI_SUCCESS)
+        return;
+    char msg[MPI_MAX_ERROR_STRING];
+    int len = 0;
+    if (MPI_Error_string(rc, msg, &len) != MPI_SUCCESS)
+        len = 0;
+    throw std::runtime_error(std::string(what) + " failed: " + std::string(msg, len) + hint);
+}
+#endif
+
 struct VarInfo
 {
     std::string name;
@@ -229,22 +245,24 @@ public:
         else if (this->method == 0)
         {
             MPI_Win win = varinfo.win;
-            MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win);
+            ddstore_mpi_check(MPI_Win_lock(MPI_LOCK_SHARED, target, 0, win), "MPI_Win_lock");
             /*
             int MPI_Get(void *origin_addr, int origin_count, MPI_Datatype
                         origin_datatype, int target_rank, MPI_Aint target_disp,
                         int target_count, MPI_Datatype target_datatype, MPI_Win
                         win)
             */
-            MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
-                    varinfo.disp * varinfo.itemsize * count, /* count on RMA origin process */
-                    MPI_BYTE,                         /* type on RMA origin process */
-                    target,                           /* rank of RMA target process */
-                    start - offset,                   /* displacement on RMA target process */
-                    varinfo.disp * varinfo.itemsize * count, /* count on RMA target process */
-                    MPI_BYTE,                         /* type on RMA target process */
-                    win /* window object */);
-            MPI_Win_unlock(target, win);
+            ddstore_mpi_check(
+                MPI_Get(buffer,                           /* pre-allocated buffer on RMA origin process */
+                        varinfo.disp * varinfo.itemsize * count, /* count on RMA origin process */
+                        MPI_BYTE,                         /* type on RMA origin process */
+                        target,                           /* rank of RMA target process */
+                        start - offset,                   /* displacement on RMA target process */
+                        varinfo.disp * varinfo.itemsize * count, /* count on RMA target process */
+                        MPI_BYTE,                         /* type on RMA target process */
+                        win /* window object */),
+                "MPI_Get");
+            ddstore_mpi_check(MPI_Win_unlock(target, win), "MPI_Win_unlock");
         }
 #endif
         else if (this->method == 1 || this->method == 2)
@@ -422,12 +440,26 @@ private:
         if (this->method == 0)
         {
 #ifdef DDSTORE_HAVE_MPI
-            MPI_Win_create(base,                              /* pre-allocated buffer */
-                           (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
-                           disp * itemsize,                   /* displacement units */
-                           MPI_INFO_NULL,                     /* info object */
-                           this->comm,                        /* communicator */
-                           &var.win /* window object */);
+            int rc = MPI_Win_create(base,                              /* pre-allocated buffer */
+                                    (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
+                                    disp * itemsize,                   /* displacement units */
+                                    MPI_INFO_NULL,                     /* info object */
+                                    this->comm,                        /* communicator */
+                                    &var.win /* window object */);
+            if (rc != MPI_SUCCESS)
+            {
+                if (owns_base)
+                    mpi_mem ? (void)MPI_Free_mem(base) : ::free(base);
+                /* Typically no RMA (osc) component accepts the window: with
+                 * Open MPI 4.1 and no RDMA NIC, osc/pt2pt is the only choice
+                 * and it rejects MPI_THREAD_MULTIPLE (mpi4py's default);
+                 * osc/ucx over shared memory works (see .github/workflows). */
+                ddstore_mpi_check(rc, "MPI_Win_create",
+                                  " (no MPI RMA component usable with this build's "
+                                  "thread level/network? With Open MPI 4.1 try "
+                                  "OMPI_MCA_osc=ucx OMPI_MCA_opal_common_ucx_tls=any "
+                                  "OMPI_MCA_opal_common_ucx_devices=any)");
+            }
 
             std::vector<long> lenlist(this->comm_size);
             MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);

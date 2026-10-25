@@ -3,10 +3,12 @@ name: tests
 # Build both variants and run what a CPU-only runner can: method 0 (MPI RMA)
 # with 1, 2 and 4 ranks. Tests that need a CXI device, Slurm or a GPU skip
 # themselves; run those on an HPC system (docs/testing.md). Runs on pull
-# requests, on main after a merge, and by hand (Actions > Run workflow); no
-# path filters, so a required check is never left pending.
+# requests (not drafts: they run when marked ready), on main after a merge,
+# and by hand (Actions > Run workflow); no path filters, so a required check
+# is never left pending.
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
@@ -20,6 +22,7 @@ concurrency:
 
 jobs:
   black:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +33,7 @@ jobs:
       - run: black --check $(git ls-files '*.py')
 
   mpi:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # Open MPI: method 0 mixes a fence epoch (epoch_begin) with lock/unlock
@@ -71,6 +75,7 @@ jobs:
         run: mpirun -n 4 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
 
   nompi:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

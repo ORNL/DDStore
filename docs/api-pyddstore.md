@@ -67,7 +67,7 @@ Overwrite a region of the local shard for a variable registered with `init()`. L
 
 ## `get(name, arr, start=0)`
 
-Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`. The range must fall within a single rank's shard. Must be called inside an `epoch_begin` / `epoch_end` pair when using the MPI backend.
+Read `arr.shape[0]` consecutive rows starting at global index `start` into `arr`. The range must fall within a single rank's shard. With `method=0`, call it between `epoch_begin()` and `epoch_end()` so that other ranks' `update()` writes are visible.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -143,7 +143,7 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 ## `epoch_begin()` / `epoch_end()`
 
-Open and close an MPI RMA access epoch (calls `MPI_Win_fence`). **Collective**. Required around `get()` calls when using `method=0`. No-op for `method=1`/`2`.
+**Collective** synchronization points for `method=0`: `epoch_begin()` makes each rank's `update()` writes visible and waits for every rank; `epoch_end()` waits until every rank is done reading. Each `get()` locks its target itself (`MPI_Win_lock`), so these hold no RMA epoch. No-op for `method=1`/`2`.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## MPI RMA (`method=0`, default)
 
-`MPI_Win_create` + `MPI_Get`. Runs on any MPI cluster. Reads go between `epoch_begin()` and `epoch_end()`.
+`MPI_Win_create` + `MPI_Get` (passive target: each read locks its target). Runs on any MPI cluster (MPICH, Open MPI). Reads go between `epoch_begin()` and `epoch_end()`, which synchronize ranks so `update()` writes are visible.
 
 ## libfabric RDMA (`method=1`)
 

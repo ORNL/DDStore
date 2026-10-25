@@ -141,38 +141,49 @@ void DDStore::query(std::string name, VarInfo_t &varinfo)
     varinfo = this->varlist.at(name);
 }
 
+/* Method 0: synchronization points, not RMA epochs. get() locks its target
+ * itself (MPI_Win_lock/unlock), which MPI doesn't allow inside a fence epoch
+ * (Open MPI then reads nothing). epoch_begin() makes this rank's writes
+ * (update()) visible to the others' reads (MPI_Win_sync, in a passive-target
+ * epoch of its own), then waits for every rank; epoch_end() waits until
+ * every rank is done reading, so no rank updates while others read.       */
 void DDStore::epoch_begin()
 {
 #ifdef DDSTORE_HAVE_MPI
-    if (!this->method)
+    if (!this->method && !this->varlist.empty())
     {
         for (auto &x : this->varlist)
+            if (x.second.active && x.second.epoch_active)
+                throw std::logic_error("Epoch already begun");
+        for (auto &x : this->varlist)
         {
-            if (x.second.fence_active)
-                throw std::logic_error("Fence already activated");
-            MPI_Win_fence(0, x.second.win);
-            x.second.fence_active = true;
+            if (!x.second.active)
+                continue;
+            MPI_Win_lock_all(MPI_MODE_NOCHECK, x.second.win);
+            MPI_Win_sync(x.second.win);
+            MPI_Win_unlock_all(x.second.win);
+            x.second.epoch_active = true;
         }
+        MPI_Barrier(this->comm);
     }
 #endif
-    /* Methods 1 and 2 use libfabric — no fence needed. */
+    /* Methods 1 and 2 use libfabric: no epoch needed. */
 }
 
 void DDStore::epoch_end()
 {
 #ifdef DDSTORE_HAVE_MPI
-    if (!this->method)
+    if (!this->method && !this->varlist.empty())
     {
         for (auto &x : this->varlist)
-        {
-            if (not x.second.fence_active)
-                throw std::logic_error("Fence is not activated");
-            MPI_Win_fence(0, x.second.win);
-            x.second.fence_active = false;
-        }
+            if (x.second.active && !x.second.epoch_active)
+                throw std::logic_error("Epoch not begun");
+        for (auto &x : this->varlist)
+            x.second.epoch_active = false;
+        MPI_Barrier(this->comm);
     }
 #endif
-    /* Methods 1 and 2 use libfabric — no fence needed. */
+    /* Methods 1 and 2 use libfabric: no epoch needed. */
 }
 
 /* --------------------------------------------------------------------------
@@ -232,7 +243,7 @@ void DDStore::join(std::string name)
     var.disp         = out_disp;
     var.lenlist      = lenlist;
     var.active       = true;
-    var.fence_active = false;
+    var.epoch_active = false;
     var.base         = NULL; /* extra member owns no data */
     var.owns_base    = false;
     var.fabric_state = fs;
@@ -288,7 +299,7 @@ DDStore *DDStore::fork_reader() const
         var.disp         = src.disp;
         var.lenlist      = src.lenlist;
         var.active       = true;
-        var.fence_active = false;
+        var.epoch_active = false;
         var.base         = NULL;
         var.owns_base    = false;
         var.fabric_state = fs;

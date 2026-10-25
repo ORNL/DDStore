@@ -28,7 +28,7 @@ struct VarInfo
     MPI_Win win = MPI_WIN_NULL;
 #endif
     bool active;
-    bool fence_active;
+    bool epoch_active;
     void *base;
     /* true if base was allocated by add()/init() (alloc_base()) and free()
      * must release it; false for a caller-owned GPU buffer (add() with
@@ -413,7 +413,7 @@ private:
         var.itemsize     = itemsize;
         var.disp         = disp;
         var.active       = true;
-        var.fence_active = false;
+        var.epoch_active = false;
         var.base         = base;
         var.owns_base    = owns_base;
         var.mpi_mem      = mpi_mem;

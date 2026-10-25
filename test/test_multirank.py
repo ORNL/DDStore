@@ -111,6 +111,31 @@ def test_init_update_remote_get(comm):
     store.free()
 
 
+def test_update_rounds_between_epochs(comm):
+    """method 0: each round every rank update()s its shard, then reads every
+    rank's inside an epoch; epoch_begin() must make the writes visible and
+    epoch_end() keep the next round's writes out until all are done."""
+    rank, size = comm.Get_rank(), comm.Get_size()
+    nrows, ncols = 4, 8
+    store = dds.PyDDStore(comm)
+    store.init("y", nrows, ncols, itemsize=4)
+    out = np.zeros((1, ncols), dtype=np.float32)
+    local_ok = True
+    for rnd in range(5):
+        store.update("y", np.full((nrows, ncols), rnd * 100.0 + rank, np.float32), 0)
+        store.epoch_begin()
+        for target_rank in range(size):
+            store.get("y", out, start=target_rank * nrows + nrows - 1)
+            local_ok &= bool(np.all(out == rnd * 100.0 + target_rank))
+        store.epoch_end()
+    with pytest.raises(RuntimeError, match="Epoch already begun"):
+        store.epoch_begin()
+        store.epoch_begin()
+    store.epoch_end()
+    assert all_passed(comm, local_ok)
+    store.free()
+
+
 # ---------------------------------------------------------------------------
 # multiple variables — independent correctness
 # ---------------------------------------------------------------------------

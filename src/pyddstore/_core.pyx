@@ -118,8 +118,8 @@ cdef extern from "ddstore.hpp":
         void get_batch[T](string name, const long *idx, long n, T* buffer, int hmem_iface) except + nogil
         void register_recv(string name, void *buffer, size_t len, int hmem_iface) except +
         void unregister_recv(string name, void *buffer) except +
-        void epoch_begin()
-        void epoch_end()
+        void epoch_begin() except +
+        void epoch_end() except +
         void free()
         void init(string name, long nrows, int disp, int itemsize) except +
         void update[T](string name, T* buffer, long nrows, long offset) except +

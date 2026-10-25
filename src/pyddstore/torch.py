@@ -1242,7 +1242,10 @@ class ThreadDataLoader(DataLoader):
         self._pool_sets = []
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass  # at interpreter exit, modules close() needs may be gone
 
 
 class _ThreadLoaderIter:

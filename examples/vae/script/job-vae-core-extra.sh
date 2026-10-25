@@ -97,6 +97,7 @@ IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
 export DDSTORE_METHOD="${METHOD:-2}"
+export VAE_PROFILE=1
 # Forked DataLoader workers read DDStore through their own endpoints; that
 # needs a fork-safe libfabric MR cache monitor (see docs/pytorch.md).
 if [ "$LOADER" = torch ] && [ "$NUM_WORKERS" -gt 0 ]; then

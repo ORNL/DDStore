@@ -223,3 +223,21 @@ One 2-node debug job covering what Frontier could not:
   (`--gpus-per-node=4`, each picks `cuda:$SLURM_LOCALID`); with
   `--gpus-per-task=1`, NCCL 2.29 fails in DDP setup with "Cuda failure 101
   'invalid device ordinal'". The job scripts handle this.
+- **`mpi-optional` branch** (commit `a258bfc`, 2 nodes × 4 ranks): both builds
+  pass the tests (126 `test_torch` + `test_get_batch`, 14 `test_gpu_rdma`, 14
+  `test_torch_nompi`, 12 `test_file_exchange`) with `DDSTORE_TEST_DIR` on
+  `$SCRATCH`. VAE `--method=1`, all loaders give epoch-3 loss 19.8601;
+  core/extra, torch and thread loaders give the same per-rank losses.
+
+  | VAE run (epoch 3) | fetch (s) | compute (s) |
+  |---|---|---|
+  | 0 workers | 0.059 | 0.176 |
+  | forked, 4 persistent workers | 0.045 | 0.172 |
+  | threads, 2 workers (own readers) | 0.005 | 0.156 |
+  | threads, `DDSTORE_THREAD_READERS=0` | 0.005 | 0.153 |
+  | threads, `DDSTORE_FAST_COLLATE=0` | 0.007 | 0.218 |
+  | threads, `--gpudirect` | 0.007 | 0.156 |
+
+  Forked workers run with every MR cache monitor except `kdreg2`;
+  `FI_CXI_DISABLE_HOST_REGISTER=0` fails after fork (`fi_enable` -262), as on
+  Frontier.

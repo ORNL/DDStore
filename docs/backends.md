@@ -68,6 +68,7 @@ srun -N2 -n8 python train.py         # no mpirun, no MPI library needed
 
 - Works in either build; the only option in a [`DDSTORE_MPI=0` build](installation.md#building-without-mpi).
 - `method=2` gives a core member (`size=` is `n_core`) that publishes `{name}.bin` as usual.
+- Put `handshake_dir` on Lustre (Perlmutter: `$SCRATCH`, not CFS, where polling across nodes is erratic).
 - Every rank creates its stores and calls `add()`/`init()` in the same order. Ranks poll (1–200 ms backoff) for up to `DDSTORE_HANDSHAKE_TIMEOUT_S`.
 - File names include a session (`DDSTORE_SESSION`, else `{SLURM_JOB_ID}_{SLURM_STEP_ID}`) and a store name (`exchange_ns`, default `s0`, `s1`, …), and records carry a nonce, so runs and stores can share a directory.
 - `epoch_begin`/`epoch_end` are no-ops. For barriers (e.g. before `free()`), use `pyddstore.FileComm(dir, rank, size, ns)`.

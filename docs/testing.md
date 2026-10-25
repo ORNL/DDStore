@@ -42,6 +42,8 @@ DDSTORE_FABRIC=cxi mpirun -n 2 python -m pytest test/test_gpu_rdma.py -v
 | `test/test_torch_nompi.py` | 2 (4 recommended) | `pyddstore.torch` without MPI (never imports mpi4py; either build): `DistDataset` over a `FileComm` and over a `torch.distributed` gloo group, methods 1 and 2, default method 1, `ddstore_width` groups, a `DistDatasetReader`, PyTorch `DataLoader` with forked workers (methods 1 and 2, a reader, the `kdreg2` error), errors raised on every rank, `method=0` refused, `FileComm.allgather`; launch with `srun` inside a Slurm step with a CXI device |
 | `test/test_torch.py` | 2 (4 recommended) | `pyddstore.torch`: tuple/dict/single samples of every field kind, numpy records, loaders vs the plain source (direct batch reads on and off), `ThreadDataLoader` per-thread readers, iterators and prefetch depth, `read_rows`/`alloc` buffers, `reuse_buffers` (also with GPU buffers), `WindowedDataset`, `row_of`, `encode`/`decode`/`fields`, chunked loading, error handling, `ddstore_width`, GPU placement, `DistDatasetReader` |
 
+`test_file_exchange.py` and `test_torch_nompi.py` create their files under `DDSTORE_TEST_DIR` (default: the current directory), which every rank must see. Use Lustre (Frontier, Perlmutter `$SCRATCH`); on Perlmutter CFS the file handshake is erratic across nodes and torch's `file://` rendezvous fails (no `flock()` on compute nodes). Run `test_torch_nompi.py` on its own.
+
 ## Integration scripts
 
 ```bash

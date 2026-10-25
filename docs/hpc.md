@@ -38,3 +38,8 @@ It defaults to `--layout=split-node`; `--layout=colocate` works on Perlmutter on
 
 - `fi_domain()` fails with `-38`, or `init_fabric failed: no suitable fabric found`: the step has no CXI service. Add `#SBATCH --network=single_node_vni` (Frontier, any one-node step).
 - `VNI_NOT_FOUND` between steps: see [Slingshot VNIs](#slingshot-vnis-and---network).
+
+## Perlmutter filesystems
+
+- Use `$SCRATCH` (Lustre) for `handshake_dir` and `DDSTORE_TEST_DIR`. On CFS, file handshakes across nodes are erratic (slow, or `DDSTORE_HANDSHAKE_TIMEOUT_S` reached).
+- torch's `file://` rendezvous fails on CFS from compute nodes (`DistStoreError: Unknown error 524`: no `flock()`). Use `env://` or a `$SCRATCH` path.

@@ -16,7 +16,7 @@
 | `DDSTORE_MAX_READ_BYTES` | `1073741824` (1 GiB) | `method=1`/`2`: largest single `fi_read`; longer rows are split (Perlmutter `cxi` rejects 5 GB reads without reporting a limit). Capped at the provider's `max_msg_size`. |
 | `DDSTORE_ALLTOALL_MAX_BYTES` | `2097152` (2 MiB) | `method=0` `get_batch()`: bytes per rank per exchange round. Same on all ranks. |
 | `DDSTORE_FORK_WORKERS` | unset | `1`: allow reads from forked `DataLoader` workers; sets `FI_MR_CACHE_MONITOR=memhooks` if unset or `kdreg2`. Set before libfabric starts. See [Forked DataLoader workers](pytorch.md#forked-dataloader-workers). |
-| `FI_CXI_DISABLE_HOST_REGISTER` | `1` (set by `pyddstore` unless already set) | CXI: skip ROCm registration of host buffers; needed for forked workers. |
+| `FI_CXI_DISABLE_HOST_REGISTER` | `1` (set by `pyddstore` unless already set) | CXI: skip GPU-runtime (ROCm, CUDA) registration of host buffers; needed for forked workers. Perlmutter sets it by default. |
 
 **Read by `pyddstore.torch`** (defaults for arguments not given):
 
@@ -36,7 +36,7 @@
 | Variable | Default | Effect |
 |---|---|---|
 | `DDSTORE_BACKEND` | auto | Examples' DDP backend (`nccl`, `gloo`, `xccl`). |
-| `VAE_PROFILE` | off | `1`: `vae-ddp.py` prints fetch and compute time per epoch. |
+| `VAE_PROFILE` | off | `1`: `vae-ddp.py` and `vae_extra_train.py` print fetch and compute time per epoch (the job scripts set it). |
 | `MASTER_PORT` | `2345` | DDP rendezvous port (one per step in the core/extra script). |
 
 **System settings that matter on Frontier:**

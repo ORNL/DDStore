@@ -90,11 +90,11 @@ for x, y in loader:
 
   | Setting | Set by | Purpose |
   |---|---|---|
-  | `FI_MR_CACHE_MONITOR=memhooks` | `DDSTORE_FORK_WORKERS=1`, when the variable is unset or `kdreg2` | Frontier's default `kdreg2` ([OLCF, 2025-05-13](https://docs.olcf.ornl.gov/systems/frontier_user_guide.html#id30)) doesn't work in forked processes; `memhooks` does, at the same speed. Without the setting, workers raise an error. |
-  | `FI_CXI_DISABLE_HOST_REGISTER=1` | `pyddstore` on import, unless already set | Skips ROCm registration of CXI host buffers, which fails after fork. |
+  | `FI_MR_CACHE_MONITOR=memhooks` | `DDSTORE_FORK_WORKERS=1`, when the variable is unset or `kdreg2` | Frontier's default `kdreg2` ([OLCF, 2025-05-13](https://docs.olcf.ornl.gov/systems/frontier_user_guide.html#id30)) doesn't work in forked processes; `memhooks` does, at the same speed. Without the setting, workers raise an error. Perlmutter leaves the variable unset; there the default, `memhooks`, `userfaultfd` and `disabled` all work. |
+  | `FI_CXI_DISABLE_HOST_REGISTER=1` | `pyddstore` on import, unless already set | Skips GPU-runtime (ROCm, CUDA) registration of CXI host buffers, which fails after fork. Perlmutter's default. |
 
   `FI_MR_CACHE_MONITOR=disabled` also works, with 2–10× slower host reads.
-- **Tested** on Frontier, both builds: methods 1 and 2, 2–8 workers, GPU parents, VAE over MPI, `torch.distributed` and file communicators.
+- **Tested** on Frontier and Perlmutter, both builds: methods 1 and 2, 2–8 workers, GPU parents, VAE over MPI, `torch.distributed` and file communicators.
 - **Which loader**: `ThreadDataLoader` reads into GPU memory and waits less for batches; forked workers suit heavy per-sample Python work.
 
 ## Without MPI

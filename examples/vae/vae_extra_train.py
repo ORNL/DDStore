@@ -24,6 +24,7 @@ from __future__ import print_function
 
 import argparse
 import os
+import time
 
 ## torch (and the RCCL/HIP shared libraries it pulls in) must finish loading
 ## before mpi4py triggers MPI_Init, or their static destructors run in the
@@ -193,11 +194,19 @@ test_loader = torch.utils.data.DataLoader(
 )
 
 
+# VAE_PROFILE=1: fetch vs compute time per epoch, as in vae-ddp.py
+PROFILE = os.environ.get("VAE_PROFILE") == "1"
+
+
 def train(epoch):
     model.train()
     train_loss = 0
+    fetch_time = 0.0
+    compute_time = 0.0
     train_loader.dataset.ddstore.epoch_begin()
+    t0 = time.perf_counter()
     for batch_idx, (data, _) in enumerate(train_loader):
+        t1 = time.perf_counter()
         train_loader.dataset.ddstore.epoch_end()
         data = data.to(device)
         optimizer.zero_grad()
@@ -206,6 +215,12 @@ def train(epoch):
         loss.backward()
         train_loss += loss.item()
         optimizer.step()
+        # skip epoch 1 (warmup), as in vae-ddp.py
+        if PROFILE and epoch > 1:
+            torch.cuda.synchronize(device=device)
+            t2 = time.perf_counter()
+            fetch_time += t1 - t0
+            compute_time += t2 - t1
         if batch_idx % args.log_interval == 0:
             print(
                 "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
@@ -218,6 +233,7 @@ def train(epoch):
             )
 
         train_loader.dataset.ddstore.epoch_begin()
+        t0 = time.perf_counter()
 
     train_loader.dataset.ddstore.epoch_end()
     print(
@@ -225,6 +241,13 @@ def train(epoch):
             epoch, train_loss / len(train_loader.dataset)
         )
     )
+    if PROFILE and epoch > 1:
+        print(
+            "[profile] epoch {}: fetch={:.3f}s compute={:.3f}s".format(
+                epoch, fetch_time, compute_time
+            ),
+            flush=True,
+        )
 
 
 def test(epoch):

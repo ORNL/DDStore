@@ -217,7 +217,12 @@ def train(epoch):
         optimizer.step()
         # skip epoch 1 (warmup), as in vae-ddp.py
         if PROFILE and epoch > 1:
-            torch.cuda.synchronize(device=device)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device=device)
+            elif device.type == "xpu":
+                torch.xpu.synchronize(device=device)
+            elif device.type == "mps":
+                torch.mps.synchronize()
             t2 = time.perf_counter()
             fetch_time += t1 - t0
             compute_time += t2 - t1

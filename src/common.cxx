@@ -436,7 +436,9 @@ static void init_fabric_cxi(struct fabric_state *fabric)
     }
 
     /* Query real max_msg_size from the created endpoint — necessary for CXI
-     * where fi_getinfo with NULL hints returns max_msg_size=0.               */
+     * where fi_getinfo with NULL hints returns max_msg_size=0. The option is
+     * not in libfabric 1.20 and older: there reads are split at 1 GiB.     */
+#if FI_MAJOR_VERSION >= 2
     {
         size_t max_msg_size = 0;
         size_t optlen = sizeof(max_msg_size);
@@ -449,6 +451,7 @@ static void init_fabric_cxi(struct fabric_state *fabric)
             fprintf(stderr, "endpoint max_msg_size=%zu\n", max_msg_size);
         }
     }
+#endif
 
     av_attr.type = FI_AV_MAP;
     av_attr.count = DP_AV_DEF_SIZE;

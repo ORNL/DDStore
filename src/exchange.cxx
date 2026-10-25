@@ -155,43 +155,85 @@ std::string FileExchange::path(long call, const char *who) const
 void FileExchange::allgather(const void *in, void *out, size_t bytes)
 {
     const long k = this->ncalls++;
-    const size_t slot = sizeof(uint64_t) + bytes;
+    const size_t head = 2 * sizeof(uint64_t); /* generation, nonce */
+    const size_t slot = head + bytes;
 
     static thread_local std::mt19937_64 rng(std::random_device{}() ^ (uint64_t)getpid());
     const uint64_t nonce = rng();
     std::vector<char> mine(slot);
-    memcpy(mine.data(), &nonce, sizeof(nonce));
-    memcpy(mine.data() + sizeof(nonce), in, bytes);
+    memcpy(mine.data() + sizeof(uint64_t), &nonce, sizeof(nonce));
+    memcpy(mine.data() + head, in, bytes);
 
     std::vector<char> all(slot * this->size);
     const std::string all_path = this->path(k, "all");
+    const std::string go_path = this->path(0, "go");
 
     if (this->rank == 0)
     {
+        /* A fresh generation for this exchange, before reading any rank's
+         * file: files an earlier run left behind carry another one.        */
+        if (k == 0)
+        {
+            do
+                this->gen = rng();
+            while (this->gen == 0);
+            write_atomic(go_path, &this->gen, sizeof(this->gen));
+        }
+        memcpy(mine.data(), &this->gen, sizeof(this->gen));
         memcpy(all.data(), mine.data(), slot);
         for (int r = 1; r < this->size; r++)
         {
             const std::string p = this->path(k, std::to_string(r).c_str());
-            poll_until([&] { return read_exact(p, all.data() + r * slot, slot); },
-                       p + " (rank " + std::to_string(r) + ")");
+            char *dst = all.data() + r * slot;
+            poll_until([&] {
+                return read_exact(p, dst, slot) && memcmp(dst, &this->gen, sizeof(this->gen)) == 0;
+            }, p + " (rank " + std::to_string(r) + ")");
         }
         write_atomic(all_path, all.data(), all.size());
         for (int r = 1; r < this->size; r++)
             unlink(this->path(k, std::to_string(r).c_str()).c_str());
-        /* Every rank has read call k-1's file: it wrote its call-k file
-         * after doing so.                                                  */
+        /* Every rank has read call k-1's file (and the generation): it
+         * wrote its call-k file after doing so.                            */
         if (k > 0)
             unlink(this->path(k - 1, "all").c_str());
+        if (k == 1)
+            unlink(go_path.c_str());
     }
     else
     {
-        write_atomic(this->path(k, std::to_string(this->rank).c_str()), mine.data(), slot);
+        const std::string my_path = this->path(k, std::to_string(this->rank).c_str());
+        /* Call 0: take the generation from rank 0's go file. One left by an
+         * earlier run may be read first; rank 0 then ignores this rank's
+         * file, so re-read the go file while waiting and resend on change. */
+        auto read_gen = [&] {
+            uint64_t g;
+            if (read_exact(go_path, &g, sizeof(g)) && g != 0 && g != this->gen)
+            {
+                this->gen = g;
+                memcpy(mine.data(), &g, sizeof(g));
+                write_atomic(my_path, mine.data(), slot);
+            }
+        };
+        if (k == 0)
+            poll_until([&] {
+                read_gen();
+                return this->gen != 0;
+            }, go_path);
+        else
+        {
+            memcpy(mine.data(), &this->gen, sizeof(this->gen));
+            write_atomic(my_path, mine.data(), slot);
+        }
         poll_until([&] {
-            return read_exact(all_path, all.data(), all.size()) &&
-                   memcmp(all.data() + this->rank * slot, &nonce, sizeof(nonce)) == 0;
+            if (read_exact(all_path, all.data(), all.size()) &&
+                memcmp(all.data() + this->rank * slot, mine.data(), head) == 0)
+                return true;
+            if (k == 0)
+                read_gen();
+            return false;
         }, all_path);
     }
 
     for (int r = 0; r < this->size; r++)
-        memcpy((char *)out + r * bytes, all.data() + r * slot + sizeof(uint64_t), bytes);
+        memcpy((char *)out + r * bytes, all.data() + r * slot + head, bytes);
 }

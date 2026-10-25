@@ -53,9 +53,15 @@ private:
  * session: DDSTORE_SESSION, else SLURM_JOB_ID.SLURM_STEP_ID, else "0".
  * ns separates stores (and the Python layer's collectives) of one session;
  * all ranks must create them in the same order with the same ns.
- * Each rank's contribution carries a random nonce that the rank checks in
- * the combined file, so a combined file left by an earlier run with the
- * same session and ns is never mistaken for this one.                     */
+ * Files left by an earlier run with the same session and ns are never
+ * mistaken for this one's:
+ *   - on call 0, rank 0 picks a random generation and writes it to
+ *     {dir}/.x.{session}.{ns}.0.go first; every rank's file carries it,
+ *     and rank 0 accepts only files with it. A rank that read an earlier
+ *     run's go file re-reads it while waiting and resends its file;
+ *   - each rank's contribution also carries a random nonce, which the
+ *     rank checks in the combined file.
+ * Rank 0 removes the go file on call 1.                                   */
 class FileExchange : public Exchange
 {
 public:
@@ -68,6 +74,7 @@ private:
 
     std::string dir, prefix; /* prefix: ".x.{session}.{ns}" */
     long ncalls = 0;
+    uint64_t gen = 0; /* this exchange's generation, from rank 0 on call 0 */
 };
 
 /* Default namespace for a store's FileExchange: "s0", "s1", ... in

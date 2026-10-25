@@ -14,6 +14,7 @@ import glob
 import os
 import shutil
 import tempfile
+import time
 
 import numpy as np
 import pytest
@@ -168,6 +169,36 @@ def test_stale_exchange_files_ignored(comm, hs):
     ok = ok and np.array_equal(out, expected_rows(idx) + 7)
     comm.Barrier()
     second.free()
+    assert all_passed(comm, ok)
+
+
+@pytest.mark.parametrize("late", ["others", "rank0"])
+def test_stale_rank_files_ignored(comm, hs, monkeypatch, late):
+    """Per-rank and go files left by an interrupted run with the same session
+    and ns: rank 0 ignores per-rank files of another generation, and a rank
+    that read the old go file resends its own. late="others": rank 0 finds
+    the stale files before the others write theirs; late="rank0": the others
+    read the stale go file before rank 0 replaces it."""
+    rank, size = comm.Get_rank(), comm.Get_size()
+    monkeypatch.setenv("DDSTORE_SESSION", f"stale{late}")
+    monkeypatch.setenv("DDSTORE_HANDSHAKE_TIMEOUT_S", "20")
+    pre = os.path.join(hs, f".x.stale{late}.st.0.")
+    rng = np.random.default_rng()
+    old_gen = rng.integers(1, 2**63, dtype=np.uint64)
+    if rank == 0:
+        old_gen.tofile(pre + "go")
+    else:  # call 0 of FileComm.allgather gathers one int64: 8 + 8 + 8 bytes
+        np.array([old_gen, rng.integers(1, 2**63), 0], dtype=np.uint64).tofile(
+            pre + str(rank)
+        )
+    comm.Barrier()
+    if (rank == 0) == (late == "rank0"):
+        time.sleep(1)
+    fc = dds.FileComm(hs, rank, size, "st")
+    ok = fc.allgather(("a", rank)) == [("a", r) for r in range(size)]
+    ok = ok and fc.allgather(rank * 10) == [r * 10 for r in range(size)]
+    fc.barrier()
+    ok = ok and not os.path.exists(pre + "go")  # removed on call 1
     assert all_passed(comm, ok)
 
 

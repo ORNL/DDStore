@@ -2,10 +2,13 @@ name: tests
 
 # Build both variants and run what a CPU-only runner can: method 0 (MPI RMA)
 # with 1, 2 and 4 ranks. Tests that need a CXI device, Slurm or a GPU skip
-# themselves; run those on an HPC system (docs/testing.md).
+# themselves; run those on an HPC system (docs/testing.md). Runs on pull
+# requests, on main after a merge, and by hand (Actions > Run workflow); no
+# path filters, so a required check is never left pending.
 on:
-  push:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:

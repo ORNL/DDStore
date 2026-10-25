@@ -1,10 +1,22 @@
 name: docs
 
-# Build the Sphinx docs on every push and pull request; publish them to
-# GitHub Pages from main. Needs Settings > Pages > Source: "GitHub Actions".
+# Build the Sphinx docs on pull requests and on main when the docs or the
+# documented code change; publish them to GitHub Pages from main. Needs
+# Settings > Pages > Source: "GitHub Actions".
 on:
-  push:
   pull_request:
+    paths:
+      - "docs/**"
+      - "src/pyddstore/**"
+      - "README.md"
+      - ".github/workflows/docs.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "src/pyddstore/**"
+      - "README.md"
+      - ".github/workflows/docs.yml"
   workflow_dispatch:
 
 permissions:

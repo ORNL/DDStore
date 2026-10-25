@@ -52,6 +52,11 @@ jobs:
       OMPI_MCA_osc: ucx
       OMPI_MCA_opal_common_ucx_tls: any
       OMPI_MCA_opal_common_ucx_devices: any
+      # Both stacks run on UCX (Ubuntu's MPICH is ch4:ucx). Some runner VMs
+      # (Azure MANA NICs) expose an RDMA device whose verbs transport fails
+      # (ibv_create_srq: Operation not supported), and MPI_Init aborts with a
+      # silent exit code 15. Keep UCX on shared memory and TCP.
+      UCX_TLS: self,sm,tcp
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

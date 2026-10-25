@@ -191,7 +191,9 @@ def test_shapes_and_dtypes(comm, monkeypatch):
 @pytest.mark.parametrize("loader", ["DataLoader", "ThreadDataLoader"])
 @pytest.mark.parametrize("source_cls", [TupleSource, DictSource, SingleSource])
 @pytest.mark.parametrize("fast", ["1", "0"])
-def test_loaders_match_plain_source(comm, monkeypatch, method, loader, source_cls, fast):
+def test_loaders_match_plain_source(
+    comm, monkeypatch, method, loader, source_cls, fast
+):
     """A whole epoch through the loader equals the same loader over the plain
     source (same order, same collation), with ThreadDataLoader's collated
     batch reads (DDSTORE_FAST_COLLATE) on and off. Collective for method 0:
@@ -279,8 +281,14 @@ def test_thread_loader_keeps_prefetch_full(comm):
 
 def stacked(src, rows, key):
     """Field `key` of src[r] for r in rows, stacked as read_rows returns it."""
-    vals = [src[int(r)] if key == 0 and not isinstance(src[0], (tuple, list, dict))
-            else src[int(r)][key] for r in rows]
+    vals = [
+        (
+            src[int(r)]
+            if key == 0 and not isinstance(src[0], (tuple, list, dict))
+            else src[int(r)][key]
+        )
+        for r in rows
+    ]
     if isinstance(vals[0], torch.Tensor):
         return torch.stack(vals)
     return np.stack([np.asarray(v) for v in vals])
@@ -313,7 +321,9 @@ def test_read_rows_and_out(comm, monkeypatch, method, source_cls):
     ok = list(got) == keys
     ok &= all(same_values(got[k], stacked(src, rows, k)) for k in keys)
     sub = ds.read_rows(rows[:3], fields=keys[-1:])
-    ok &= list(sub) == keys[-1:] and same_values(sub[keys[-1]], stacked(src, rows[:3], keys[-1]))
+    ok &= list(sub) == keys[-1:] and same_values(
+        sub[keys[-1]], stacked(src, rows[:3], keys[-1])
+    )
     with pytest.raises(KeyError):
         ds.read_rows(rows, fields=["nope"])
 
@@ -356,7 +366,9 @@ def test_windowed_dataset(comm, monkeypatch, method, loader):
     kw = {} if cls is DataLoader else {"num_workers": 1 if method == 0 else 2}
     got = list(cls(wd, batch_size=4, **kw))
     ref = [
-        torch.utils.data.default_collate([window([s, s + 2, s + 4]) for s in range(b, min(b + 8, len(wd) * 2), 2)])
+        torch.utils.data.default_collate(
+            [window([s, s + 2, s + 4]) for s in range(b, min(b + 8, len(wd) * 2), 2)]
+        )
         for b in range(0, len(wd) * 2, 8)
     ]
     ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
@@ -432,9 +444,18 @@ def test_thread_loader_reuse_buffers(comm, monkeypatch, method):
     with pytest.raises(TypeError):  # dataset without alloc()
         ThreadDataLoader(src, batch_size=8, reuse_buffers=True)
     copying = ThreadDataLoader(
-        ds, batch_size=8, num_workers=nw, reuse_buffers=True, collate_copies=True,
-        collate_fn=lambda b: [tuple(x.clone() if isinstance(x, torch.Tensor) else
-                                    np.array(x, copy=True) for x in s) for s in b],
+        ds,
+        batch_size=8,
+        num_workers=nw,
+        reuse_buffers=True,
+        collate_copies=True,
+        collate_fn=lambda b: [
+            tuple(
+                x.clone() if isinstance(x, torch.Tensor) else np.array(x, copy=True)
+                for x in s
+            )
+            for s in b
+        ],
     )
     got = [s for b in copying for s in b]
     ok &= len(got) == N and all(
@@ -472,7 +493,9 @@ def test_thread_loader_readers(comm, monkeypatch, method, own):
         got = list(ThreadDataLoader(ds, batch_size=4, num_workers=nw))
         ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
     # created on a thread's first read: slots of threads that read
-    ok &= (set(ds._readers) <= {0, 1, 2} and 0 in ds._readers) if own else not ds._readers
+    ok &= (
+        (set(ds._readers) <= {0, 1, 2} and 0 in ds._readers) if own else not ds._readers
+    )
     ok &= ds.ddstore is ds._ddstore and same(ds[3], src[3])
     calls = sum(ds.get_profile(v)["calls"] for v in ds._var)
     ok &= calls == 0 or calls >= 2 * len(ref) * len(ds._var)  # 0 unless DDSTORE_PROFILE
@@ -531,8 +554,14 @@ def test_encode_decode(comm, monkeypatch, method):
     read_rows stays row-level."""
     with pytest.raises(TypeError):  # strings can't be stored as they are
         make(comm, monkeypatch, Labeled(), method)
-    ds = make(comm, monkeypatch, Labeled(), method, encode=labeled_encode,
-              decode=labeled_decode)
+    ds = make(
+        comm,
+        monkeypatch,
+        Labeled(),
+        method,
+        encode=labeled_encode,
+        decode=labeled_decode,
+    )
     ok = labeled_ok(ds[7], 7) and labeled_ok(ds[N - 1], N - 1)
     idx = list(range(N))[::-2]
     ok &= all(labeled_ok(sm, i) for sm, i in zip(ds.__getitems__(idx), idx))
@@ -687,13 +716,15 @@ def test_method2_reader_decode(comm, monkeypatch, tmp_path):
     """The core group encodes, a DistDatasetReader decodes."""
     monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
     hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
-    core = DistDataset(Labeled(), "lab", comm, method=2, handshake_dir=hs,
-                       encode=labeled_encode)
+    core = DistDataset(
+        Labeled(), "lab", comm, method=2, handshake_dir=hs, encode=labeled_encode
+    )
     comm.Barrier()
     ok = True
     if comm.Get_rank() == 0:
-        reader = DistDatasetReader("lab", handshake_dir=hs, n_core=comm.Get_size(),
-                                   decode=labeled_decode)
+        reader = DistDatasetReader(
+            "lab", handshake_dir=hs, n_core=comm.Get_size(), decode=labeled_decode
+        )
         idx = list(range(N))
         ok = all(labeled_ok(sm, i) for sm, i in zip(reader.__getitems__(idx), idx))
         ok &= labeled_ok(reader[3], 3)

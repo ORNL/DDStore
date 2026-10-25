@@ -5,7 +5,9 @@ import sys
 
 # Document pyddstore from the source tree; its compiled core, MPI and torch
 # are mocked, so the docs build needs neither a compiler, MPI nor libfabric.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+)
 
 project = "DDStore"
 author = "Oak Ridge National Laboratory"

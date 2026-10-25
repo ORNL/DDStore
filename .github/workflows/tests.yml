@@ -1,0 +1,86 @@
+name: tests
+
+# Build both variants and run what a CPU-only runner can: method 0 (MPI RMA)
+# with 1, 2 and 4 ranks. Tests that need a CXI device, Slurm or a GPU skip
+# themselves; run those on an HPC system (docs/testing.md).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  black:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "black==26.5.1"
+      - run: black --check $(git ls-files '*.py')
+
+  mpi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mpi: [openmpi, mpich]
+    env:
+      OMPI_MCA_rmaps_base_oversubscribe: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: System packages
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.mpi }}" = openmpi ]; then
+            sudo apt-get install -y libopenmpi-dev openmpi-bin libfabric-dev pkg-config
+          else
+            sudo apt-get install -y libmpich-dev mpich libfabric-dev pkg-config
+          fi
+      - name: Python packages
+        run: |
+          pip install numpy Cython pytest setuptools wheel
+          pip install --no-binary mpi4py mpi4py
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build
+        run: CC=mpicc CXX=mpicxx pip install --no-build-isolation --no-deps -e .
+      - run: python -c "import pyddstore; assert pyddstore.HAVE_MPI"
+      - name: 1 rank
+        run: mpirun -n 1 python -m pytest -q -rfs test/test_single.py
+      - name: 2 ranks
+        run: mpirun -n 2 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
+      - name: 4 ranks
+        run: mpirun -n 4 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
+
+  nompi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libfabric-dev pkg-config
+      - run: pip install numpy Cython pytest setuptools wheel
+      - name: Build (DDSTORE_MPI=0)
+        run: DDSTORE_MPI=0 CC=gcc CXX=g++ pip install --no-build-isolation --no-deps -e .
+      - name: Import without MPI
+        run: |
+          python - <<'PY'
+          import sys, pyddstore
+          assert not pyddstore.HAVE_MPI
+          assert "mpi4py" not in sys.modules
+          PY

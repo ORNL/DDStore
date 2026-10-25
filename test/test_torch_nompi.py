@@ -270,5 +270,35 @@ def test_torch_distributed_group(file_comm, hs, monkeypatch):
     assert ok
 
 
+def test_disjoint_torch_groups(file_comm, hs):
+    """Two disjoint torch.distributed groups build datasets in one
+    handshake_dir at the same time: their exchange files must not mix."""
+    if file_comm.size < 2:
+        pytest.skip("needs 2 ranks")
+    init = os.path.join(hs, "torch2.init")
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init}",
+        rank=file_comm.rank,
+        world_size=file_comm.size,
+    )
+    try:
+        half = file_comm.size // 2
+        groups = [
+            dist.new_group(list(range(half))),
+            dist.new_group(list(range(half, file_comm.size))),
+        ]
+        mine = groups[file_comm.rank >= half]
+        ds = DistDataset(Source(), "dg", comm=mine, handshake_dir=hs, method=1)
+        ok = ds._comm.size == dist.get_world_size(mine) and read_all(ds)
+        finish(ds)
+        ok = all(file_comm.allgather(ok))
+    finally:
+        dist.destroy_process_group()
+    if file_comm.rank == 0 and os.path.exists(init):
+        os.remove(init)
+    assert ok
+
+
 def test_no_mpi4py_imported():
     assert "mpi4py" not in sys.modules

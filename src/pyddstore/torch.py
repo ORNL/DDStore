@@ -27,6 +27,7 @@ Import torch before mpi4py/MPI starts; ``from pyddstore.torch import ...``
 does that by itself.
 """
 
+import hashlib
 import json
 import logging
 import multiprocessing as mp
@@ -130,15 +131,16 @@ def _env_rank_size():
     return None
 
 
-_ns_count = 0
+_ns_counts = {}
 
 
-def _next_ns():
-    # Exchange names for the files of groups and stores; the same on every
-    # rank as long as every rank creates its datasets in the same order.
-    global _ns_count
-    _ns_count += 1
-    return f"p{_ns_count - 1}"
+def _next_ns(ns):
+    # Exchange names for group ns's subgroups and stores, "{ns}-{k}": counted
+    # per group, so they agree across its members as long as they create the
+    # group's datasets in the same order, whatever other groups they are in.
+    k = _ns_counts.get(ns, 0)
+    _ns_counts[ns] = k + 1
+    return f"{ns}-{k}"
 
 
 class _MpiComm:
@@ -178,7 +180,7 @@ class _NoMpiComm:
     def split(self, color, key):
         from ._core import FileComm
 
-        ns = _next_ns()
+        ns = _next_ns(self.ns)
         peers = self.allgather((color, key, self.rank))
         members = sorted((k, r) for c, k, r in peers if c == color)
         rank = members.index((key, self.rank))
@@ -202,7 +204,7 @@ class _NoMpiComm:
             handshake_dir=handshake_dir,
             rank=self.rank,
             size=self.size,
-            exchange_ns=f"{self.ns}-{_next_ns()}",
+            exchange_ns=_next_ns(self.ns),
         )
 
 
@@ -240,7 +242,11 @@ def _torch_comm(group, handshake_dir):
         dist.all_gather_object(out, obj, group=group)
         return out
 
-    return _NoMpiComm(rank, size, allgather, handshake_dir, "t")
+    # Named by its members, so that disjoint groups sharing handshake_dir
+    # never use the same exchange files
+    members = dist.get_process_group_ranks(group or dist.group.WORLD)
+    ns = "t" + hashlib.sha1(repr(sorted(members)).encode()).hexdigest()[:12]
+    return _NoMpiComm(rank, size, allgather, handshake_dir, ns)
 
 
 def _resolve_comm(comm, handshake_dir):

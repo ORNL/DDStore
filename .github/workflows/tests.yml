@@ -36,17 +36,25 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    # Open MPI: method 0 mixes a fence epoch (epoch_begin) with lock/unlock
-    # in get(), which MPICH tolerates but Open MPI does not (reads return
-    # zeros). Reported, not gating, until method 0 is fixed.
+    # Open MPI: method-0 reads return zeros on this runner; not gating while
+    # under investigation. osc: Open MPI's RMA component selection
+    # (OMPI_MCA_osc), "^ucx" to rule out UCX.
     continue-on-error: ${{ matrix.mpi == 'openmpi' }}
     strategy:
       fail-fast: false
       matrix:
-        mpi: [openmpi, mpich]
+        include:
+          - mpi: openmpi
+            osc: ""
+          - mpi: openmpi
+            osc: "^ucx"
+          - mpi: mpich
+            osc: ""
     env:
       OMPI_MCA_rmaps_base_oversubscribe: "1"
     steps:
+      - if: matrix.osc != ''
+        run: echo "OMPI_MCA_osc=${{ matrix.osc }}" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -67,6 +75,8 @@ jobs:
       - name: Build
         run: CC=mpicc CXX=mpicxx pip install --no-build-isolation --no-deps -e .
       - run: python -c "import pyddstore; assert pyddstore.HAVE_MPI"
+      - if: matrix.mpi == 'openmpi'
+        run: ompi_info | grep -E "MCA (osc|pml|btl)"
       - name: 1 rank
         run: mpirun -n 1 python -m pytest -q -rfs test/test_single.py
       - name: 2 ranks

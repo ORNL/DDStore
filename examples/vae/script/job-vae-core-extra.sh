@@ -96,6 +96,9 @@ REPLICATE="${REPLICATE:-1}"
 IMAGE_SCALE="${IMAGE_SCALE:-1}"
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
+# CPU->NIC map, computed once here instead of a hwloc query in every rank
+# (docs/backends.md). Empty on failure: ranks then query hwloc themselves.
+export DDSTORE_NIC_MAP="${DDSTORE_NIC_MAP:-$(python3 -m cpu_nic_map --env)}"
 export DDSTORE_METHOD="${METHOD:-2}"
 export VAE_PROFILE=1
 # Forked DataLoader workers read DDStore through their own endpoints; that

@@ -15,12 +15,12 @@
 
 The network interface (`FABRIC_IFACE`) is chosen per rank from its CPU affinity:
 
-- **`DDSTORE_NIC_MAP`**: a precomputed CPU→NIC map, used if set. Generate it in the batch step's shell (NIC discovery can fail inside nested `srun` tasks) and export it:
+- **`DDSTORE_NIC_MAP`** (recommended): a precomputed CPU→NIC map, used if set. Generate it once in the batch step's shell and export it:
   ```bash
   export DDSTORE_NIC_MAP=$(python3 -m cpu_nic_map --env)
   srun ... python train.py
   ```
-- Otherwise each rank queries `hwloc` for its nearest NIC (`python3 cpu_nic_map.py --allocated` to check).
+- Otherwise each rank queries `hwloc` for its nearest NIC (`python3 cpu_nic_map.py --allocated` to check). On Frontier compute nodes this took 8–18 s per process, versus under 0.01 s with the map, and NIC discovery can fail inside nested `srun` tasks.
 - `FABRIC_IFACE=hsn0` forces an interface; `PyDDStore(..., nic_map="hsn0=0-15,64-79;...")` passes a map directly.
 
 ## File-based handshake (`method=2`)

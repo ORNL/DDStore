@@ -11,6 +11,12 @@ sbatch examples/vae/script/job-vae-core-extra.sh                       # split-n
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --core-nnodes=2
 ```
 
+For your own scripts using methods 1/2, export the CPU→NIC map in the batch step before `srun` so ranks skip the per-process `hwloc` query ([details](backends.md#libfabric-rdma-method1)):
+
+```bash
+export DDSTORE_NIC_MAP=$(python3 -m cpu_nic_map --env)
+```
+
 On Perlmutter (detected via `NERSC_HOST`) the scripts use 4 ranks per node, each seeing its node's 4 GPUs (needed by NCCL). Override the `#SBATCH` lines:
 
 ```bash

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """CPU <-> nearest HSN (Slingshot) NIC topology, and FABRIC_IFACE auto-selection.
 
-Requires: module load hwloc  (or lstopo/hwloc-calc on PATH)
+Reads the topology from sysfs (NIC local_cpulist/numa_node, NUMA node
+cpulists); falls back to hwloc-calc (module load hwloc) only if sysfs lacks
+the CPU/NUMA lists.
 
 Three layers, one file:
-  - build_map()/serialize_env()/parse_env(): pure hwloc-calc topology query,
-    independent of any particular process's CPU affinity.
+  - build_map()/serialize_env()/parse_env(): topology query, independent of
+    any particular process's CPU affinity.
   - allocated_nics(): affinity-aware wrapper — which NIC(s) is *this
     process*, given its actual pinning (os.sched_getaffinity), closest to.
   - select_fabric_iface(): called automatically by PyDDStore.__cinit__
@@ -58,13 +60,17 @@ def hcalc(loc, itype):
     return [int(x) for x in out.split(",")] if out else []
 
 
-def _sysfs_cpulist(name):
-    """Parse /sys/class/net/<name>/device/local_cpulist into a set of PU ids."""
-    path = f"/sys/class/net/{name}/device/local_cpulist"
+# sysfs root; tests point it at a fake tree.
+SYSFS = "/sys"
+
+
+def _read_cpulist(path):
+    """Parse a kernel cpulist file ("0-15,64-79") into a set of PU ids, or
+    None if the file can't be read."""
     try:
         text = open(path).read().strip()
     except OSError:
-        return set()
+        return None
     pus = set()
     for part in text.split(","):
         part = part.strip()
@@ -76,9 +82,14 @@ def _sysfs_cpulist(name):
     return pus
 
 
+def _sysfs_cpulist(name):
+    """Parse /sys/class/net/<name>/device/local_cpulist into a set of PU ids."""
+    return _read_cpulist(f"{SYSFS}/class/net/{name}/device/local_cpulist") or set()
+
+
 def _sysfs_numa(name):
     """Read /sys/class/net/<name>/device/numa_node; returns int or None."""
-    path = f"/sys/class/net/{name}/device/numa_node"
+    path = f"{SYSFS}/class/net/{name}/device/numa_node"
     try:
         val = int(open(path).read().strip())
         return val if val >= 0 else None
@@ -89,7 +100,7 @@ def _sysfs_numa(name):
 def build_map(pattern):
     nics = sorted(
         os.path.basename(p)
-        for p in glob.glob("/sys/class/net/*")
+        for p in glob.glob(f"{SYSFS}/class/net/*")
         if os.path.exists(os.path.join(p, "device"))
         and fnmatch.fnmatch(os.path.basename(p), pattern)
     )
@@ -140,10 +151,22 @@ def build_map(pattern):
     for n, numa in nic_numa.items():
         numa_to_nics.setdefault(numa, []).append(n)
 
-    all_pus = hcalc("all", "PU")
+    # Online PUs and each NIC NUMA node's PUs, as OS (physical) ids. sysfs
+    # lists every online CPU, including ones excluded from jobs by core
+    # specialization, the same set as hwloc-calc --disallowed -p; reading it
+    # avoids hwloc's topology load (seconds per process on GPU nodes).
+    numas = [n for n in numa_to_nics if n is not None]
+    online = _read_cpulist(f"{SYSFS}/devices/system/cpu/online")
+    node_pus = {
+        n: _read_cpulist(f"{SYSFS}/devices/system/node/node{n}/cpulist") for n in numas
+    }
+    if online is None or any(v is None for v in node_pus.values()):
+        online = set(hcalc("all", "PU"))
+        node_pus = {n: set(hcalc(f"NUMA:{n}", "PU")) for n in numas}
+    all_pus = sorted(online)
     pu_numa = {}
-    for numa in numa_to_nics:
-        for pu in hcalc(f"NUMA:{numa}", "PU"):
+    for numa, pus in node_pus.items():
+        for pu in pus:
             pu_numa[pu] = numa
 
     def nearest(pu):
@@ -214,14 +237,14 @@ def allocated_nics(pattern="hsn*", nic_map=None):
     nic_map: an explicit precomputed map string (see serialize_env()/--env
     format), taking priority over the DDSTORE_NIC_MAP env var. Pass this
     when the caller already has the map from somewhere other than the
-    process environment. Falls back to a live hwloc-calc query when neither
-    is available.
+    process environment. Falls back to a live topology query (build_map)
+    when neither is available.
 
-    Prefer a precomputed map: hwloc-calc's NIC/PCI visibility has been
+    A precomputed map is still preferred: NIC/PCI visibility has been
     observed to fail silently inside some srun tasks, so computing the map
     once (e.g. in the sbatch batch step's own shell, where NIC visibility is
     reliable) and sharing it -- via DDSTORE_NIC_MAP or the nic_map argument
-    -- is more robust than querying hwloc fresh in every rank.
+    -- is more robust than querying fresh in every rank.
     """
     allocated = sorted(os.sched_getaffinity(0))
     map_str = nic_map if nic_map is not None else os.environ.get("DDSTORE_NIC_MAP")
@@ -250,7 +273,7 @@ def allocated_nics(pattern="hsn*", nic_map=None):
 def select_fabric_iface(nic_map=None):
     """Pick the libfabric NIC (FABRIC_IFACE) for this process, if not
     already set. Defers to allocated_nics(), which uses nic_map when given,
-    else DDSTORE_NIC_MAP when set, or a live hwloc-calc/lstopo query
+    else DDSTORE_NIC_MAP when set, or a live topology query
     (build_map) against this process's real CPU affinity when neither is.
 
     Called automatically by PyDDStore.__cinit__ (src/pyddstore/_core.pyx) for
@@ -265,7 +288,7 @@ def select_fabric_iface(nic_map=None):
       - cxi: the kernel NIC names are hsn0-hsn3, but the cxi provider
         exposes them as cxi0-cxi3, so the result is translated hsnN -> cxiN
         (Frontier and Perlmutter alike). Also adds a
-        SLURM_LOCALID round-robin fallback for when hwloc can't map this
+        SLURM_LOCALID round-robin fallback for when the topology query can't map this
         rank's CPU affinity to a NIC (common inside srun tasks with limited
         PCI visibility).
     """
@@ -321,7 +344,7 @@ def select_fabric_iface(nic_map=None):
 def main():
     parser = argparse.ArgumentParser(
         description="Find the nearest HSN (Slingshot) NIC for a given CPU (PU) id, "
-        "based on hwloc PCI/NUMA locality.",
+        "based on sysfs PCI/NUMA locality.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"

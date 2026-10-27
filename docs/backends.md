@@ -20,7 +20,7 @@ The network interface (`FABRIC_IFACE`) is chosen per rank from its CPU affinity:
   export DDSTORE_NIC_MAP=$(python3 -m cpu_nic_map --env)
   srun ... python train.py
   ```
-- Otherwise each rank queries `hwloc` for its nearest NIC (`python3 cpu_nic_map.py --allocated` to check). On Frontier compute nodes this took 8–18 s per process, versus under 0.01 s with the map, and NIC discovery can fail inside nested `srun` tasks.
+- Otherwise each rank finds its nearest NIC from sysfs (`python3 cpu_nic_map.py --allocated` to check), in about 1 ms; `hwloc-calc` is used only if sysfs lacks the CPU/NUMA lists. NIC discovery can fail inside nested `srun` tasks, hence the recommendation above.
 - `FABRIC_IFACE=hsn0` forces an interface; `PyDDStore(..., nic_map="hsn0=0-15,64-79;...")` passes a map directly.
 
 ## File-based handshake (`method=2`)

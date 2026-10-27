@@ -95,8 +95,8 @@ for arg in "$@"; do
 done
 
 export DDSTORE_FABRIC="${FABRIC:-cxi}"
-# CPU->NIC map, computed once here instead of a hwloc query in every rank
-# (docs/backends.md). Empty on failure: ranks then query hwloc themselves.
+# CPU->NIC map, computed once here instead of a topology query in every rank
+# (docs/backends.md). Empty on failure: ranks then query the topology themselves.
 export DDSTORE_NIC_MAP="${DDSTORE_NIC_MAP:-$(python3 -m cpu_nic_map --env)}"
 # Forked DataLoader workers read DDStore through their own endpoints; that
 # needs a fork-safe libfabric MR cache monitor (see docs/pytorch.md).

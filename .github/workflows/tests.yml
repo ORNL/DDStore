@@ -109,3 +109,5 @@ jobs:
           assert not pyddstore.HAVE_MPI
           assert "mpi4py" not in sys.modules
           PY
+      - name: NIC map (fake sysfs trees)
+        run: python -m pytest -q -rs test/test_cpu_nic_map.py

@@ -8,7 +8,7 @@
 |---|---|---|
 | `DDSTORE_FABRIC` | `hsn` | libfabric provider for `method=1`/`2`: `hsn` (`tcp;ofi_rxm`) or `cxi` (native Slingshot; required for [GPUDirect RDMA](gpudirect.md)). See [libfabric RDMA](backends.md#libfabric-rdma-method1). |
 | `FABRIC_IFACE` | auto | Network interface for `method=1`/`2` (e.g. `cxi0`, `hsn0`); default from the rank's CPU affinity. |
-| `DDSTORE_NIC_MAP` | unset | Precomputed CPU→NIC map (`python3 -m cpu_nic_map --env`) instead of a live hwloc query; `nic_map=` takes priority. |
+| `DDSTORE_NIC_MAP` | unset | Precomputed CPU→NIC map (`python3 -m cpu_nic_map --env`) instead of a live hwloc query per process (recommended: the query took 8–18 s per process on Frontier); `nic_map=` takes priority. |
 | `DDSTORE_HANDSHAKE_DIR` | `./ddstore_hs` | `method=2` handshake directory (C++ API and examples; `PyDDStore` takes `handshake_dir`). Shared filesystem. |
 | `DDSTORE_HANDSHAKE_TIMEOUT_S` | `300` | Seconds `join()` and file exchanges [without MPI](backends.md#without-mpi-methods-1-and-2) wait. |
 | `DDSTORE_SESSION` | `{SLURM_JOB_ID}_{SLURM_STEP_ID}`, else `0` | Without MPI: exchange file prefix, so runs can share a directory. Same on all ranks. |

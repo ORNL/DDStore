@@ -379,17 +379,7 @@ void DDStore::free()
         }
 
         if (var.owns_base && var.base)
-        {
-#ifdef DDSTORE_HAVE_MPI
-            if (var.mpi_mem)
-            {
-                if (!finalized)
-                    MPI_Free_mem(var.base);
-            }
-            else
-#endif
-                ::free(var.base);
-        }
+            free_base(var.base, var.base_alloc, var.base_len);
         var.base = NULL;
         var.owns_base = false;
         var.active = false;

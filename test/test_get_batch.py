@@ -327,3 +327,41 @@ def test_wide_rows(comm, monkeypatch, method):
     comm.Barrier()
     finish(store)
     assert all_passed(comm, ok)
+
+
+def _anon_ranges():
+    """(start, end) of this process's mappings, from /proc/self/maps."""
+    out = set()
+    with open("/proc/self/maps") as f:
+        for line in f:
+            lo, hi = line.split()[0].split("-")
+            out.add((int(lo, 16), int(hi, 16)))
+    return out
+
+
+@pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
+def test_shard_not_in_forked_child(comm, monkeypatch):
+    """Methods 1/2 map the shard MADV_DONTFORK: a forked child doesn't map it
+    (registered pages would otherwise be copied into every child)."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    rank = comm.Get_rank()
+    nbytes = 64 << 20
+    data = np.full((64, 1 << 20), rank, dtype=np.uint8)
+    before = _anon_ranges()
+    store = dds.PyDDStore(comm, method=1)
+    store.add("big", data)
+    # the shard's own mapping: new, and exactly its (page-rounded) size
+    shard = [m for m in _anon_ranges() - before if m[1] - m[0] == nbytes]
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child: no MPI, no store; report and leave
+        os.close(r)
+        mine = _anon_ranges()
+        os.write(w, b"1" if not any(m in mine for m in shard) else b"0")
+        os._exit(0)
+    os.close(w)
+    absent = os.read(r, 1) == b"1"
+    os.close(r)
+    os.waitpid(pid, 0)
+    store.free()
+    assert all_passed(comm, len(shard) == 1 and absent), f"shard mappings {shard}"

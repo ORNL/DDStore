@@ -225,7 +225,9 @@ def test_fork_reader_refuses_kdreg2(file_comm, hs, monkeypatch):
 
 
 def test_error_raised_on_every_rank(file_comm, hs):
-    with pytest.raises(ValueError, match="differs"):
+    # "differs from" (one rank sees it) or "differ ... across ranks" (a
+    # rank's first sample is the bad one, with more ranks).
+    with pytest.raises(ValueError, match="differ"):
         DistDataset(Bad(), "bad", handshake_dir=hs, method=1)
 
 

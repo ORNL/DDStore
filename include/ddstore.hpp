@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstdint>
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -12,6 +13,7 @@
 #include <typeinfo>
 #include <vector>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -34,6 +36,14 @@ static inline void ddstore_mpi_check(int rc, const char *what, const char *hint 
 }
 #endif
 
+/* How alloc_base() got a store's own host buffer, for free_base(). */
+enum BaseAlloc
+{
+    BASE_ALIGNED = 0, /* posix_memalign */
+    BASE_MPI,         /* MPI_Alloc_mem */
+    BASE_MMAP         /* private anonymous mapping, MADV_DONTFORK */
+};
+
 struct VarInfo
 {
     std::string name;
@@ -50,7 +60,8 @@ struct VarInfo
      * must release it; false for a caller-owned GPU buffer (add() with
      * hmem_iface != 0) or a joined variable (base == NULL).               */
     bool owns_base;
-    bool mpi_mem = false; /* base came from MPI_Alloc_mem, not posix_memalign */
+    int base_alloc = BASE_ALIGNED; /* BaseAlloc, if owns_base */
+    size_t base_len = 0;            /* mapping length, for BASE_MMAP */
     struct fabric_state *fabric_state;
     /* Methods 1/2: every core rank's record (address, key, rows), kept so
      * fork_reader() can open a new endpoint onto the same data.          */
@@ -171,10 +182,11 @@ public:
             throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
 
         void *base = NULL;
-        bool mpi_mem = false;
+        int how = BASE_ALIGNED;
+        size_t len = 0;
         if (hmem_iface == 0)
         {
-            base = alloc_base((size_t)nrows * disp * sizeof(T), mpi_mem);
+            base = alloc_base((size_t)nrows * disp * sizeof(T), how, len);
             memcpy(base, buffer, (size_t)nrows * disp * sizeof(T));
         }
         else
@@ -185,15 +197,16 @@ public:
             base = (void *)buffer;
         }
         this->add_base(name, base, nrows, disp, (int)sizeof(T), hmem_iface,
-                       hmem_iface == 0, mpi_mem);
+                       hmem_iface == 0, how, len);
     }
 
     void init(std::string name, long nrows, int disp, int itemsize)
     {
-        bool mpi_mem = false;
-        void *base = alloc_base((size_t)nrows * disp * itemsize, mpi_mem);
+        int how = BASE_ALIGNED;
+        size_t len = 0;
+        void *base = alloc_base((size_t)nrows * disp * itemsize, how, len);
         memset(base, 0, (size_t)nrows * disp * itemsize);
-        this->add_base(name, base, nrows, disp, itemsize, 0, true, mpi_mem);
+        this->add_base(name, base, nrows, disp, itemsize, 0, true, how, len);
     }
 
     template <typename T>
@@ -395,14 +408,41 @@ public:
     }
 
 private:
-    /* Allocate `bytes` for a store's own copy of a variable: MPI_Alloc_mem
-     * when MPI is built in and initialized (needed for MPI windows, and it
-     * was needed to avoid memory errors with Cray MPICH), otherwise
-     * page-aligned posix_memalign. mpi_mem says which, for free().        */
-    static void *alloc_base(size_t bytes, bool &mpi_mem)
+    /* Allocate `bytes` for a store's own copy of a variable; `how` and
+     * `len` record how, for free_base().
+     *
+     * Methods 1/2: a private anonymous mapping marked MADV_DONTFORK
+     * (unless DDSTORE_DONTFORK=0). The buffer is registered with the NIC,
+     * and Linux (5.12+) copies pinned pages into a child at fork() instead
+     * of sharing them, so every forked process (DataLoader worker,
+     * subprocess) would otherwise get a private copy of the shard. Children
+     * never use it: fork_reader() reads it over RDMA like any remote rank.
+     * Its own mapping, so MADV_DONTFORK covers nothing else.
+     *
+     * Method 0 (and DDSTORE_DONTFORK=0): MPI_Alloc_mem when MPI is built
+     * in and initialized (needed for MPI windows, and it was needed to
+     * avoid memory errors with Cray MPICH), otherwise page-aligned
+     * posix_memalign.                                                      */
+    void *alloc_base(size_t bytes, int &how, size_t &len) const
     {
         void *base = NULL;
-        mpi_mem = false;
+        how = BASE_ALIGNED;
+        len = bytes;
+        const char *df = getenv("DDSTORE_DONTFORK");
+        if (this->method != 0 && !(df && strcmp(df, "0") == 0))
+        {
+            size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            if (bytes > SIZE_MAX - (page - 1))
+                throw std::bad_alloc(); /* can't round up (e.g. nrows < 0) */
+            len = std::max(page, (bytes + page - 1) / page * page);
+            base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED)
+                throw std::bad_alloc();
+            if (madvise(base, len, MADV_DONTFORK) != 0)
+                perror("DDStore: madvise(MADV_DONTFORK) (forked processes will copy the shard)");
+            how = BASE_MMAP;
+            return base;
+        }
 #ifdef DDSTORE_HAVE_MPI
         int initialized = 0, finalized = 0;
         MPI_Initialized(&initialized);
@@ -411,7 +451,7 @@ private:
         {
             if (MPI_Alloc_mem((MPI_Aint)bytes, MPI_INFO_NULL, &base) != MPI_SUCCESS)
                 throw std::bad_alloc();
-            mpi_mem = true;
+            how = BASE_MPI;
             return base;
         }
 #endif
@@ -420,11 +460,30 @@ private:
         return base;
     }
 
+    /* Release a buffer from alloc_base(). BASE_MPI is skipped after
+     * MPI_Finalize (MPI_Free_mem is no longer callable).                   */
+    static void free_base(void *base, int how, size_t len)
+    {
+        if (how == BASE_MMAP)
+            munmap(base, len);
+#ifdef DDSTORE_HAVE_MPI
+        else if (how == BASE_MPI)
+        {
+            int finalized = 0;
+            MPI_Finalized(&finalized);
+            if (!finalized)
+                MPI_Free_mem(base);
+        }
+#endif
+        else
+            ::free(base);
+    }
+
     /* add()/init() after the buffer is in place: expose `base` (nrows rows
      * of disp items of itemsize bytes) through this store's method and
      * record the variable. Collective over the store's ranks.              */
     void add_base(const std::string &name, void *base, long nrows, int disp, int itemsize,
-                  int hmem_iface, bool owns_base, bool mpi_mem)
+                  int hmem_iface, bool owns_base, int how, size_t len)
     {
         VarInfo_t var;
         var.name         = name;
@@ -434,7 +493,8 @@ private:
         var.epoch_active = false;
         var.base         = base;
         var.owns_base    = owns_base;
-        var.mpi_mem      = mpi_mem;
+        var.base_alloc   = how;
+        var.base_len     = len;
         var.fabric_state = NULL;
 
         if (this->method == 0)
@@ -449,7 +509,7 @@ private:
             if (rc != MPI_SUCCESS)
             {
                 if (owns_base)
-                    mpi_mem ? (void)MPI_Free_mem(base) : ::free(base);
+                    free_base(base, how, len);
                 /* Typically no RMA (osc) component accepts the window: with
                  * Open MPI 4.1 and no RDMA NIC, osc/pt2pt is the only choice
                  * and it rejects MPI_THREAD_MULTIPLE (mpi4py's default);

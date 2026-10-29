@@ -76,6 +76,7 @@ for x, y in loader:
 ```
 
 - **How it works**: each worker opens its own reader (`PyDDStore.fork_reader()`) on first read; the inherited store is not used.
+- **Shard memory is not copied into workers**: methods 1/2 keep each rank's shard in its own mapping marked `MADV_DONTFORK`. The shard is registered with the NIC, and Linux copies registered (pinned) pages into a child at `fork()`; without this every worker got a private copy of its rank's shard. A child has no shard memory and reads it over RDMA like any other rank. `DDSTORE_DONTFORK=0` turns this off.
 - **Host memory only**: a forked process can't use CUDA/HIP, so `device=` is ignored and samples are returned on the CPU; move batches in the training loop (`pin_memory=True` helps). Data stored on the GPU (`add_device=`) is still readable.
 
   | GPUDirect | forked `DataLoader` worker | `ThreadDataLoader` thread |

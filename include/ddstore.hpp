@@ -1,4 +1,5 @@
 #include <iostream>
+#include <cstdint>
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -431,6 +432,8 @@ private:
         if (this->method != 0 && !(df && strcmp(df, "0") == 0))
         {
             size_t page = (size_t)sysconf(_SC_PAGESIZE);
+            if (bytes > SIZE_MAX - (page - 1))
+                throw std::bad_alloc(); /* can't round up (e.g. nrows < 0) */
             len = std::max(page, (bytes + page - 1) / page * page);
             base = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (base == MAP_FAILED)

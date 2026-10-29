@@ -344,6 +344,7 @@ def test_shard_not_in_forked_child(comm, monkeypatch):
     """Methods 1/2 map the shard MADV_DONTFORK: a forked child doesn't map it
     (registered pages would otherwise be copied into every child)."""
     monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    monkeypatch.setenv("DDSTORE_DONTFORK", "1")
     rank = comm.Get_rank()
     nbytes = 64 << 20
     data = np.full((64, 1 << 20), rank, dtype=np.uint8)
@@ -365,3 +366,15 @@ def test_shard_not_in_forked_child(comm, monkeypatch):
     os.waitpid(pid, 0)
     store.free()
     assert all_passed(comm, len(shard) == 1 and absent), f"shard mappings {shard}"
+
+
+@pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
+def test_init_size_too_large(comm, monkeypatch):
+    """A size that can't be rounded up to a page (nrows=-1 is SIZE_MAX
+    bytes) is rejected, not wrapped to a one-page mapping."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    monkeypatch.setenv("DDSTORE_DONTFORK", "1")
+    store = dds.PyDDStore(comm, method=1)
+    with pytest.raises(MemoryError):
+        store.init("huge", -1, 1)
+    store.free()

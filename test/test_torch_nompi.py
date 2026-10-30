@@ -372,6 +372,23 @@ def test_torch_split(torch_world, hs):
     assert comm.allgather(why) == [[]] * comm.size
 
 
+@pytest.mark.parametrize("kind", ["file", "torch"])
+def test_dist_store(file_comm, hs, request, kind):
+    """Two datasets on one DistStore over files or torch.distributed."""
+    comm = request.getfixturevalue("torch_world") if kind == "torch" else file_comm
+    group = dist.group.WORLD if kind == "torch" else None
+    store = pt.DistStore(group, method=1, handshake_dir=hs)
+    a = DistDataset(Source(), "sa", store)
+    b = DistDataset(Source(), "sb", store)
+    ok = a.ddstore is b.ddstore and read_all(a, num_workers=2) and read_all(b)
+    ok &= a._readers is b._readers
+    with pytest.raises(ValueError, match="already a dataset"):
+        DistDataset(Source(), "sa", store)
+    comm.allgather(None)
+    store.free()
+    assert all(comm.allgather(ok))
+
+
 def test_store_allgather_callback(file_comm):
     """PyDDStore(allgather=): records go through the given function."""
     calls = []

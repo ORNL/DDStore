@@ -33,7 +33,7 @@ Independent stores per group of ranks: `comm.Split()` and pass the sub-communica
 
 ## `init(name, nrows, disp, itemsize=1)`
 
-Pre-allocate a named variable without providing data yet. Use `update()` to fill it in afterwards. **Collective**.
+Pre-allocate a named variable without providing data yet. Use `update()` to fill it in afterwards. **Collective**. Raises `ValueError` if `name` is in use (as do `add()` and `join()`).
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -137,6 +137,12 @@ A read-only `PyDDStore` for the same variables, with its own libfabric endpoints
 
 ---
 
+## `has(name)`
+
+`True` if variable `name` is added or joined and not freed.
+
+---
+
 ## `info(name)`
 
 Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed or `join()`-ed. Useful on the extra side to size output buffers without hardcoding shapes.
@@ -151,7 +157,7 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 ## `free()`
 
-Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`.
+Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`. Freed names can be added again.
 
 ---
 

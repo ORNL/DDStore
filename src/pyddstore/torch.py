@@ -7,6 +7,9 @@
   each field's shape and dtype. ``__getitems__`` reads a whole batch with one
   ``PyDDStore.get_batch()`` per field, which PyTorch's ``DataLoader`` uses
   automatically.
+- ``DistStore``: one store for several ``DistDataset``\ s (train, val, test)
+  on the same ranks, with ``comm``, ``method`` and ``handshake_dir`` given
+  once and one ``free()``.
 - ``DistDatasetReader``: the same, as a ``method=2`` extra member that joins a
   dataset published by a ``DistDataset`` core group through a shared
   handshake directory.
@@ -36,6 +39,7 @@ import queue
 import socket
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -47,6 +51,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DistDataset",
     "DistDatasetReader",
+    "DistStore",
     "ThreadDataLoader",
     "WindowedDataset",
     "row_of",
@@ -457,51 +462,81 @@ class _Encoded(Dataset):
         return self.encode(self.source[i])
 
 
+class _Readers:
+    """A store and the readers this process makes from it, shared by every
+    dataset on the store.
+
+    In a process forked from the one that made the store (a PyTorch
+    DataLoader worker), get() returns a store of that process's own
+    (``PyDDStore.fork_reader()``, opened on first use): the inherited
+    store's endpoint belongs to the parent. ThreadDataLoader worker thread i
+    reads through reader i (see ThreadDataLoader): its own endpoint, so
+    threads don't wait on each other's reads. Kept per slot, so later
+    loaders reuse them."""
+
+    def __init__(self, store):
+        self.store, self.owner_pid = store, os.getpid()
+        self.thread_readers = store.method in (1, 2) and os.environ.get(
+            "DDSTORE_THREAD_READERS", "1"
+        ) not in ("", "0")
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        # after new variables: readers made before don't have them (one in
+        # use stays alive until its reads finish)
+        self.fork_store = self.fork_pid = None
+        self.readers = {}
+
+    def get(self):
+        pid = os.getpid()
+        if pid != self.owner_pid:
+            if self.fork_pid != pid:
+                self.fork_store = self.store.fork_reader()
+                self.fork_pid = pid
+            return self.fork_store
+        slot = getattr(_loader_thread, "slot", None)
+        if slot is None or not self.thread_readers:
+            return self.store
+        readers = self.readers
+        store = readers.get(slot)
+        if store is None:
+            with self.lock:
+                store = readers.get(slot)
+                if store is None:
+                    store = readers[slot] = self.store.fork_reader()
+        return store
+
+
 class _StoreDataset(Dataset):
     """Reads samples described by `self.schema` from `self.ddstore`.
 
     In a process forked from the one that made the store (a PyTorch
-    DataLoader worker), `ddstore` is a store of that process's own
-    (``PyDDStore.fork_reader()``, opened on first use) and `device` is None:
-    the inherited store's endpoint and the GPU belong to the parent."""
+    DataLoader worker), `ddstore` is a store of that process's own and
+    `device` is None: the GPU belongs to the parent (see _Readers)."""
 
-    _owner_pid = None
+    _handle = None
 
     @property
     def ddstore(self):
-        pid = os.getpid()
-        if pid != self._owner_pid:
-            if self._fork_pid != pid:
-                self._fork_store = self._ddstore.fork_reader()
-                self._fork_pid = pid
-            return self._fork_store
-        slot = getattr(_loader_thread, "slot", None)
-        if slot is None or not self._thread_readers:
-            return self._ddstore
-        store = self._readers.get(slot)
-        if store is None:
-            with self._readers_lock:
-                store = self._readers.get(slot)
-                if store is None:
-                    store = self._readers[slot] = self._ddstore.fork_reader()
-        return store
+        return self._handle.get()
 
     @ddstore.setter
     def ddstore(self, store):
-        self._ddstore, self._owner_pid = store, os.getpid()
-        self._fork_store = self._fork_pid = None
-        # ThreadDataLoader worker thread i reads through reader i (see
-        # ThreadDataLoader): its own endpoint, so threads don't wait on each
-        # other's reads. Kept per slot, so later loaders reuse them.
-        self._thread_readers = store.method in (1, 2) and os.environ.get(
-            "DDSTORE_THREAD_READERS", "1"
-        ) not in ("", "0")
-        self._readers, self._readers_lock = {}, threading.Lock()
+        self._handle = _Readers(store)
+
+    @property
+    def _ddstore(self):
+        return self._handle.store
+
+    @property
+    def _readers(self):
+        return self._handle.readers
 
     def get_profile(self, name):
         """``PyDDStore.get_profile(name)`` summed over the store and the
         ThreadDataLoader worker threads' readers of this process."""
-        stores = [self._ddstore, *self._readers.values()]
+        stores = [self._handle.store, *self._handle.readers.values()]
         tot = {}
         for st in stores:
             for k, v in st.get_profile(name).items():
@@ -510,7 +545,8 @@ class _StoreDataset(Dataset):
 
     @property
     def device(self):
-        return self._device if self._owner_pid in (None, os.getpid()) else None
+        own = self._handle is None or self._handle.owner_pid == os.getpid()
+        return self._device if own else None
 
     @device.setter
     def device(self, device):
@@ -746,6 +782,93 @@ def _rows(values, dtype):
     )
 
 
+# method=2 datasets of this process, by (handshake_dir, name): another
+# live store publishing the same name there would overwrite its files
+_published = weakref.WeakValueDictionary()
+
+
+class DistStore:
+    """One DDStore for several ``DistDataset``\ s on the same ranks.
+
+      store = DistStore(comm, method=2, handshake_dir=hs)
+      train = DistDataset(train_source, "train", store)
+      val = DistDataset(val_source, "val", store)
+      ...
+      store.free()
+
+    Args:
+        comm: as for ``DistDataset``: an mpi4py communicator, a
+            ``torch.distributed`` process group, or None.
+        method, handshake_dir, ddstore_width: as for ``DistDataset``; every
+            dataset of the store uses them.
+
+    The datasets' variables (``name/k``) live in one ``PyDDStore``
+    (``store.ddstore``), and a forked DataLoader worker or ThreadDataLoader
+    thread opens one reader for all of them. Dataset names must differ
+    (``store.names``); with ``method=2`` they must also differ from those of
+    other live stores in the same ``handshake_dir``. Every rank creates the
+    datasets in the same order. ``free()`` frees all of them.
+    """
+
+    def __init__(self, comm=None, method=None, handshake_dir=None, ddstore_width=None):
+        self.handshake_dir = _handshake_dir(handshake_dir)
+        self._comm = _resolve_comm(comm, self.handshake_dir)
+        self.rank = self._comm.rank
+        self.comm_size = self._comm.size
+        self.ddstore_width = (
+            ddstore_width if ddstore_width is not None else self.comm_size
+        )
+        if method is None:
+            method = os.environ.get("DDSTORE_METHOD", "0" if self._comm.is_mpi else "1")
+        self.method = int(method)
+        if self.method == 0 and not self._comm.is_mpi:
+            raise ValueError("method=0 needs an MPI communicator; use method=1 or 2")
+        if self.method == 2 and self.ddstore_width != self.comm_size:
+            raise NotImplementedError(
+                "method=2 does not support ddstore_width < comm size (groups would "
+                "collide on the same handshake directory)"
+            )
+        self._group = self._comm.split(self.rank // self.ddstore_width, self.rank)
+        self.ddstore = self._group.store(self.method, self.handshake_dir)
+        self._handle = _Readers(self.ddstore)
+        self.names = []
+        self._first_var = {}
+        self._freed = False
+
+    def _check_name(self, name):
+        # the same on every rank, so every rank raises together
+        if self._freed:
+            raise RuntimeError("this DistStore has been freed")
+        if name in self.names and self._live(name):
+            raise ValueError(f"{name!r} is already a dataset of this DistStore")
+        if self.method == 2:
+            key = (os.path.realpath(self.handshake_dir), name)
+            other = _published.get(key)
+            if other is not None and other is not self and other._live(name):
+                raise ValueError(
+                    f"{name!r} is already published in {self.handshake_dir} by "
+                    "another DistStore (method=2 datasets there need distinct names)"
+                )
+
+    def _live(self, name):
+        # name's variables still in this store (not freed, here or through
+        # ds.ddstore.free())
+        return not self._freed and self.ddstore.has(self._first_var[name])
+
+    def _added(self, name, first_var):
+        if name not in self.names:
+            self.names.append(name)
+        self._first_var[name] = first_var
+        if self.method == 2:
+            _published[(os.path.realpath(self.handshake_dir), name)] = self
+        self._handle.reset()
+
+    def free(self):
+        """Free every dataset of this store (collective)."""
+        self.ddstore.free()
+        self._freed = True
+
+
 class DistDataset(_StoreDataset):
     """A map-style dataset stored in DDStore across the ranks of `comm`.
 
@@ -754,8 +877,9 @@ class DistDataset(_StoreDataset):
             rank loads only its contiguous share. Every sample must have the
             same structure, and each field the same shape and dtype.
         name: dataset name; field ``k`` is stored as variable ``name/k``.
-        comm: an mpi4py communicator, a ``torch.distributed`` process group,
-            or None (default) for ``MPI.COMM_WORLD`` in an MPI build, else
+        comm: a ``DistStore`` to add this dataset to, an mpi4py
+            communicator, a ``torch.distributed`` process group, or None
+            (default) for ``MPI.COMM_WORLD`` in an MPI build, else
             the default ``torch.distributed`` group if initialized, else
             files in ``handshake_dir`` with rank and size from the launcher
             (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
@@ -766,6 +890,8 @@ class DistDataset(_StoreDataset):
             allgather, else through files in ``handshake_dir``.
         ddstore_width: ranks per independent store (default: all of
             ``comm``); each group holds a full copy of the dataset.
+            With a ``DistStore``, ``ddstore_width``, ``method`` and
+            ``handshake_dir`` are the store's: don't pass them.
         device: put tensor fields of read samples on this device
             (GPUDirect RDMA; needs ``method`` 1/2 and ``DDSTORE_FABRIC=cxi``).
         add_device: keep this rank's share of tensor fields on this device.
@@ -795,7 +921,8 @@ class DistDataset(_StoreDataset):
 
     ``ds[i]`` returns a sample with the source's structure: tensors stay
     tensors (on ``device`` if given), numpy arrays stay arrays, numbers stay
-    numbers. ``ds.ddstore`` is the underlying ``PyDDStore``.
+    numbers. ``ds.store`` is its ``DistStore`` (its own unless one was
+    passed) and ``ds.ddstore`` the underlying ``PyDDStore``.
 
     With ``method=0``, batched reads are collective: every rank must read the
     same number of batches (DistributedSampler does that) from one thread.
@@ -825,25 +952,25 @@ class DistDataset(_StoreDataset):
             source = _Encoded(source, encode)
         self._decode = decode
 
-        hs = _handshake_dir(handshake_dir)
-        self._comm = _resolve_comm(comm, hs)
-        self.rank = self._comm.rank
-        self.comm_size = self._comm.size
+        if isinstance(comm, DistStore):
+            if (ddstore_width, method, handshake_dir) != (None, None, None):
+                raise ValueError(
+                    "ddstore_width, method and handshake_dir are the DistStore's; "
+                    "don't pass them with one"
+                )
+            store = comm
+        else:
+            store = DistStore(comm, method, handshake_dir, ddstore_width)
+        store._check_name(name)
+        self.store = store
+        hs = store.handshake_dir
+        self._comm = store._comm
+        self.rank = store.rank
+        self.comm_size = store.comm_size
         self.add_device = add_device
-        self.ddstore_width = (
-            ddstore_width if ddstore_width is not None else self.comm_size
-        )
-        if method is None:
-            method = os.environ.get("DDSTORE_METHOD", "0" if self._comm.is_mpi else "1")
-        self.method = int(method)
-        if self.method == 0 and not self._comm.is_mpi:
-            raise ValueError("method=0 needs an MPI communicator; use method=1 or 2")
-        if self.method == 2 and self.ddstore_width != self.comm_size:
-            raise NotImplementedError(
-                "method=2 does not support ddstore_width < comm size (groups would "
-                "collide on the same handshake directory)"
-            )
-        self._group = self._comm.split(self.rank // self.ddstore_width, self.rank)
+        self.ddstore_width = store.ddstore_width
+        self.method = store.method
+        self._group = store._group
         group_rank = self._group.rank
         group_size = self._group.size
 
@@ -888,7 +1015,7 @@ class DistDataset(_StoreDataset):
                     f"({other} vs {self.schema}); DistDataset needs fixed-shape samples"
                 )
 
-        self.ddstore = self._group.store(self.method, hs)
+        self._handle = store._handle
         if self.method == 2:
             if group_rank == 0:
                 # published before the variables, so a reader that sees a
@@ -949,6 +1076,7 @@ class DistDataset(_StoreDataset):
                 error = exc
             # also makes sure every rank has filled its share before any reads
             self._raise_on_all(error)
+        store._added(name, self._var[0])
         logger.debug(
             "DistDataset %s: rank %d holds [%d, %d) of %d",
             name,

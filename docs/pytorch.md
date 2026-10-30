@@ -14,7 +14,8 @@ for x, y in loader:
     ...
 ```
 
-- **`DistDataset(source, name, comm=None, ddstore_width=None, device=None, add_device=None, method=None, handshake_dir=None, chunk_size=None, encode=None, decode=None, fields=None)`**: each rank loads its share of `source` (any `len()` + `[i]` dataset); every rank reads every sample. Samples keep the source's structure (a value, tuple/list or dict) and each field's shape and dtype, which must be fixed across samples. Dtypes: bool, uint8, int32, int64, float32, float64. Numpy structured records (`np.void`, structured `ndarray`, `np.recarray`) are stored as bytes and returned with the same layout; batch them with a custom `collate_fn`. `ds.shapes`, `ds.dtypes`; `ds.ddstore` is the `PyDDStore`.
+- **`DistDataset(source, name, comm=None, ddstore_width=None, device=None, add_device=None, method=None, handshake_dir=None, chunk_size=None, encode=None, decode=None, fields=None)`**: each rank loads its share of `source` (any `len()` + `[i]` dataset); every rank reads every sample. Samples keep the source's structure (a value, tuple/list or dict) and each field's shape and dtype, which must be fixed across samples. Dtypes: bool, uint8, int32, int64, float32, float64. Numpy structured records (`np.void`, structured `ndarray`, `np.recarray`) are stored as bytes and returned with the same layout; batch them with a custom `collate_fn`. `ds.shapes`, `ds.dtypes`; `ds.store` is its `DistStore`, `ds.ddstore` the `PyDDStore`.
+  - `comm`: a [`DistStore`](#diststore), an mpi4py communicator, a `torch.distributed` group, or `None`.
   - `method`: backend (default `DDSTORE_METHOD`, else 0). `ddstore_width`: split `comm` into independent stores ([Partitioned usage](backends.md#partitioned--sub-communicator-usage)).
   - `device`: put tensor fields of read samples on a GPU. `add_device`: keep each rank's share there ([GPUDirect](gpudirect.md)).
   - `chunk_size`: load the share that many samples at a time; peak memory ≈ share + one chunk instead of ≈ 3× share (400 MiB share: 461 vs 1202 MiB). Host storage only.
@@ -46,6 +47,21 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
 ```
 
 - **`comm`**: mpi4py communicator, `torch.distributed` group, or `None` ([Without MPI](#without-mpi)).
+- <a id="diststore"></a>**`DistStore(comm=None, method=None, handshake_dir=None, ddstore_width=None)`**: one store for several datasets on the same ranks. Pass it as `DistDataset`'s `comm`; `method`, `handshake_dir` and `ddstore_width` are the store's (passing them too raises).
+  - Variables of all its datasets live in one `PyDDStore`; a forked worker or `ThreadDataLoader` thread opens one reader for all of them.
+  - Dataset names must differ (`store.names`). With `method=2`, they must also differ from other live stores' in the same `handshake_dir`, whose `{name}` files they would overwrite. A `DistDataset` with its own store gets the same check.
+  - `store.free()` frees every dataset. Every rank creates the datasets in the same order.
+
+```python
+from pyddstore.torch import DistStore, DistDataset
+
+store = DistStore(comm, method=2, handshake_dir=hs)   # mpi4py comm, torch group, or None
+trainset = DistDataset(ConcatDataset([mnist_train] * r), "train", store, device=dev)
+valset   = DistDataset(ConcatDataset([mnist_val]   * r), "val",   store, device=dev)
+testset  = DistDataset(ConcatDataset([mnist_test]  * r), "test",  store, device=dev)
+...
+store.free()
+```
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)`**: the same dataset from a separate `method=2` extra job; fields come from the core group's `{name}.meta.json`.
 - **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: `DataLoader` with worker threads instead of processes; safe with MPI and GPU buffers. Fetch, collate and pinning run in the workers; random draws match `DataLoader`'s. `iter(loader)` gives an independent per-epoch iterator; `num_workers * prefetch_factor` batches are prefetched.
   - **Parallel reads** (methods 1, 2): each worker thread has its own reader (one endpoint per variable). `DDSTORE_THREAD_READERS=0`: threads share the store.

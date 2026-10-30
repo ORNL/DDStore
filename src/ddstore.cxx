@@ -208,6 +208,7 @@ void DDStore::join(std::string name)
         throw std::logic_error("join() is only valid for extra members");
     if (this->method != 2)
         throw std::logic_error("join() requires method=2");
+    this->new_name(name);
 
     struct fabric_state *fs =
         (struct fabric_state *)calloc(1, sizeof(struct fabric_state));

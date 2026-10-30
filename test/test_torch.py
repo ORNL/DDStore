@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset  # noqa: E402
 from pyddstore.torch import (
     DistDataset,
     DistDatasetReader,
+    DistStore,
     ThreadDataLoader,
     WindowedDataset,
     row_of,
@@ -500,6 +501,49 @@ def test_thread_loader_readers(comm, monkeypatch, method, own):
     calls = sum(ds.get_profile(v)["calls"] for v in ds._var)
     ok &= calls == 0 or calls >= 2 * len(ref) * len(ds._var)  # 0 unless DDSTORE_PROFILE
     finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize(
+    "method",
+    METHODS
+    + [pytest.param(2, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))],
+)
+def test_dist_store(comm, monkeypatch, tmp_path, method):
+    """Several datasets on one DistStore: one PyDDStore and one set of
+    thread readers; names checked; free() frees them all."""
+    if method != 0:
+        monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    src = TupleSource()
+    part = torch.utils.data.Subset(src, range(5, N))
+    store = DistStore(comm, method=method, handshake_dir=hs)
+    a = DistDataset(src, "a", store)
+    b = DistDataset(part, "b", store)
+    ok = a.store is b.store is store and a.ddstore is b.ddstore is store.ddstore
+    ok &= store.names == ["a", "b"] and len(b) == N - 5
+    for ds, ref in ((a, src), (b, part)):
+        nw = 0 if method == 0 else 2  # method 0: collective reads, one thread
+        got = list(ThreadDataLoader(ds, batch_size=4, num_workers=nw))
+        want = list(DataLoader(ref, batch_size=4))
+        ok &= len(got) == len(want) and all(same(g, r) for g, r in zip(got, want))
+    ok &= a._readers is b._readers
+    with pytest.raises(ValueError, match="already a dataset"):
+        DistDataset(src, "a", store)
+    with pytest.raises(ValueError, match="DistStore's"):
+        DistDataset(src, "c", store, method=method)
+    if method == 2:  # another store can't publish "a" in the same directory
+        with pytest.raises(ValueError, match="already published"):
+            DistDataset(src, "a", comm, method=2, handshake_dir=hs)
+    comm.Barrier()
+    store.free()
+    with pytest.raises(RuntimeError, match="freed"):
+        DistDataset(src, "c", store)
+    # the names are free again
+    c = DistDataset(src, "a", DistStore(comm, method=method, handshake_dir=hs))
+    ok &= same(c[N - 1], src[N - 1])
+    comm.Barrier()
+    c.store.free()
     assert all_ok(comm, ok)
 
 

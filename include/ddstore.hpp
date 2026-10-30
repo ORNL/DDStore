@@ -132,6 +132,13 @@ public:
 
     void query(std::string name, VarInfo_t &varinfo);
 
+    /* True if `name` is added or joined and not freed. */
+    bool has(const std::string &name) const
+    {
+        auto it = this->varlist.find(name);
+        return it != this->varlist.end() && it->second.active;
+    }
+
     /* Total row count across all core ranks for a variable (added or joined). */
     long size(std::string name)
     {
@@ -185,6 +192,7 @@ public:
     {
         if (this->method == 0 && hmem_iface != 0)
             throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
+        this->new_name(name);
 
         void *base = NULL;
         int how = BASE_ALIGNED;
@@ -207,6 +215,7 @@ public:
 
     void init(std::string name, long nrows, int disp, int itemsize)
     {
+        this->new_name(name);
         int how = BASE_ALIGNED;
         size_t len = 0;
         void *base = alloc_base((size_t)nrows * disp * itemsize, how, len);
@@ -487,6 +496,16 @@ private:
     /* add()/init() after the buffer is in place: expose `base` (nrows rows
      * of disp items of itemsize bytes) through this store's method and
      * record the variable. Collective over the store's ranks.              */
+    /* add()/init()/join() of `name`: an error if it is in use; a freed
+     * variable of that name is replaced. Collective callers pass the same
+     * names on every rank, so every rank throws together.                  */
+    void new_name(const std::string &name)
+    {
+        if (this->has(name))
+            throw std::invalid_argument("variable '" + name + "' already exists in this store");
+        this->varlist.erase(name);
+    }
+
     void add_base(const std::string &name, void *base, long nrows, int disp, int itemsize,
                   int hmem_iface, bool owns_base, int how, size_t len)
     {

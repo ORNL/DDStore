@@ -137,6 +137,7 @@ cdef extern from "ddstore.hpp":
         void join(string name) except +
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
+        bint has(string name)
         void profile(string name, unsigned long long *out) except +
         DDStore *fork_reader() except +
 
@@ -663,6 +664,10 @@ cdef class PyDDStore:
         cdef PyDDStore r = PyDDStore(_NO_STORE, method=self.method)
         r.c_ddstore = self.c_ddstore.fork_reader()
         return r
+
+    def has(self, str name):
+        """True if variable `name` is added or joined and not freed."""
+        return self.c_ddstore.has(s2b(name))
 
     def info(self, str name):
         """Return (total_rows, disp, itemsize) for an added or joined variable."""

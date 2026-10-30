@@ -115,7 +115,8 @@ def _meta_path(handshake_dir, name):
 # ddstore_width groups, and a way to make a store on a group. _MpiComm does
 # that with mpi4py (any method); _NoMpiComm with torch.distributed or a
 # FileComm for the allgather, and stores without a communicator (methods 1
-# and 2, records exchanged through files in handshake_dir).
+# and 2). A store on a torch.distributed group exchanges its records with
+# the group's allgather; otherwise through files in handshake_dir.
 
 
 def _env_rank_size():
@@ -167,12 +168,15 @@ class _MpiComm:
 class _NoMpiComm:
     is_mpi = False
 
-    def __init__(self, rank, size, allgather, handshake_dir, ns):
+    def __init__(self, rank, size, allgather, handshake_dir, ns, members=None):
         # ns: this group's name, part of its stores' exchange names, so
-        # groups of one split never share files
+        # groups of one split never share files. members: the group's
+        # torch.distributed global ranks, by group rank (None: a FileComm);
+        # its stores then exchange records with allgather, not files.
         self.rank, self.size, self.ns = rank, size, ns
         self._allgather = allgather
         self.handshake_dir = handshake_dir
+        self.members = members
 
     def allgather(self, obj):
         return self._allgather(obj)
@@ -186,6 +190,10 @@ class _NoMpiComm:
         rank = members.index((key, self.rank))
         if len(members) == self.size and rank == self.rank:
             return self
+        if self.members is not None:
+            sub = _torch_split(self, peers, color, members)
+            if sub is not None:
+                return sub
         ns = f"{ns}g{color}"
         fc = FileComm(self.handshake_dir, rank, len(members), ns)
         return _NoMpiComm(rank, len(members), fc.allgather, self.handshake_dir, ns)
@@ -197,6 +205,15 @@ class _NoMpiComm:
             raise ValueError(
                 f"method={method} needs an MPI communicator; without MPI use "
                 "method=1 or 2"
+            )
+        if self.members is not None:
+            return PyDDStore(
+                None,
+                method=method,
+                handshake_dir=handshake_dir if method == 2 else "",
+                rank=self.rank,
+                size=self.size,
+                allgather=self._allgather,
             )
         return PyDDStore(
             None,
@@ -243,10 +260,36 @@ def _torch_comm(group, handshake_dir):
         return out
 
     # Named by its members, so that disjoint groups sharing handshake_dir
-    # never use the same exchange files
+    # never use the same exchange files (a split that falls back to files)
     members = dist.get_process_group_ranks(group or dist.group.WORLD)
     ns = "t" + hashlib.sha1(repr(sorted(members)).encode()).hexdigest()[:12]
-    return _NoMpiComm(rank, size, allgather, handshake_dir, ns)
+    return _NoMpiComm(rank, size, allgather, handshake_dir, ns, members)
+
+
+def _torch_split(comm, peers, color, members):
+    """comm's split as torch.distributed groups, or None (then files).
+    new_group must be called by every global rank, so this needs comm to
+    span the whole world, and new_group orders a group by global rank, so
+    the split's order by key must agree with it."""
+    import torch.distributed as dist
+
+    if comm.size != dist.get_world_size():
+        return None
+    groups = {}
+    for c, k, r in peers:
+        groups.setdefault(c, []).append((k, r))
+    ranks = {}
+    for c, kr in groups.items():
+        g = [comm.members[r] for _, r in sorted(kr)]
+        if g != sorted(g):
+            return None
+        ranks[c] = g
+    mine = None
+    for c in sorted(ranks):  # every rank creates every group, in one order
+        pg = dist.new_group(ranks[c])
+        if c == color:
+            mine = pg
+    return _torch_comm(mine, comm.handshake_dir)
 
 
 def _resolve_comm(comm, handshake_dir):
@@ -718,8 +761,9 @@ class DistDataset(_StoreDataset):
             (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
             ``WORLD_SIZE``, PMI). ``DDSTORE_COMM``
             = ``mpi``, ``torch`` or ``file`` forces one for None. All its
-            ranks must construct the dataset together. Without MPI, stores
-            exchange their records through files (methods 1 and 2 only).
+            ranks must construct the dataset together. Without MPI (methods 1
+            and 2 only), stores exchange their records with a torch group's
+            allgather, else through files in ``handshake_dir``.
         ddstore_width: ranks per independent store (default: all of
             ``comm``); each group holds a full copy of the dataset.
         device: put tensor fields of read samples on this device
@@ -728,7 +772,7 @@ class DistDataset(_StoreDataset):
         method: DDStore backend (default ``DDSTORE_METHOD``, else 0 with an
             MPI communicator and 1 without).
         handshake_dir: directory on a filesystem every rank sees, for
-            ``method=2`` and for any store without MPI (default
+            ``method=2`` and for stores on a ``FileComm`` (default
             ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
         chunk_size: load this rank's share ``chunk_size`` samples at a time,
             writing each chunk into the store before reading the next, so

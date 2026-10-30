@@ -49,7 +49,7 @@ Settings: `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S`, `DDSTORE_FABRI
 
 ## Without MPI (methods 1 and 2)
 
-Methods 1 and 2 use MPI only to gather each rank's record in `add()`/`init()`. Without a communicator, that gather goes through files in a shared directory:
+Methods 1 and 2 use MPI only to gather each rank's record in `add()`/`init()`. Without a communicator, that gather goes through files in a shared directory, or through a function given as `allgather=` (`DistDataset` passes `torch.distributed`'s when it has a torch group, [PyTorch integration](pytorch.md#without-mpi)):
 
 ```python
 import os
@@ -71,6 +71,7 @@ srun -N2 -n8 python train.py         # no mpirun, no MPI library needed
 - Put `handshake_dir` on Lustre (Perlmutter: `$SCRATCH`, not CFS, where polling across nodes is erratic).
 - Every rank creates its stores and calls `add()`/`init()` in the same order. Ranks poll (1–200 ms backoff) for up to `DDSTORE_HANDSHAKE_TIMEOUT_S`.
 - File names include a session (`DDSTORE_SESSION`, else `{SLURM_JOB_ID}_{SLURM_STEP_ID}`) and a store name (`exchange_ns`, default `s0`, `s1`, …), and each exchange has its own generation and nonces, so runs and stores can share a directory.
+- With `allgather=fn`, method 1 needs no `handshake_dir` (`PyDDStore(None, method=1, rank=r, size=n, allgather=fn)`); `fn(data)` returns every rank's bytes by rank.
 - `epoch_begin`/`epoch_end` are no-ops. For barriers (e.g. before `free()`), use `pyddstore.FileComm(dir, rank, size, ns)`.
 
 `DistDataset` does this when it has no MPI communicator ([PyTorch integration](pytorch.md#without-mpi)).

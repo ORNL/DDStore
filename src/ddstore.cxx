@@ -82,21 +82,30 @@ DDStore::DDStore(int method, MPI_Comm comm,
 /* Methods 1/2 without MPI: records are exchanged through files in dir.     */
 DDStore::DDStore(int method, const std::string &dir, int rank, int size,
                  const std::string &ns)
-    : comm_size(size), rank(rank), n_core(0), is_extra(false)
+    : DDStore(method,
+              new FileExchange(resolve_dir(dir), rank, size,
+                               ns.empty() ? next_exchange_ns() : ns),
+              dir)
 {
+}
+
+DDStore::DDStore(int method, Exchange *x, const std::string &dir)
+    : comm_size(x->size), rank(x->rank), n_core(0), is_extra(false)
+{
+    this->exchange.reset(x);
     if (method != 1 && method != 2)
         throw std::invalid_argument(
             "a store without an MPI communicator needs method 1 or 2 (got " +
             std::to_string(method) + ")");
-    this->method        = method;
-    this->handshake_dir = resolve_dir(dir);
+    this->method = method;
+    if (method == 2 || !dir.empty())
+        this->handshake_dir = resolve_dir(dir);
     if (method == 2)
-        this->n_core = size;
-    this->exchange.reset(new FileExchange(this->handshake_dir, rank, size,
-                                          ns.empty() ? next_exchange_ns() : ns));
-    if (method == 2)
+    {
+        this->n_core = this->comm_size;
         fprintf(stderr, "[DDStore] method=2 core (no MPI): handshake_dir=%s, rank=%d, n_core=%d\n",
-                this->handshake_dir.c_str(), rank, size);
+                this->handshake_dir.c_str(), this->rank, this->comm_size);
+    }
 }
 
 /* Method 2: extra member constructor (no MPI communicator needed). */

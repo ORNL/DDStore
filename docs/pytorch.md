@@ -108,7 +108,10 @@ Methods 1 and 2 need no MPI. Pass a `torch.distributed` group as `comm`, or `Non
 | the default `torch.distributed` group | no MPI, `torch.distributed` initialized |
 | a `FileComm` in `handshake_dir`, rank and size from `srun` (`SLURM_PROCID`/`SLURM_NTASKS`) | otherwise |
 
-`DDSTORE_COMM=mpi|torch|file` forces one. Records are then exchanged through files in `handshake_dir` (shared filesystem); default method is 1; `method=0` raises. `ddstore_width` works; method 2 needs one group.
+`DDSTORE_COMM=mpi|torch|file` forces one. Default method is 1; `method=0` raises. `ddstore_width` works; method 2 needs one group.
+
+- **`torch.distributed`**: stores exchange their records with the group's `all_gather_object`. Method 1 needs no `handshake_dir`; method 2 still publishes `{name}.bin` there for extra jobs. `ddstore_width` on the whole world makes groups with `dist.new_group` (other groups fall back to files). With NCCL the exchange runs on the current GPU, in order with the group's other collectives.
+- **`FileComm`**: records go through files in `handshake_dir` (shared filesystem).
 
 ```python
 import torch
@@ -116,8 +119,7 @@ import torch.distributed as dist
 from pyddstore.torch import DistDataset, ThreadDataLoader
 
 dist.init_process_group("nccl")                  # DDP as usual, ranks from srun
-trainset = DistDataset(my_dataset, "train", comm=dist.group.WORLD,
-                       handshake_dir="/lustre/.../hs")    # method 1, no MPI
+trainset = DistDataset(my_dataset, "train", comm=dist.group.WORLD)  # method 1, no MPI
 ```
 
 ```bash

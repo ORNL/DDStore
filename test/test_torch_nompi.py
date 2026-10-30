@@ -1,7 +1,7 @@
 """
 pyddstore.torch without MPI: DistDataset over a FileComm (rank and size from
 the launcher) or a torch.distributed group, with stores that exchange their
-records through files (methods 1 and 2). Never imports mpi4py, so it runs
+records through files or the group's allgather (methods 1 and 2). Never imports mpi4py, so it runs
 with either build (DDSTORE_MPI=0 or not). Inside a Slurm step with a CXI
 device, e.g.:
   srun -n 4 python -m pytest test/test_torch_nompi.py -v
@@ -14,6 +14,7 @@ DDSTORE_FORK_WORKERS=1 (forked DataLoader workers) for the whole session.
 
 import glob
 import os
+import re
 import shutil
 import sys
 import time
@@ -29,7 +30,7 @@ import torch.distributed as dist  # noqa: E402
 from torch.utils.data import Dataset  # noqa: E402
 
 import pyddstore.torch as pt  # noqa: E402
-from pyddstore import FileComm  # noqa: E402
+from pyddstore import FileComm, PyDDStore  # noqa: E402
 from pyddstore.torch import (
     DistDataset,
     DistDatasetReader,
@@ -300,6 +301,119 @@ def test_disjoint_torch_groups(file_comm, hs):
     if file_comm.rank == 0 and os.path.exists(init):
         os.remove(init)
     assert ok
+
+
+@pytest.fixture
+def torch_world(file_comm, hs, request):
+    """A gloo default group over file_comm's ranks, for one test."""
+    init = os.path.join(hs, f"tw.{request.node.name}.init")
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init}",
+        rank=file_comm.rank,
+        world_size=file_comm.size,
+    )
+    yield file_comm
+    dist.destroy_process_group()
+    file_comm.allgather(None)
+    if file_comm.rank == 0 and os.path.exists(init):
+        os.remove(init)
+
+
+def _torch_exchange_files(hs):
+    # a torch group's file exchanges are named .x.{session}.t{12 hex}...
+    # (not .x.{session}.pw.{k}.{rank}.tmp, the FileComm's)
+    pat = re.compile(r"\.x\.[^.]+\.t[0-9a-f]{12}")
+    return [f for f in os.listdir(hs) if pat.match(f)]
+
+
+@pytest.mark.parametrize("method", [1, 2])
+def test_torch_store_exchange(torch_world, hs, method):
+    """Stores on a torch.distributed group exchange their records with the
+    group's allgather: method 1 needs no handshake_dir at all."""
+    unused = os.path.join(hs, f"unused{method}")
+    ds = DistDataset(
+        Source(),
+        f"tx{method}",
+        comm=dist.group.WORLD,
+        handshake_dir=unused if method == 1 else hs,
+        method=method,
+    )
+    ok = ds._group.members is not None and read_all(ds, num_workers=2)
+    finish(ds)
+    ok &= not _torch_exchange_files(hs)
+    ok &= not os.path.exists(unused)
+    assert all(torch_world.allgather(ok))
+
+
+def test_torch_split(torch_world, hs):
+    """ddstore_width on the whole world: groups from dist.new_group, and
+    stores on them exchange through torch, not files."""
+    comm = torch_world
+    if comm.size < 2:
+        pytest.skip("needs 2 ranks")
+    unused = os.path.join(hs, "unused_split")
+    ds = DistDataset(
+        Source(),
+        "ts",
+        comm=dist.group.WORLD,
+        ddstore_width=comm.size // 2,
+        handshake_dir=unused,
+        method=1,
+    )
+    why = []
+    if ds._group.members is None or ds._group.size != comm.size // 2:
+        why.append(f"group {ds._group.members} size {ds._group.size}")
+    if not read_all(ds):
+        why.append("bad read")
+    finish(ds)
+    if _torch_exchange_files(hs) or os.path.exists(unused):
+        why.append(f"files {_torch_exchange_files(hs)}")
+    assert comm.allgather(why) == [[]] * comm.size
+
+
+def test_store_allgather_callback(file_comm):
+    """PyDDStore(allgather=): records go through the given function."""
+    calls = []
+
+    def ag(data):
+        calls.append(len(data))
+        return file_comm.allgather(data)
+
+    rank, size = file_comm.rank, file_comm.size
+    st = PyDDStore(None, method=1, rank=rank, size=size, allgather=ag)
+    st.add("cb", np.full((3, 4), rank, dtype=np.float32))
+    out = np.zeros((1, 4), dtype=np.float32)
+    ok = bool(calls) and st.info("cb")[0] == 3 * size
+    for r in range(size):
+        st.get("cb", out, r * 3 + 2)
+        ok &= bool((out == r).all())
+    file_comm.allgather(None)
+    st.free()
+    assert all(file_comm.allgather(ok))
+
+
+def test_store_allgather_errors(file_comm):
+    """The allgather function's exception reaches add()/init(); a result of
+    the wrong length is an error, not a short copy."""
+
+    class Boom(Exception):
+        pass
+
+    def boom(data):
+        raise Boom("no allgather")
+
+    rank, size = file_comm.rank, file_comm.size
+    st = PyDDStore(None, method=1, rank=rank, size=size, allgather=boom)
+    with pytest.raises(Boom, match="no allgather"):
+        st.add("e", np.zeros((2, 2), dtype=np.float32))
+    with pytest.raises(Boom):
+        st.init("e2", 2, 2, 4)
+    st = PyDDStore(None, method=1, rank=rank, size=size, allgather=lambda d: b"")
+    with pytest.raises(RuntimeError, match="allgather returned 0 bytes"):
+        st.add("s", np.zeros((2, 2), dtype=np.float32))
+    with pytest.raises(ValueError, match="handshake_dir"):
+        PyDDStore(None, method=2, rank=rank, size=size, allgather=boom)
 
 
 def test_no_mpi4py_imported():

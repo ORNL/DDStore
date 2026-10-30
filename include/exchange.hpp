@@ -12,7 +12,8 @@
  * when a variable is added -- every rank of the store gathering every
  * rank's handshake record. MpiExchange does it with MPI_Allgather;
  * FileExchange through files in a shared directory, so a store can be
- * built without MPI. Every rank must call allgather() the same number of
+ * built without MPI; CallbackExchange through a caller's function (the
+ * Python binding's torch.distributed path). Every rank must call allgather() the same number of
  * times, in the same order (add()/init() are collective).
  * ----------------------------------------------------------------------- */
 class Exchange
@@ -39,6 +40,21 @@ private:
     MPI_Comm comm;
 };
 #endif
+
+/* allgather through fn(ctx, in, out, bytes), which has allgather()'s
+ * contract and returns 0 on success; nonzero throws std::runtime_error.   */
+class CallbackExchange : public Exchange
+{
+public:
+    typedef int (*Fn)(void *ctx, const void *in, void *out, size_t bytes);
+    CallbackExchange(Fn fn, void *ctx, int rank, int size)
+        : Exchange(rank, size), fn(fn), ctx(ctx) {}
+    void allgather(const void *in, void *out, size_t bytes) override;
+
+private:
+    Fn fn;
+    void *ctx;
+};
 
 /* File-based allgather in `dir` (on a filesystem all ranks see). Call k:
  *   1. every rank writes {dir}/.x.{session}.{ns}.{k}.{rank}

@@ -104,6 +104,11 @@ public:
     DDStore(int method, const std::string &dir, int rank, int size,
             const std::string &ns = "");
 
+    /* Methods 1 and 2 without MPI, exchanging records through x (rank and
+     * size from x), which the store takes ownership of. dir is needed only
+     * for method 2, where rank 0 publishes {name}.bin for extra members.   */
+    DDStore(int method, Exchange *x, const std::string &dir = "");
+
     /* Method 2: extra member constructor (no MPI communicator required).
      * The extra member calls join() per variable to discover the data.      */
     DDStore(int method, const std::string &handshake_dir, int n_core);

@@ -14,7 +14,7 @@ for x, y in loader:
     ...
 ```
 
-- **`DistDataset(source, name, store=None, *, device, add_device, chunk_size, encode=None, decode=None, fields=None, comm=None, method=None, handshake_dir=None, ddstore_width=None)`**: each rank loads its share of `source` (any `len()` + `[i]` dataset); every rank reads every sample. Samples keep the source's structure (a value, tuple/list or dict) and each field's shape and dtype, which must be fixed across samples. Dtypes: bool, uint8, int32, int64, float32, float64. Numpy structured records (`np.void`, structured `ndarray`, `np.recarray`) are stored as bytes and returned with the same layout; batch them with a custom `collate_fn`. `ds.shapes`, `ds.dtypes`; `ds.store` is its `DistStore`, `ds.ddstore` the `PyDDStore`.
+- **`DistDataset(source, name, store=None, ddstore_width=None, device, add_device, method=None, handshake_dir=None, chunk_size, encode=None, decode=None, fields=None, comm=None)`**: each rank loads its share of `source` (any `len()` + `[i]` dataset); every rank reads every sample. Samples keep the source's structure (a value, tuple/list or dict) and each field's shape and dtype, which must be fixed across samples. Dtypes: bool, uint8, int32, int64, float32, float64. Numpy structured records (`np.void`, structured `ndarray`, `np.recarray`) are stored as bytes and returned with the same layout; batch them with a custom `collate_fn`. `ds.shapes`, `ds.dtypes`; `ds.store` is its `DistStore`, `ds.ddstore` the `PyDDStore`.
   - `store`: a `DistStore` (below) to add the dataset to; or a communicator (mpi4py, `torch.distributed` group) or `None` for a store of its own, `DistStore(store, method, handshake_dir, ddstore_width)`. `comm=` is the same as a communicator in `store`; `comm`, `method`, `handshake_dir`, `ddstore_width` are not allowed with a `DistStore`.
   - `device`: put tensor fields of read samples on a GPU. `add_device`: keep each rank's share there ([GPUDirect](gpudirect.md)).
   - `chunk_size`: load the share that many samples at a time; peak memory ≈ share + one chunk instead of ≈ 3× share (400 MiB share: 461 vs 1202 MiB). Host storage only.
@@ -51,7 +51,8 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
   - `method`: backend (default `DDSTORE_METHOD`, else 0 with MPI, 1 without). `handshake_dir`: for `method=2` and the file handshake. `ddstore_width`: split `comm` into independent stores ([Partitioned usage](backends.md#partitioned--sub-communicator-usage)).
   - `device`, `add_device`, `chunk_size`: defaults for its datasets.
   - Variables of all its datasets live in one `PyDDStore`; a forked worker or `ThreadDataLoader` thread opens one reader for all of them.
-  - Dataset names must differ (`store.names`). With `method=2`, they must also differ from other live stores' in the same `handshake_dir`, whose `{name}` files they would overwrite. A `DistDataset` with its own store gets the same check.
+  - Dataset names must differ (`store.names`). With `method=2`, the files a dataset publishes (`{name}.meta.json`, a `.bin` per field; `.` and `/` become `_`) must not be those of another live dataset in the same `handshake_dir`, in this store or another. A `DistDataset` with its own store gets the same check, on every rank.
+  - `store.free()` also frees the readers this process opened on it.
   - `store.free()` frees every dataset. Every rank creates the datasets in the same order.
 
 ```python

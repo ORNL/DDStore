@@ -540,7 +540,7 @@ def test_dist_store(comm, monkeypatch, tmp_path, method):
     with pytest.raises(ValueError, match="once"):
         DistDataset(src, "c", comm, comm=comm)
     if method == 2:  # another store can't publish "a" in the same directory
-        with pytest.raises(ValueError, match="already published"):
+        with pytest.raises(ValueError, match="another DistStore"):
             DistDataset(src, "a", comm, method=2, handshake_dir=hs)
     comm.Barrier()
     store.free()
@@ -551,6 +551,64 @@ def test_dist_store(comm, monkeypatch, tmp_path, method):
     ok &= same(c[N - 1], src[N - 1])
     comm.Barrier()
     c.store.free()
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
+def test_dist_store_file_names(comm, monkeypatch, tmp_path):
+    """method=2 names that publish the same files ("a.b", "a_b") are
+    rejected, also across stores, and on every rank when the other store
+    covers only some of them (no rank left waiting in a collective)."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    src = TupleSource()
+    store = DistStore(comm, method=2, handshake_dir=hs)
+    DistDataset(src, "a.b", store)
+    with pytest.raises(ValueError, match="would overwrite"):
+        DistDataset(src, "a_b", store)
+    with pytest.raises(ValueError, match="another DistStore"):
+        DistDataset(src, "a_b", comm, method=2, handshake_dir=hs)
+    comm.Barrier()
+    store.free()
+    if comm.Get_size() >= 2:
+        sub = comm.Split(comm.Get_rank() % 2, comm.Get_rank())
+        part = None
+        if comm.Get_rank() % 2 == 0:  # only the even ranks hold "even"
+            part = DistDataset(src, "even", sub, method=2, handshake_dir=hs)
+        with pytest.raises(ValueError, match="would overwrite"):
+            DistDataset(src, "even", comm, method=2, handshake_dir=hs)
+        comm.Barrier()
+        if part is not None:
+            part.store.free()
+        sub.Free()
+    assert all_ok(comm, True)
+
+
+@pytest.mark.parametrize("method", [m for m in METHODS if m != 0])
+def test_dist_store_frees_readers(comm, monkeypatch, method):
+    """store.free() frees the thread readers too; a loader closed after it
+    doesn't fail."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    store = DistStore(comm, method=method)
+    ds = DistDataset(TupleSource(), f"fr{method}", store)
+    loader = ThreadDataLoader(ds, batch_size=4, num_workers=2, reuse_buffers=True)
+    list(loader)
+    readers = list(ds._readers.values())
+    comm.Barrier()
+    store.free()
+    ok = bool(readers) and not any(r.has(f"fr{method}/0") for r in readers)
+    loader.close()
+    ok &= list(ds._readers.values()) == readers  # kept, not reopened
+    assert all_ok(comm, ok)
+
+
+def test_dist_dataset_positional(comm, monkeypatch):
+    """The 2.0 positional order still works: (source, name, comm,
+    ddstore_width, device, add_device, method)."""
+    ds = DistDataset(TupleSource(), "pos", comm, comm.Get_size(), None, None, 0)
+    ok = ds.method == 0 and ds.ddstore_width == comm.Get_size()
+    ok &= same(ds[2], TupleSource()[2])
+    finish(comm, ds)
     assert all_ok(comm, ok)
 
 

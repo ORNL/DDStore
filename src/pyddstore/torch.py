@@ -104,10 +104,13 @@ def _handshake_dir(handshake_dir):
     return handshake_dir or os.environ.get("DDSTORE_HANDSHAKE_DIR") or "./ddstore_hs"
 
 
+def _safe_name(name):
+    # same sanitization as the C library's record files ({name}.bin)
+    return name.replace("/", "_").replace(".", "_")
+
+
 def _meta_path(handshake_dir, name):
-    # same sanitization as the C library's record files
-    safe = name.replace("/", "_").replace(".", "_")
-    return os.path.join(handshake_dir, f"{safe}.meta.json")
+    return os.path.join(handshake_dir, f"{_safe_name(name)}.meta.json")
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +185,7 @@ class _NoMpiComm:
         self._allgather = allgather
         self.handshake_dir = handshake_dir
         self.members = members
+        self.group = None  # torch.distributed group (None: the default)
 
     def allgather(self, obj):
         return self._allgather(obj)
@@ -268,7 +272,9 @@ def _torch_comm(group, handshake_dir):
     # never use the same exchange files (a split that falls back to files)
     members = dist.get_process_group_ranks(group or dist.group.WORLD)
     ns = "t" + hashlib.sha1(repr(sorted(members)).encode()).hexdigest()[:12]
-    return _NoMpiComm(rank, size, allgather, handshake_dir, ns, members)
+    comm = _NoMpiComm(rank, size, allgather, handshake_dir, ns, members)
+    comm.group = group
+    return comm
 
 
 def _torch_split(comm, peers, color, members):
@@ -290,8 +296,9 @@ def _torch_split(comm, peers, color, members):
             return None
         ranks[c] = g
     mine = None
+    backend = dist.get_backend(comm.group)  # the given group's, not the world's
     for c in sorted(ranks):  # every rank creates every group, in one order
-        pg = dist.new_group(ranks[c])
+        pg = dist.new_group(ranks[c], backend=backend)
         if c == color:
             mine = pg
     return _torch_comm(mine, comm.handshake_dir)
@@ -785,9 +792,11 @@ def _rows(values, dtype):
     )
 
 
-# method=2 datasets of this process, by (handshake_dir, name): another
-# live store publishing the same name there would overwrite its files
-_published = weakref.WeakValueDictionary()
+# method=2 files of this process's datasets, (realpath(handshake_dir),
+# file) -> (weakref to the store, dataset name): another dataset publishing
+# a file of the same name there (names are sanitized: "a.b" and "a_b" give
+# the same files) would overwrite it while it is live
+_published = {}
 
 
 class DistStore:
@@ -866,36 +875,72 @@ class DistStore:
         self._first_var = {}
         self._freed = False
 
-    def _check_name(self, name):
-        # the same on every rank, so every rank raises together
+    def _check_freed(self):
+        # free() is collective: the same on every rank
         if self._freed:
             raise RuntimeError("this DistStore has been freed")
+
+    def _files(self, name, variables):
+        # what a method=2 dataset publishes in handshake_dir
+        return [os.path.basename(_meta_path(self.handshake_dir, name))] + [
+            f"{_safe_name(v)}.bin" for v in variables
+        ]
+
+    def _check_name(self, name, variables):
+        """Raise on every rank if `name` (or a file it would publish) is in
+        use. The registry is per process, and a store on another
+        communicator may cover only some of this store's ranks: gather the
+        result over the store's ranks before raising."""
+        error = None
         if name in self.names and self._live(name):
-            raise ValueError(f"{name!r} is already a dataset of this DistStore")
-        if self.method == 2:
-            key = (os.path.realpath(self.handshake_dir), name)
-            other = _published.get(key)
-            if other is not None and other is not self and other._live(name):
-                raise ValueError(
-                    f"{name!r} is already published in {self.handshake_dir} by "
-                    "another DistStore (method=2 datasets there need distinct names)"
+            error = f"{name!r} is already a dataset of this DistStore"
+        elif self.method == 2:
+            hs = os.path.realpath(self.handshake_dir)
+            for f in self._files(name, variables):
+                ref, other = _published.get((hs, f), (None, None))
+                owner = ref() if ref is not None else None
+                if owner is None or not owner._live(other):
+                    continue  # no live dataset publishes f
+                error = (
+                    f"{name!r} would overwrite {f} in {self.handshake_dir}, "
+                    f"published by dataset {other!r}"
+                    + ("" if owner is self else " of another DistStore")
+                    + " (names map '.' and '/' to '_')"
                 )
+                break
+        errors = [e for e in self._comm.allgather(error) if e is not None]
+        if errors:
+            raise ValueError(errors[0])
 
     def _live(self, name):
         # name's variables still in this store (not freed, here or through
         # ds.ddstore.free())
-        return not self._freed and self.ddstore.has(self._first_var[name])
+        return (
+            not self._freed
+            and name in self._first_var
+            and self.ddstore.has(self._first_var[name])
+        )
 
-    def _added(self, name, first_var):
+    def _added(self, name, variables):
         if name not in self.names:
             self.names.append(name)
-        self._first_var[name] = first_var
+        self._first_var[name] = variables[0]
         if self.method == 2:
-            _published[(os.path.realpath(self.handshake_dir), name)] = self
+            hs = os.path.realpath(self.handshake_dir)
+            for f in self._files(name, variables):
+                _published[(hs, f)] = (weakref.ref(self), name)
         self._handle.reset()
 
     def free(self):
-        """Free every dataset of this store (collective)."""
+        """Free every dataset of this store (collective), and the readers
+        this process opened on it (ThreadDataLoader threads', a forked
+        worker's). The readers stay cached, freed, so a loader closed later
+        doesn't open new ones to unregister its buffers."""
+        h = self._handle
+        for r in list(h.readers.values()):
+            r.free()
+        if h.fork_store is not None and h.fork_pid == os.getpid():
+            h.fork_store.free()
         self.ddstore.free()
         self._freed = True
 
@@ -965,17 +1010,16 @@ class DistDataset(_StoreDataset):
         source,
         name,
         store=None,
-        *,
+        ddstore_width=None,
         device=_FROM_STORE,
         add_device=_FROM_STORE,
+        method=None,
+        handshake_dir=None,
         chunk_size=_FROM_STORE,
         encode=None,
         decode=None,
         fields=None,
         comm=None,
-        method=None,
-        handshake_dir=None,
-        ddstore_width=None,
     ):
         super().__init__()
         if fields is not None:
@@ -1003,7 +1047,7 @@ class DistDataset(_StoreDataset):
             add_device = store.add_device
         if chunk_size is _FROM_STORE:
             chunk_size = store.chunk_size
-        store._check_name(name)
+        store._check_freed()
         self.store = store
         hs = store.handshake_dir
         self._comm = store._comm
@@ -1040,6 +1084,7 @@ class DistDataset(_StoreDataset):
                 f"{name}: samples differ in structure, shape or dtype across ranks"
             )
         self._setup_fields(schemas[0], name, device)
+        store._check_name(name, self._var)
         if chunk_size is not None:
             if chunk_size < 1:
                 raise ValueError(f"chunk_size must be >= 1 (got {chunk_size})")
@@ -1119,7 +1164,7 @@ class DistDataset(_StoreDataset):
                 error = exc
             # also makes sure every rank has filled its share before any reads
             self._raise_on_all(error)
-        store._added(name, self._var[0])
+        store._added(name, self._var)
         logger.debug(
             "DistDataset %s: rank %d holds [%d, %d) of %d",
             name,

@@ -429,6 +429,28 @@ def test_store_allgather_errors(file_comm):
     st = PyDDStore(None, method=1, rank=rank, size=size, allgather=lambda d: b"")
     with pytest.raises(RuntimeError, match="allgather returned 0 bytes"):
         st.add("s", np.zeros((2, 2), dtype=np.float32))
+
+    # A failed add() leaves nothing behind: the name is free and a later
+    # add() of it works.
+    fail = [True]
+
+    def flaky(data):
+        if fail[0]:
+            raise Boom("not yet")
+        return file_comm.allgather(data)
+
+    st = PyDDStore(None, method=1, rank=rank, size=size, allgather=flaky)
+    for _ in range(3):
+        with pytest.raises(Boom):
+            st.add("f", np.zeros((2, 2), dtype=np.float32))
+    assert not st.has("f")
+    fail[0] = False
+    st.add("f", np.full((2, 2), rank, dtype=np.float32))
+    out = np.zeros((1, 2), dtype=np.float32)
+    st.get("f", out, 2 * (size - 1))
+    assert (out == size - 1).all()
+    file_comm.allgather(None)
+    st.free()
     with pytest.raises(ValueError, match="handshake_dir"):
         PyDDStore(None, method=2, rank=rank, size=size, allgather=boom)
 

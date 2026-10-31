@@ -23,8 +23,8 @@
 
 | Variable | Default | Effect |
 |---|---|---|
-| `DDSTORE_METHOD` | `0` with MPI, `1` without | `DistDataset`'s default `method` (`PyDDStore` takes `method=` only). |
-| `DDSTORE_COMM` | `mpi` in an MPI build, else `torch` if initialized, else `file` | `DistDataset`'s communicator for `comm=None`: `MPI.COMM_WORLD`, the default `torch.distributed` group (records exchanged with it, no files for method 1), or a `FileComm` (rank/size from Slurm, `RANK`/`WORLD_SIZE` or PMI). |
+| `DDSTORE_METHOD` | `0` with MPI, `1` without | `DistStore`'s (and `DistDataset`'s) default `method` (`PyDDStore` takes `method=` only). |
+| `DDSTORE_COMM` | `mpi` in an MPI build, else `torch` if initialized, else `file` | `DistStore`'s (and `DistDataset`'s) communicator for `comm=None`: `MPI.COMM_WORLD`, the default `torch.distributed` group (records exchanged with it, no files for method 1), or a `FileComm` (rank/size from Slurm, `RANK`/`WORLD_SIZE` or PMI). |
 | `DDSTORE_BATCH_GET` | `1` | `__getitems__` reads a batch with one `get_batch()` per field; `0`: per sample. |
 | `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S` | `./ddstore_hs`, `300` | Default `handshake_dir`, and `DistDatasetReader`'s wait for the core group. |
 | `DDSTORE_N_CORE` | unset | `DistDatasetReader`'s default `n_core` (examples: 4). |

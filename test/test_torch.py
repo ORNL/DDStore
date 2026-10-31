@@ -517,10 +517,13 @@ def test_dist_store(comm, monkeypatch, tmp_path, method):
     hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
     src = TupleSource()
     part = torch.utils.data.Subset(src, range(5, N))
-    store = DistStore(comm, method=method, handshake_dir=hs)
-    a = DistDataset(src, "a", store)
-    b = DistDataset(part, "b", store)
+    cpu = torch.device("cpu")
+    store = DistStore(comm, method=method, handshake_dir=hs, device=cpu, chunk_size=4)
+    a = DistDataset(src, "a", store)  # the store's device and chunk_size
+    b = DistDataset(part, "b", store, device=None, chunk_size=None)  # overridden
     ok = a.store is b.store is store and a.ddstore is b.ddstore is store.ddstore
+    ok &= a.device is None and b.device is None  # a CPU device is host memory
+    ok &= a.chunk_size == 4 and b.chunk_size is None
     ok &= store.names == ["a", "b"] and len(b) == N - 5
     for ds, ref in ((a, src), (b, part)):
         nw = 0 if method == 0 else 2  # method 0: collective reads, one thread
@@ -532,6 +535,10 @@ def test_dist_store(comm, monkeypatch, tmp_path, method):
         DistDataset(src, "a", store)
     with pytest.raises(ValueError, match="DistStore's"):
         DistDataset(src, "c", store, method=method)
+    with pytest.raises(ValueError, match="DistStore's"):
+        DistDataset(src, "c", store, comm=comm)
+    with pytest.raises(ValueError, match="once"):
+        DistDataset(src, "c", comm, comm=comm)
     if method == 2:  # another store can't publish "a" in the same directory
         with pytest.raises(ValueError, match="already published"):
             DistDataset(src, "a", comm, method=2, handshake_dir=hs)
@@ -539,8 +546,8 @@ def test_dist_store(comm, monkeypatch, tmp_path, method):
     store.free()
     with pytest.raises(RuntimeError, match="freed"):
         DistDataset(src, "c", store)
-    # the names are free again
-    c = DistDataset(src, "a", DistStore(comm, method=method, handshake_dir=hs))
+    # the names are free again; comm= builds a store of its own
+    c = DistDataset(src, "a", comm=comm, method=method, handshake_dir=hs)
     ok &= same(c[N - 1], src[N - 1])
     comm.Barrier()
     c.store.free()

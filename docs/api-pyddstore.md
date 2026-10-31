@@ -27,7 +27,7 @@ PyDDStore(None, method=1, rank=r, size=N, allgather=fn)  # method 1 without MPI,
 
 In a build without MPI (`DDSTORE_MPI=0`, `pyddstore.HAVE_MPI` is `False`) only the last three work; a communicator raises `RuntimeError`.
 
-Independent stores per group of ranks: `comm.Split()` and pass the sub-communicator (`DistDataset(ddstore_width=)` does this).
+Independent stores per group of ranks: `comm.Split()` and pass the sub-communicator (`DistStore(ddstore_width=)` does this).
 
 ---
 

@@ -550,6 +550,9 @@ class _StoreDataset(Dataset):
 
     @device.setter
     def device(self, device):
+        # a CPU device is host memory: the same as None
+        if device is not None and torch.device(device).type == "cpu":
+            device = None
         self._device = device
 
     def _setup_fields(self, schema, name, device):
@@ -788,19 +791,35 @@ _published = weakref.WeakValueDictionary()
 
 
 class DistStore:
-    """One DDStore for several ``DistDataset``\ s on the same ranks.
+    """The ranks, backend and handshake of one or more ``DistDataset``\ s,
+    which share one DDStore.
 
-      store = DistStore(comm, method=2, handshake_dir=hs)
+      store = DistStore(comm, method=2, handshake_dir=hs, device=dev)
       train = DistDataset(train_source, "train", store)
-      val = DistDataset(val_source, "val", store)
+      val = DistDataset(val_source, "val", store, add_device=None)
       ...
       store.free()
 
     Args:
-        comm: as for ``DistDataset``: an mpi4py communicator, a
-            ``torch.distributed`` process group, or None.
-        method, handshake_dir, ddstore_width: as for ``DistDataset``; every
-            dataset of the store uses them.
+        comm: an mpi4py communicator, a ``torch.distributed`` process group,
+            or None (default) for ``MPI.COMM_WORLD`` in an MPI build, else
+            the default ``torch.distributed`` group if initialized, else
+            files in ``handshake_dir`` with rank and size from the launcher
+            (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
+            ``WORLD_SIZE``, PMI). ``DDSTORE_COMM`` = ``mpi``, ``torch`` or
+            ``file`` forces one for None. All its ranks must construct the
+            store together. Without MPI (methods 1 and 2 only), the store
+            exchanges its records with a torch group's allgather, else
+            through files in ``handshake_dir``.
+        method: DDStore backend (default ``DDSTORE_METHOD``, else 0 with an
+            MPI communicator and 1 without).
+        handshake_dir: directory on a filesystem every rank sees, for
+            ``method=2`` and for a store on files (default
+            ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
+        ddstore_width: ranks per independent store (default: all of
+            ``comm``); each group holds a full copy of every dataset.
+        device, add_device, chunk_size: defaults for the datasets (see
+            ``DistDataset``); a dataset can override them.
 
     The datasets' variables (``name/k``) live in one ``PyDDStore``
     (``store.ddstore``), and a forked DataLoader worker or ThreadDataLoader
@@ -810,7 +829,19 @@ class DistStore:
     datasets in the same order. ``free()`` frees all of them.
     """
 
-    def __init__(self, comm=None, method=None, handshake_dir=None, ddstore_width=None):
+    def __init__(
+        self,
+        comm=None,
+        method=None,
+        handshake_dir=None,
+        ddstore_width=None,
+        device=None,
+        add_device=None,
+        chunk_size=None,
+    ):
+        self.device = device
+        self.add_device = add_device
+        self.chunk_size = chunk_size
         self.handshake_dir = _handshake_dir(handshake_dir)
         self._comm = _resolve_comm(comm, self.handshake_dir)
         self.rank = self._comm.rank
@@ -869,42 +900,40 @@ class DistStore:
         self._freed = True
 
 
+class _FromStore:
+    # DistDataset's device/add_device/chunk_size when not given: the store's
+    def __repr__(self):
+        return "<the store's>"
+
+
+_FROM_STORE = _FromStore()
+
+
 class DistDataset(_StoreDataset):
-    """A map-style dataset stored in DDStore across the ranks of `comm`.
+    """A map-style dataset stored in DDStore across the ranks of a store.
 
     Args:
         source: any map-style dataset (``len(source)``, ``source[i]``). Each
             rank loads only its contiguous share. Every sample must have the
             same structure, and each field the same shape and dtype.
         name: dataset name; field ``k`` is stored as variable ``name/k``.
-        comm: a ``DistStore`` to add this dataset to, an mpi4py
-            communicator, a ``torch.distributed`` process group, or None
-            (default) for ``MPI.COMM_WORLD`` in an MPI build, else
-            the default ``torch.distributed`` group if initialized, else
-            files in ``handshake_dir`` with rank and size from the launcher
-            (``srun``'s ``SLURM_PROCID``/``SLURM_NTASKS``, else ``RANK``/
-            ``WORLD_SIZE``, PMI). ``DDSTORE_COMM``
-            = ``mpi``, ``torch`` or ``file`` forces one for None. All its
-            ranks must construct the dataset together. Without MPI (methods 1
-            and 2 only), stores exchange their records with a torch group's
-            allgather, else through files in ``handshake_dir``.
-        ddstore_width: ranks per independent store (default: all of
-            ``comm``); each group holds a full copy of the dataset.
-            With a ``DistStore``, ``ddstore_width``, ``method`` and
-            ``handshake_dir`` are the store's: don't pass them.
+            Unique in the store (and with ``method=2`` in its
+            ``handshake_dir``).
+        store: the ``DistStore`` to add this dataset to; or a communicator
+            (an mpi4py communicator or ``torch.distributed`` group), or None
+            (default), for a store of its own: ``DistStore(store, method,
+            handshake_dir, ddstore_width)``. All its ranks must construct
+            the dataset together.
         device: put tensor fields of read samples on this device
-            (GPUDirect RDMA; needs ``method`` 1/2 and ``DDSTORE_FABRIC=cxi``).
+            (GPUDirect RDMA; needs ``method`` 1/2 and ``DDSTORE_FABRIC=cxi``);
+            a CPU device is the same as None. Default: the store's.
         add_device: keep this rank's share of tensor fields on this device.
-        method: DDStore backend (default ``DDSTORE_METHOD``, else 0 with an
-            MPI communicator and 1 without).
-        handshake_dir: directory on a filesystem every rank sees, for
-            ``method=2`` and for stores on a ``FileComm`` (default
-            ``DDSTORE_HANDSHAKE_DIR`` or ``./ddstore_hs``).
+            Default: the store's.
         chunk_size: load this rank's share ``chunk_size`` samples at a time,
             writing each chunk into the store before reading the next, so
-            only one chunk is held in memory besides the store (default:
-            read the whole share, then add it). Host storage only (no
-            ``add_device`` for tensor fields).
+            only one chunk is held in memory besides the store (None: read
+            the whole share, then add it). Host storage only (no
+            ``add_device`` for tensor fields). Default: the store's.
         encode: ``encode(sample) -> sample`` applied to every source sample
             before it is stored: pick and convert what to store (e.g. drop
             metadata objects, turn a label string into an id). Its result
@@ -918,11 +947,14 @@ class DistDataset(_StoreDataset):
         fields: store only these keys (dict samples) or positions
             (tuple/list samples), in this order: shorthand for an
             ``encode`` that selects them. Not together with ``encode``.
+        comm, method, handshake_dir, ddstore_width: for a store of its own,
+            as for ``DistStore`` (``comm=`` is the same as passing the
+            communicator as ``store``). Not with a ``DistStore``.
 
     ``ds[i]`` returns a sample with the source's structure: tensors stay
     tensors (on ``device`` if given), numpy arrays stay arrays, numbers stay
-    numbers. ``ds.store`` is its ``DistStore`` (its own unless one was
-    passed) and ``ds.ddstore`` the underlying ``PyDDStore``.
+    numbers. ``ds.store`` is its ``DistStore`` and ``ds.ddstore`` the
+    underlying ``PyDDStore``.
 
     With ``method=0``, batched reads are collective: every rank must read the
     same number of batches (DistributedSampler does that) from one thread.
@@ -932,16 +964,18 @@ class DistDataset(_StoreDataset):
         self,
         source,
         name,
-        comm=None,
-        ddstore_width=None,
-        device=None,
-        add_device=None,
-        method=None,
-        handshake_dir=None,
-        chunk_size=None,
+        store=None,
+        *,
+        device=_FROM_STORE,
+        add_device=_FROM_STORE,
+        chunk_size=_FROM_STORE,
         encode=None,
         decode=None,
         fields=None,
+        comm=None,
+        method=None,
+        handshake_dir=None,
+        ddstore_width=None,
     ):
         super().__init__()
         if fields is not None:
@@ -952,15 +986,23 @@ class DistDataset(_StoreDataset):
             source = _Encoded(source, encode)
         self._decode = decode
 
-        if isinstance(comm, DistStore):
-            if (ddstore_width, method, handshake_dir) != (None, None, None):
+        own = (comm, method, handshake_dir, ddstore_width)
+        if isinstance(store, DistStore):
+            if any(v is not None for v in own):
                 raise ValueError(
-                    "ddstore_width, method and handshake_dir are the DistStore's; "
-                    "don't pass them with one"
+                    "comm, method, handshake_dir and ddstore_width are the "
+                    "DistStore's; don't pass them with one"
                 )
-            store = comm
         else:
-            store = DistStore(comm, method, handshake_dir, ddstore_width)
+            if store is not None and comm is not None:
+                raise ValueError("pass the communicator once (store= or comm=)")
+            store = DistStore(store if comm is None else comm, *own[1:])
+        if device is _FROM_STORE:
+            device = store.device
+        if add_device is _FROM_STORE:
+            add_device = store.add_device
+        if chunk_size is _FROM_STORE:
+            chunk_size = store.chunk_size
         store._check_name(name)
         self.store = store
         hs = store.handshake_dir
@@ -968,6 +1010,7 @@ class DistDataset(_StoreDataset):
         self.rank = store.rank
         self.comm_size = store.comm_size
         self.add_device = add_device
+        self.chunk_size = chunk_size
         self.ddstore_width = store.ddstore_width
         self.method = store.method
         self._group = store._group

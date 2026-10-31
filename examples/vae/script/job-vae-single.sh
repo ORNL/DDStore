@@ -20,9 +20,9 @@ Runs examples/vae/vae-ddp.py under DDP.
 
 Options:
   --method=N     DDSTORE_METHOD: 0=MPI RMA, 1=libfabric, 2=file-based
-                 handshake. Default: DistDataset's (DDSTORE_METHOD if set,
+                 handshake. Default: DistStore's (DDSTORE_METHOD if set,
                  else 0 with --comm=mpi, 1 with --comm=torch).
-  --comm=X       mpi or torch: the communicator vae-ddp.py gives DistDataset.
+  --comm=X       mpi or torch: the communicator vae-ddp.py gives DistStore.
                  torch uses the DDP process group and no MPI (methods 1 and
                  2; the only choice for a DDSTORE_MPI=0 build). Default: mpi
                  if pyddstore was built with MPI, else torch.

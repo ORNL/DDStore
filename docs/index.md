@@ -8,7 +8,7 @@ Each rank holds a shard of the dataset in memory; any rank reads any sample by g
 
 - **Batched reads**: [`get_batch()`](api-pyddstore.md#get_batchname-arr-indices) reads a whole batch in one call.
 - **GPUDirect RDMA**: data can live in, and be read straight into, GPU memory ([details](gpudirect.md)).
-- **PyTorch integration**: [`pyddstore.torch`](pytorch.md): `DistDataset` (any map-style dataset), `WindowedDataset` (multi-row samples), `ThreadDataLoader` (threads; safe with MPI and GPU buffers). PyTorch's `DataLoader` with [forked workers](pytorch.md#forked-dataloader-workers) also works (methods 1 and 2).
+- **PyTorch integration**: [`pyddstore.torch`](pytorch.md): `DistDataset` (any map-style dataset), `DistStore` (several datasets on one store), `WindowedDataset` (multi-row samples), `ThreadDataLoader` (threads; safe with MPI and GPU buffers). PyTorch's `DataLoader` with [forked workers](pytorch.md#forked-dataloader-workers) also works (methods 1 and 2).
 - **Thread-safe** reads, a read-time [profiler](performance.md), and a split mode (`method=2`) where one job reads data published by another.
 - **MPI optional**: methods 1 and 2 also run [without MPI](backends.md#without-mpi-methods-1-and-2) (`DDSTORE_MPI=0`), launched by `srun`.
 

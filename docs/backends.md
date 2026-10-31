@@ -49,7 +49,7 @@ Settings: `DDSTORE_HANDSHAKE_DIR`, `DDSTORE_HANDSHAKE_TIMEOUT_S`, `DDSTORE_FABRI
 
 ## Without MPI (methods 1 and 2)
 
-Methods 1 and 2 use MPI only to gather each rank's record in `add()`/`init()`. Without a communicator, that gather goes through files in a shared directory, or through a function given as `allgather=` (`DistDataset` passes `torch.distributed`'s when it has a torch group, [PyTorch integration](pytorch.md#without-mpi)):
+Methods 1 and 2 use MPI only to gather each rank's record in `add()`/`init()`. Without a communicator, that gather goes through files in a shared directory, or through a function given as `allgather=` (`DistStore` passes `torch.distributed`'s when it has a torch group, [PyTorch integration](pytorch.md#without-mpi)):
 
 ```python
 import os
@@ -74,7 +74,7 @@ srun -N2 -n8 python train.py         # no mpirun, no MPI library needed
 - With `allgather=fn`, method 1 needs no `handshake_dir` (`PyDDStore(None, method=1, rank=r, size=n, allgather=fn)`); `fn(data)` returns every rank's bytes by rank.
 - `epoch_begin`/`epoch_end` are no-ops. For barriers (e.g. before `free()`), use `pyddstore.FileComm(dir, rank, size, ns)`.
 
-`DistDataset` does this when it has no MPI communicator ([PyTorch integration](pytorch.md#without-mpi)).
+`DistStore` does this when it has no MPI communicator ([PyTorch integration](pytorch.md#without-mpi)).
 
 ## Partitioned / Sub-communicator Usage
 
@@ -86,4 +86,4 @@ sub_comm = comm.Split(rank // width, rank)
 store = dds.PyDDStore(sub_comm)                  # one independent store per group
 ```
 
-Reads stay within the group at the cost of one replica per group. `DistDataset(ddstore_width=)` does this. Not supported with `method=2`.
+Reads stay within the group at the cost of one replica per group. `DistStore(ddstore_width=)` does this. Not supported with `method=2`.

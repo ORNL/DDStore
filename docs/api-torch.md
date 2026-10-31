@@ -7,7 +7,10 @@ Generated from the docstrings. For how the pieces fit together, see
 .. automodule:: pyddstore.torch
    :no-members:
 
-.. autoclass:: pyddstore.torch.DistDataset(source, name, comm=None, ddstore_width=None, device=None, add_device=None, method=None, handshake_dir=None, chunk_size=None, encode=None, decode=None, fields=None)
+.. autoclass:: pyddstore.torch.DistStore(comm=None, method=None, handshake_dir=None, ddstore_width=None, device=None, add_device=None, chunk_size=None)
+   :members: free
+
+.. autoclass:: pyddstore.torch.DistDataset(source, name, store=None, ddstore_width=None, device=<the store's>, add_device=<the store's>, method=None, handshake_dir=None, chunk_size=<the store's>, encode=None, decode=None, fields=None, comm=None)
    :members: read_rows, alloc, release, shapes, dtypes, __getitems__
 
 .. autoclass:: pyddstore.torch.DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)

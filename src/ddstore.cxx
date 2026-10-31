@@ -82,21 +82,30 @@ DDStore::DDStore(int method, MPI_Comm comm,
 /* Methods 1/2 without MPI: records are exchanged through files in dir.     */
 DDStore::DDStore(int method, const std::string &dir, int rank, int size,
                  const std::string &ns)
-    : comm_size(size), rank(rank), n_core(0), is_extra(false)
+    : DDStore(method,
+              new FileExchange(resolve_dir(dir), rank, size,
+                               ns.empty() ? next_exchange_ns() : ns),
+              dir)
 {
+}
+
+DDStore::DDStore(int method, Exchange *x, const std::string &dir)
+    : comm_size(x->size), rank(x->rank), n_core(0), is_extra(false)
+{
+    this->exchange.reset(x);
     if (method != 1 && method != 2)
         throw std::invalid_argument(
             "a store without an MPI communicator needs method 1 or 2 (got " +
             std::to_string(method) + ")");
-    this->method        = method;
-    this->handshake_dir = resolve_dir(dir);
+    this->method = method;
+    if (method == 2 || !dir.empty())
+        this->handshake_dir = resolve_dir(dir);
     if (method == 2)
-        this->n_core = size;
-    this->exchange.reset(new FileExchange(this->handshake_dir, rank, size,
-                                          ns.empty() ? next_exchange_ns() : ns));
-    if (method == 2)
+    {
+        this->n_core = this->comm_size;
         fprintf(stderr, "[DDStore] method=2 core (no MPI): handshake_dir=%s, rank=%d, n_core=%d\n",
-                this->handshake_dir.c_str(), rank, size);
+                this->handshake_dir.c_str(), this->rank, this->comm_size);
+    }
 }
 
 /* Method 2: extra member constructor (no MPI communicator needed). */
@@ -199,6 +208,7 @@ void DDStore::join(std::string name)
         throw std::logic_error("join() is only valid for extra members");
     if (this->method != 2)
         throw std::logic_error("join() requires method=2");
+    this->new_name(name);
 
     struct fabric_state *fs =
         (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
@@ -339,21 +349,35 @@ void DDStore::free()
         return;
     }
 
+    for (auto &x : this->varlist)
+        if (x.second.active)
+            this->release(x.second, true);
     int finalized = 0;
 #ifdef DDSTORE_HAVE_MPI
     MPI_Finalized(&finalized);
 #endif
     (void)finalized;
-    for (auto &x : this->varlist)
-    {
-        VarInfo_t &var = x.second;
-        if (!var.active)
-            continue;
+#ifdef DDSTORE_HAVE_MPI
+    if (this->coll_comm != MPI_COMM_NULL && !finalized)
+        MPI_Comm_free(&this->coll_comm);
+#endif
+}
 
+/* Release one variable's window (if have_win) or fabric resources and its
+ * buffer: free(), and add_base() when it fails part way.                  */
+void DDStore::release(VarInfo_t &var, bool have_win)
+{
+    int finalized = 0;
+#ifdef DDSTORE_HAVE_MPI
+    MPI_Finalized(&finalized);
+#endif
+    (void)finalized;
+    (void)have_win;
+    {
         if (this->method == 0)
         {
 #ifdef DDSTORE_HAVE_MPI
-            if (!finalized)
+            if (have_win && !finalized)
                 MPI_Win_free(&var.win);
 #endif
         }
@@ -384,8 +408,4 @@ void DDStore::free()
         var.owns_base = false;
         var.active = false;
     }
-#ifdef DDSTORE_HAVE_MPI
-    if (this->coll_comm != MPI_COMM_NULL && !finalized)
-        MPI_Comm_free(&this->coll_comm);
-#endif
 }

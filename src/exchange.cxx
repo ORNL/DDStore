@@ -21,6 +21,12 @@ void MpiExchange::allgather(const void *in, void *out, size_t bytes)
 }
 #endif
 
+void CallbackExchange::allgather(const void *in, void *out, size_t bytes)
+{
+    if (this->fn(this->ctx, in, out, bytes) != 0)
+        throw std::runtime_error("allgather callback failed");
+}
+
 std::string next_exchange_ns()
 {
     static std::atomic<long> n(0);

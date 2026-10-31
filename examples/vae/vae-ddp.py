@@ -13,7 +13,7 @@ from torchvision.utils import save_image
 import torch.distributed as dist
 
 import pyddstore
-from pyddstore.torch import DistDataset, ThreadDataLoader
+from pyddstore.torch import DistDataset, DistStore, ThreadDataLoader
 
 from ddp_utils import setup_ddp, get_local_rank
 from vae_model import VAE, loss_function, mnist_transform
@@ -106,7 +106,7 @@ parser.add_argument(
     "--comm",
     choices=["mpi", "torch"],
     default=None,
-    help="Communicator for DistDataset and this script's barriers and "
+    help="Communicator for DistStore and this script's barriers and "
     "reductions: mpi (mpi4py COMM_WORLD) or torch (the torch.distributed "
     "group set up for DDP; stores then exchange their records through "
     "files, methods 1 and 2 only). Default: mpi if pyddstore was built "
@@ -182,12 +182,13 @@ optimizer = optim.Adam(model.parameters(), lr=1e-3)
 mnist_train = datasets.MNIST(
     "data", train=True, download=True, transform=mnist_transform(args.image_scale)
 )
-trainset = DistDataset(
-    torch.utils.data.ConcatDataset([mnist_train] * args.replicate),
-    "train",
+store = DistStore(
     comm,
     device=device if args.gpu_dest else None,
     add_device=device if args.gpu_source else None,
+)
+trainset = DistDataset(
+    torch.utils.data.ConcatDataset([mnist_train] * args.replicate), "train", store
 )
 # trainset = datasets.MNIST('data', train=True, download=True,transform=transforms.ToTensor())
 barrier()

@@ -47,7 +47,7 @@ import torch
 from torchvision import datasets, transforms
 
 import pyddstore
-from pyddstore.torch import DistDataset
+from pyddstore.torch import DistDataset, DistStore
 from vae_model import mnist_transform
 
 
@@ -77,7 +77,7 @@ if os.environ.get("DDSTORE_COMM", "mpi" if pyddstore.HAVE_MPI else "file") == "m
     rank = comm.Get_rank()
     barrier = comm.Barrier
 else:
-    # No MPI: DistDataset(comm=None) finds the same ranks; this FileComm is
+    # No MPI: DistStore(comm=None) finds the same ranks; this FileComm is
     # only for the barriers below.
     os.environ["DDSTORE_COMM"] = "file"
     comm = None
@@ -101,11 +101,9 @@ barrier()
 trainset = datasets.MNIST(
     "data", train=True, download=True, transform=mnist_transform(image_scale)
 )
+store = DistStore(comm, add_device=add_device)  # method 2, hs_dir: from the env above
 dds_trainset = DistDataset(
-    torch.utils.data.ConcatDataset([trainset] * replicate),
-    "train",
-    comm,
-    add_device=add_device,
+    torch.utils.data.ConcatDataset([trainset] * replicate), "train", store
 )
 barrier()
 
@@ -138,7 +136,7 @@ if rank == 0:
     print("[core] sentinel received, shutting down", flush=True)
 barrier()
 
-dds_trainset.ddstore.free()
+store.free()
 
 if rank == 0:
     for fname in os.listdir(hs_dir):

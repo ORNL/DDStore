@@ -1,15 +1,16 @@
 # `PyDDStore` reference
 
-## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None, rank=None, size=0, exchange_ns="")`
+## `PyDDStore(comm_or_none=None, method=0, handshake_dir="", n_core=0, nic_map=None, rank=None, size=0, exchange_ns="", allgather=None)`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `comm_or_none` | `mpi4py.MPI.Comm` or `None` | MPI communicator covering all ranks. `None` for a `method=2` extra member, or for a store [without MPI](backends.md#without-mpi-methods-1-and-2) (with `rank=`) |
 | `method` | `int` | `0` = MPI RMA (default), `1` = libfabric RDMA, `2` = file-based handshake (see [below](backends.md#file-based-handshake-method2)) |
-| `handshake_dir` | `str` | Required for `method=2` and without MPI: shared-filesystem directory used to exchange RDMA addresses |
+| `handshake_dir` | `str` | Required for `method=2`, and without MPI unless `allgather` is given: shared-filesystem directory used to exchange RDMA addresses |
 | `n_core` | `int` | Required for a `method=2` extra member: number of core ranks that published data. Without MPI, also accepted for `size` with `method=2` |
 | `rank`, `size` | `int` | Without MPI (`comm_or_none=None`, `method=1`/`2`): this process is rank `rank` of `size` (e.g. `SLURM_PROCID`, `SLURM_NTASKS`) |
 | `exchange_ns` | `str` | Without MPI: names this store's exchange files; default `s0`, `s1`, … in creation order, which is right as long as every rank creates its stores in the same order. Avoid `.` in it |
+| `allgather` | callable or `None` | Without MPI: exchange records through `allgather(data: bytes)`, which returns every rank's bytes by rank (a list, or their concatenation), instead of files. All ranks call it together in `add()`/`init()` (e.g. `torch.distributed`); its exception is re-raised there and should occur on every rank |
 | `nic_map` | `str` or `None` | Optional, `method=1`/`2` only: a precomputed CPU→NIC map string (see [`DDSTORE_NIC_MAP`](backends.md#libfabric-rdma-method1) below) to use instead of the environment variable. Ignored if `FABRIC_IFACE` is already set |
 
 Call shapes:
@@ -21,17 +22,18 @@ PyDDStore(comm, method=2, handshake_dir="/path")      # method 2, core member (n
 PyDDStore(None, method=2, handshake_dir="/path", n_core=N)  # method 2, extra member (no comm)
 PyDDStore(None, method=1, handshake_dir="/path", rank=r, size=N)  # method 1 without MPI
 PyDDStore(None, method=2, handshake_dir="/path", rank=r, size=N)  # method 2 core member without MPI
+PyDDStore(None, method=1, rank=r, size=N, allgather=fn)  # method 1 without MPI, no files
 ```
 
 In a build without MPI (`DDSTORE_MPI=0`, `pyddstore.HAVE_MPI` is `False`) only the last three work; a communicator raises `RuntimeError`.
 
-Independent stores per group of ranks: `comm.Split()` and pass the sub-communicator (`DistDataset(ddstore_width=)` does this).
+Independent stores per group of ranks: `comm.Split()` and pass the sub-communicator (`DistStore(ddstore_width=)` does this).
 
 ---
 
 ## `init(name, nrows, disp, itemsize=1)`
 
-Pre-allocate a named variable without providing data yet. Use `update()` to fill it in afterwards. **Collective**.
+Pre-allocate a named variable without providing data yet. Use `update()` to fill it in afterwards. **Collective**. Raises `ValueError` if `name` is in use (as do `add()` and `join()`).
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -135,6 +137,12 @@ A read-only `PyDDStore` for the same variables, with its own libfabric endpoints
 
 ---
 
+## `has(name)`
+
+`True` if variable `name` is added or joined and not freed.
+
+---
+
 ## `info(name)`
 
 Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed or `join()`-ed. Useful on the extra side to size output buffers without hardcoding shapes.
@@ -149,7 +157,7 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 ## `free()`
 
-Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`.
+Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`. Freed names can be added again.
 
 ---
 

@@ -21,6 +21,7 @@ cdef inline size_t _host_ptr(arr) except? 0:
         return <size_t> np.PyArray_DATA(<np.ndarray> arr)
     return arr.ctypes.data
 
+from libc.string cimport memcpy
 from libcpp.string cimport string
 from libcpp.typeinfo cimport type_info
 
@@ -98,6 +99,14 @@ def _check_dtype(arr, bint is_gpu):
     if not ok:
         raise NotImplementedError("unsupported dtype: %s" % arr.dtype)
 
+cdef extern from "exchange.hpp":
+    cdef cppclass Exchange:
+        pass
+    # allgather through a function (see _allgather_cb)
+    cdef cppclass CallbackExchange(Exchange):
+        CallbackExchange(int (*fn)(void *, const void *, void *, size_t) noexcept,
+                         void *ctx, int rank, int size)
+
 cdef extern from "ddstore.hpp":
     ctypedef struct VarInfo:
         string name
@@ -111,6 +120,8 @@ cdef extern from "ddstore.hpp":
         # Methods 1/2 without MPI: rank of size, records exchanged via files
         DDStore(int method, string handshake_dir, int rank, int size,
                 string ns) except +
+        # Methods 1/2 without MPI: records exchanged through x (owned)
+        DDStore(int method, Exchange *x, string handshake_dir) except +
         # Method 2: extra member (no MPI communicator)
         DDStore(int method, string handshake_dir, int n_core) except +
         void add[T](string name, T* buffer, long nrows, int disp, int hmem_iface) except +
@@ -126,6 +137,7 @@ cdef extern from "ddstore.hpp":
         void join(string name) except +
         void query(string name, VarInfo &varinfo) except +
         long size(string name) except +
+        bint has(string name)
         void profile(string name, unsigned long long *out) except +
         DDStore *fork_reader() except +
 
@@ -137,6 +149,28 @@ cdef extern from "ddstore.hpp":
 # True if this build has MPI (method 0 and MPI communicators); False for a
 # DDSTORE_MPI=0 build, where only methods 1 and 2 without a communicator work.
 HAVE_MPI = bool(ddstore_have_mpi)
+
+
+cdef int _allgather_cb(void *ctx, const void *inp, void *out, size_t n) noexcept with gil:
+    # CallbackExchange's function for a store made with allgather=: runs the
+    # Python allgather (add()/init() hold the GIL; this takes it anyway). An
+    # exception is kept on the store and re-raised by add()/init().
+    cdef PyDDStore st = <PyDDStore>ctx
+    try:
+        got = st._allgather((<const char *>inp)[:n])
+        if isinstance(got, bytearray):
+            got = bytes(got)
+        elif not isinstance(got, bytes):
+            got = b"".join(got)
+        if <size_t>len(got) != n * st._x_size:
+            raise RuntimeError(
+                "allgather returned %d bytes, expected %d (%d ranks x %d)"
+                % (len(got), n * st._x_size, st._x_size, n))
+        memcpy(out, <const char *>got, len(got))
+        return 0
+    except BaseException as e:
+        st._allgather_err = e
+        return -1
 
 cdef extern from "exchange.hpp":
     cdef cppclass FileExchange:
@@ -235,10 +269,14 @@ cdef class PyDDStore:
     cdef double _prof_get_s
     cdef double _prof_sync_s
     cdef long _prof_gets
+    # allgather= stores: the Python allgather, its size, and its last error
+    cdef object _allgather
+    cdef int _x_size
+    cdef object _allgather_err
 
     def __cinit__(self, comm_or_none=None, int method=0,
                   str handshake_dir="", int n_core=0, nic_map=None,
-                  rank=None, int size=0, str exchange_ns=""):
+                  rank=None, int size=0, str exchange_ns="", allgather=None):
         """
         Constructors:
           PyDDStore(comm)                          — method 0, MPI
@@ -259,6 +297,15 @@ cdef class PyDDStore:
         every rank must create its stores in the same order. exchange_ns
         names this store's exchange files; by default stores are numbered
         in creation order.
+
+        allgather: with rank= and size=, exchange the records through this
+          function instead of files: allgather(data) gets this rank's bytes
+          (the same length on every rank) and returns every rank's, by rank
+          (a list of bytes, or their concatenation). Every rank of the store
+          calls it together, in add() and init(), e.g. through
+          torch.distributed. handshake_dir is then needed only for method=2.
+          An exception it raises is re-raised by add()/init() (it should
+          raise on every rank, or the others stay blocked).
 
         nic_map: optional precomputed CPU->NIC map string (see
           cpu_nic_map.py --env) used to select FABRIC_IFACE for this rank's
@@ -283,16 +330,28 @@ cdef class PyDDStore:
                 raise ValueError(
                     "a store without an MPI communicator needs method=1 or 2 "
                     "(got method=%d)" % method)
-            if not handshake_dir:
+            if not handshake_dir and (allgather is None or method == 2):
                 raise ValueError(
                     "a store without an MPI communicator needs handshake_dir "
-                    "(a directory every rank sees)")
+                    "(a directory every rank sees)%s"
+                    % ("" if allgather is None else " for method=2"))
             if size <= 0:
                 size = n_core
             if size <= 0:
                 raise ValueError("rank= needs size= (or n_core= for method=2) > 0")
-            self.c_ddstore = new DDStore(method, s2b(handshake_dir), <int>rank,
-                                         size, s2b(exchange_ns))
+            if not 0 <= rank < size:
+                raise ValueError("need 0 <= rank < size (got rank=%d, size=%d)"
+                                 % (rank, size))
+            if allgather is not None:
+                self._allgather = allgather
+                self._x_size = size
+                self.c_ddstore = new DDStore(
+                    method,
+                    new CallbackExchange(_allgather_cb, <void *>self, <int>rank, size),
+                    s2b(handshake_dir))
+            else:
+                self.c_ddstore = new DDStore(method, s2b(handshake_dir), <int>rank,
+                                             size, s2b(exchange_ns))
         elif method == 2:
             if not handshake_dir:
                 raise ValueError(
@@ -365,12 +424,16 @@ cdef class PyDDStore:
         # DDStore::add<T>() only uses T through sizeof(T), so dispatching on
         # item size is enough.
         cdef string cname = s2b(name)
-        if itemsize == 1:
-            self.c_ddstore.add(cname, <char *> ptr, nrows, disp, iface)
-        elif itemsize == 4:
-            self.c_ddstore.add(cname, <int *> ptr, nrows, disp, iface)
-        else:
-            self.c_ddstore.add(cname, <long *> ptr, nrows, disp, iface)
+        try:
+            if itemsize == 1:
+                self.c_ddstore.add(cname, <char *> ptr, nrows, disp, iface)
+            elif itemsize == 4:
+                self.c_ddstore.add(cname, <int *> ptr, nrows, disp, iface)
+            else:
+                self.c_ddstore.add(cname, <long *> ptr, nrows, disp, iface)
+        except RuntimeError:
+            self._raise_allgather_err()
+            raise
 
         if is_gpu:
             # Keepalive: DDStore now holds a raw pointer into arr's storage
@@ -552,7 +615,17 @@ cdef class PyDDStore:
         self._recv_buffers.clear()
 
     def init(self, str name, long nrows, int disp, int itemsize=1):
-        self.c_ddstore.init(s2b(name), nrows, disp, itemsize)
+        try:
+            self.c_ddstore.init(s2b(name), nrows, disp, itemsize)
+        except RuntimeError:
+            self._raise_allgather_err()
+            raise
+
+    def _raise_allgather_err(self):
+        # The allgather= function's exception, if it is what failed
+        err, self._allgather_err = self._allgather_err, None
+        if err is not None:
+            raise err
 
     def update(self, str name, arr, long offset):
         if _is_cuda_tensor(arr):
@@ -591,6 +664,10 @@ cdef class PyDDStore:
         cdef PyDDStore r = PyDDStore(_NO_STORE, method=self.method)
         r.c_ddstore = self.c_ddstore.fork_reader()
         return r
+
+    def has(self, str name):
+        """True if variable `name` is added or joined and not freed."""
+        return self.c_ddstore.has(s2b(name))
 
     def info(self, str name):
         """Return (total_rows, disp, itemsize) for an added or joined variable."""

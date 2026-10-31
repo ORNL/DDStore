@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset  # noqa: E402
 from pyddstore.torch import (
     DistDataset,
     DistDatasetReader,
+    DistStore,
     ThreadDataLoader,
     WindowedDataset,
     row_of,
@@ -499,6 +500,114 @@ def test_thread_loader_readers(comm, monkeypatch, method, own):
     ok &= ds.ddstore is ds._ddstore and same(ds[3], src[3])
     calls = sum(ds.get_profile(v)["calls"] for v in ds._var)
     ok &= calls == 0 or calls >= 2 * len(ref) * len(ds._var)  # 0 unless DDSTORE_PROFILE
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize(
+    "method",
+    METHODS
+    + [pytest.param(2, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))],
+)
+def test_dist_store(comm, monkeypatch, tmp_path, method):
+    """Several datasets on one DistStore: one PyDDStore and one set of
+    thread readers; names checked; free() frees them all."""
+    if method != 0:
+        monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    src = TupleSource()
+    part = torch.utils.data.Subset(src, range(5, N))
+    cpu = torch.device("cpu")
+    store = DistStore(comm, method=method, handshake_dir=hs, device=cpu, chunk_size=4)
+    a = DistDataset(src, "a", store)  # the store's device and chunk_size
+    b = DistDataset(part, "b", store, device=None, chunk_size=None)  # overridden
+    ok = a.store is b.store is store and a.ddstore is b.ddstore is store.ddstore
+    ok &= a.device is None and b.device is None  # a CPU device is host memory
+    ok &= a.chunk_size == 4 and b.chunk_size is None
+    ok &= store.names == ["a", "b"] and len(b) == N - 5
+    for ds, ref in ((a, src), (b, part)):
+        nw = 0 if method == 0 else 2  # method 0: collective reads, one thread
+        got = list(ThreadDataLoader(ds, batch_size=4, num_workers=nw))
+        want = list(DataLoader(ref, batch_size=4))
+        ok &= len(got) == len(want) and all(same(g, r) for g, r in zip(got, want))
+    ok &= a._readers is b._readers
+    with pytest.raises(ValueError, match="already a dataset"):
+        DistDataset(src, "a", store)
+    with pytest.raises(ValueError, match="DistStore's"):
+        DistDataset(src, "c", store, method=method)
+    with pytest.raises(ValueError, match="DistStore's"):
+        DistDataset(src, "c", store, comm=comm)
+    with pytest.raises(ValueError, match="once"):
+        DistDataset(src, "c", comm, comm=comm)
+    if method == 2:  # another store can't publish "a" in the same directory
+        with pytest.raises(ValueError, match="another DistStore"):
+            DistDataset(src, "a", comm, method=2, handshake_dir=hs)
+    comm.Barrier()
+    store.free()
+    with pytest.raises(RuntimeError, match="freed"):
+        DistDataset(src, "c", store)
+    # the names are free again; comm= builds a store of its own
+    c = DistDataset(src, "a", comm=comm, method=method, handshake_dir=hs)
+    ok &= same(c[N - 1], src[N - 1])
+    comm.Barrier()
+    c.store.free()
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
+def test_dist_store_file_names(comm, monkeypatch, tmp_path):
+    """method=2 names that publish the same files ("a.b", "a_b") are
+    rejected, also across stores, and on every rank when the other store
+    covers only some of them (no rank left waiting in a collective)."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    src = TupleSource()
+    store = DistStore(comm, method=2, handshake_dir=hs)
+    DistDataset(src, "a.b", store)
+    with pytest.raises(ValueError, match="would overwrite"):
+        DistDataset(src, "a_b", store)
+    with pytest.raises(ValueError, match="another DistStore"):
+        DistDataset(src, "a_b", comm, method=2, handshake_dir=hs)
+    comm.Barrier()
+    store.free()
+    if comm.Get_size() >= 2:
+        sub = comm.Split(comm.Get_rank() % 2, comm.Get_rank())
+        part = None
+        if comm.Get_rank() % 2 == 0:  # only the even ranks hold "even"
+            part = DistDataset(src, "even", sub, method=2, handshake_dir=hs)
+        with pytest.raises(ValueError, match="would overwrite"):
+            DistDataset(src, "even", comm, method=2, handshake_dir=hs)
+        comm.Barrier()
+        if part is not None:
+            part.store.free()
+        sub.Free()
+    assert all_ok(comm, True)
+
+
+@pytest.mark.parametrize("method", [m for m in METHODS if m != 0])
+def test_dist_store_frees_readers(comm, monkeypatch, method):
+    """store.free() frees the thread readers too; a loader closed after it
+    doesn't fail."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    store = DistStore(comm, method=method)
+    ds = DistDataset(TupleSource(), f"fr{method}", store)
+    loader = ThreadDataLoader(ds, batch_size=4, num_workers=2, reuse_buffers=True)
+    list(loader)
+    readers = list(ds._readers.values())
+    comm.Barrier()
+    store.free()
+    ok = bool(readers) and not any(r.has(f"fr{method}/0") for r in readers)
+    loader.close()
+    ok &= list(ds._readers.values()) == readers  # kept, not reopened
+    assert all_ok(comm, ok)
+
+
+def test_dist_dataset_positional(comm, monkeypatch):
+    """The 2.0 positional order still works: (source, name, comm,
+    ddstore_width, device, add_device, method)."""
+    ds = DistDataset(TupleSource(), "pos", comm, comm.Get_size(), None, None, 0)
+    ok = ds.method == 0 and ds.ddstore_width == comm.Get_size()
+    ok &= same(ds[2], TupleSource()[2])
     finish(comm, ds)
     assert all_ok(comm, ok)
 

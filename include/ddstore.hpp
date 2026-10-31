@@ -104,6 +104,11 @@ public:
     DDStore(int method, const std::string &dir, int rank, int size,
             const std::string &ns = "");
 
+    /* Methods 1 and 2 without MPI, exchanging records through x (rank and
+     * size from x), which the store takes ownership of. dir is needed only
+     * for method 2, where rank 0 publishes {name}.bin for extra members.   */
+    DDStore(int method, Exchange *x, const std::string &dir = "");
+
     /* Method 2: extra member constructor (no MPI communicator required).
      * The extra member calls join() per variable to discover the data.      */
     DDStore(int method, const std::string &handshake_dir, int n_core);
@@ -126,6 +131,13 @@ public:
     ~DDStore();
 
     void query(std::string name, VarInfo_t &varinfo);
+
+    /* True if `name` is added or joined and not freed. */
+    bool has(const std::string &name) const
+    {
+        auto it = this->varlist.find(name);
+        return it != this->varlist.end() && it->second.active;
+    }
 
     /* Total row count across all core ranks for a variable (added or joined). */
     long size(std::string name)
@@ -180,6 +192,7 @@ public:
     {
         if (this->method == 0 && hmem_iface != 0)
             throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
+        this->new_name(name);
 
         void *base = NULL;
         int how = BASE_ALIGNED;
@@ -202,6 +215,7 @@ public:
 
     void init(std::string name, long nrows, int disp, int itemsize)
     {
+        this->new_name(name);
         int how = BASE_ALIGNED;
         size_t len = 0;
         void *base = alloc_base((size_t)nrows * disp * itemsize, how, len);
@@ -482,6 +496,18 @@ private:
     /* add()/init() after the buffer is in place: expose `base` (nrows rows
      * of disp items of itemsize bytes) through this store's method and
      * record the variable. Collective over the store's ranks.              */
+    /* add()/init()/join() of `name`: an error if it is in use; a freed
+     * variable of that name is replaced. Collective callers pass the same
+     * names on every rank, so every rank throws together.                  */
+    void new_name(const std::string &name)
+    {
+        if (this->has(name))
+            throw std::invalid_argument("variable '" + name + "' already exists in this store");
+        this->varlist.erase(name);
+    }
+
+    void release(VarInfo_t &var, bool have_win);
+
     void add_base(const std::string &name, void *base, long nrows, int disp, int itemsize,
                   int hmem_iface, bool owns_base, int how, size_t len)
     {
@@ -497,87 +523,98 @@ private:
         var.base_len     = len;
         var.fabric_state = NULL;
 
-        if (this->method == 0)
+        /* On failure (an MPI or fabric error, the exchange, mismatched
+         * shapes), release what was set up before rethrowing: the variable
+         * isn't in varlist yet, so free() wouldn't.                        */
+        bool have_win = false;
+        try
         {
+            if (this->method == 0)
+            {
 #ifdef DDSTORE_HAVE_MPI
-            int rc = MPI_Win_create(base,                              /* pre-allocated buffer */
-                                    (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
-                                    disp * itemsize,                   /* displacement units */
-                                    MPI_INFO_NULL,                     /* info object */
-                                    this->comm,                        /* communicator */
-                                    &var.win /* window object */);
-            if (rc != MPI_SUCCESS)
-            {
-                if (owns_base)
-                    free_base(base, how, len);
-                /* Typically no RMA (osc) component accepts the window: with
-                 * Open MPI 4.1 and no RDMA NIC, osc/pt2pt is the only choice
-                 * and it rejects MPI_THREAD_MULTIPLE (mpi4py's default);
-                 * osc/ucx over shared memory works (see .github/workflows). */
-                ddstore_mpi_check(rc, "MPI_Win_create",
-                                  " (no MPI RMA component usable with this build's "
-                                  "thread level/network? With Open MPI 4.1 try "
-                                  "OMPI_MCA_osc=ucx OMPI_MCA_opal_common_ucx_tls=any "
-                                  "OMPI_MCA_opal_common_ucx_devices=any)");
-            }
+                int rc = MPI_Win_create(base,                              /* pre-allocated buffer */
+                                        (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
+                                        disp * itemsize,                   /* displacement units */
+                                        MPI_INFO_NULL,                     /* info object */
+                                        this->comm,                        /* communicator */
+                                        &var.win /* window object */);
+                if (rc != MPI_SUCCESS)
+                {
+                    /* Typically no RMA (osc) component accepts the window: with
+                     * Open MPI 4.1 and no RDMA NIC, osc/pt2pt is the only choice
+                     * and it rejects MPI_THREAD_MULTIPLE (mpi4py's default);
+                     * osc/ucx over shared memory works (see .github/workflows). */
+                    ddstore_mpi_check(rc, "MPI_Win_create",
+                                      " (no MPI RMA component usable with this build's "
+                                      "thread level/network? With Open MPI 4.1 try "
+                                      "OMPI_MCA_osc=ucx OMPI_MCA_opal_common_ucx_tls=any "
+                                      "OMPI_MCA_opal_common_ucx_devices=any)");
+                }
+                have_win = true;
 
-            std::vector<long> lenlist(this->comm_size);
-            MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
+                std::vector<long> lenlist(this->comm_size);
+                MPI_Allgather(&nrows, 1, MPI_LONG, lenlist.data(), 1, MPI_LONG, this->comm);
 
-            int max_disp = 0;
-            // We assume disp is same for all
-            MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
-            if (max_disp != disp)
-                throw std::invalid_argument("Invalid disp");
-
-            long sum = 0;
-            for (long unsigned int i = 0; i < lenlist.size(); i++)
-            {
-                sum += lenlist[i];
-                lenlist[i] = sum;
-            }
-            var.lenlist = lenlist;
-#endif
-        }
-        else
-        {
-            /* Methods 1 and 2 (core): open the fabric, register the buffer,
-             * and exchange records with every rank of the store. Method 2
-             * rank 0 also publishes them for extra members to join.        */
-            struct fabric_state *fs = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
-            pthread_mutex_init(&fs->recv_lock, NULL);
-            fs->send_data       = (char *)base;
-            fs->send_data_len   = (size_t)nrows * disp * itemsize;
-            fs->send_hmem_iface = hmem_iface;
-            fs->world_size      = this->comm_size;
-            fs->rank            = this->rank;
-            var.fabric_state    = fs;
-
-            init_fabric(fs);
-            if (!fs->info)
-                throw std::runtime_error("init_fabric failed: no suitable fabric found");
-            if (hmem_iface != 0 && !is_hmem_capable(fs))
-                throw std::runtime_error(
-                    "GPU source buffer requires DDSTORE_FABRIC=cxi "
-                    "(current fabric does not support FI_HMEM)");
-            register_send_mr(fs);
-
-            std::vector<struct CoreRecord> &all = var.records;
-            exchange_records(fs, *this->exchange, nrows, disp, itemsize, all);
-            if (this->method == 2 && this->rank == 0)
-                publish_records(this->handshake_dir.c_str(), name.c_str(), all);
-
-            /* Every rank sees the same records, so every rank throws
-             * together if the shapes disagree.                             */
-            long sum = 0;
-            var.lenlist.resize(all.size());
-            for (size_t i = 0; i < all.size(); i++)
-            {
-                if (all[i].disp != disp || all[i].itemsize != itemsize)
+                int max_disp = 0;
+                // We assume disp is same for all
+                MPI_Allreduce(&disp, &max_disp, 1, MPI_INT, MPI_MAX, this->comm);
+                if (max_disp != disp)
                     throw std::invalid_argument("Invalid disp");
-                sum += all[i].nrows;
-                var.lenlist[i] = sum;
+
+                long sum = 0;
+                for (long unsigned int i = 0; i < lenlist.size(); i++)
+                {
+                    sum += lenlist[i];
+                    lenlist[i] = sum;
+                }
+                var.lenlist = lenlist;
+#endif
             }
+            else
+            {
+                /* Methods 1 and 2 (core): open the fabric, register the buffer,
+                 * and exchange records with every rank of the store. Method 2
+                 * rank 0 also publishes them for extra members to join.        */
+                struct fabric_state *fs = (struct fabric_state *)calloc(1, sizeof(struct fabric_state));
+                pthread_mutex_init(&fs->recv_lock, NULL);
+                fs->send_data       = (char *)base;
+                fs->send_data_len   = (size_t)nrows * disp * itemsize;
+                fs->send_hmem_iface = hmem_iface;
+                fs->world_size      = this->comm_size;
+                fs->rank            = this->rank;
+                var.fabric_state    = fs;
+
+                init_fabric(fs);
+                if (!fs->info)
+                    throw std::runtime_error("init_fabric failed: no suitable fabric found");
+                if (hmem_iface != 0 && !is_hmem_capable(fs))
+                    throw std::runtime_error(
+                        "GPU source buffer requires DDSTORE_FABRIC=cxi "
+                        "(current fabric does not support FI_HMEM)");
+                register_send_mr(fs);
+
+                std::vector<struct CoreRecord> &all = var.records;
+                exchange_records(fs, *this->exchange, nrows, disp, itemsize, all);
+                if (this->method == 2 && this->rank == 0)
+                    publish_records(this->handshake_dir.c_str(), name.c_str(), all);
+
+                /* Every rank sees the same records, so every rank throws
+                 * together if the shapes disagree.                             */
+                long sum = 0;
+                var.lenlist.resize(all.size());
+                for (size_t i = 0; i < all.size(); i++)
+                {
+                    if (all[i].disp != disp || all[i].itemsize != itemsize)
+                        throw std::invalid_argument("Invalid disp");
+                    sum += all[i].nrows;
+                    var.lenlist[i] = sum;
+                }
+            }
+        }
+        catch (...)
+        {
+            this->release(var, have_win);
+            throw;
         }
 
         this->varlist.insert(std::pair<std::string, VarInfo_t>(name, var));

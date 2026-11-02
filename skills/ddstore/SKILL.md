@@ -13,7 +13,7 @@ Files in this skill's directory (paths below are relative to it):
 - [hpc.md](hpc.md): Slurm, Frontier and Perlmutter settings, errors.
 - `scripts/check_env.py`: build, methods, resolved communicator and settings. Run it first: `python <this skill's directory>/scripts/check_env.py`.
 
-Full docs: https://github.com/ORNL/DDStore/tree/main/docs. Complete example: https://github.com/ORNL/DDStore/blob/main/examples/vae/vae-ddp.py.
+Full docs: https://github.com/ORNL/DDStore/tree/main/docs. Complete examples: [examples/minimal/train.py](https://github.com/ORNL/DDStore/blob/main/examples/minimal/train.py) (about 100 lines; start here), [examples/vae/vae-ddp.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae-ddp.py) (all options).
 
 ## Steps
 

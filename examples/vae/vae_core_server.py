@@ -88,7 +88,13 @@ add_device = None
 if gpu_source:
     if not torch.cuda.is_available():
         raise RuntimeError("--gpu-source requires a visible CUDA/HIP GPU")
-    add_device = torch.device("cuda")
+    # One visible GPU (--gpus-per-task=1): device 0. All of the node's GPUs
+    # (--mpmd, Perlmutter): this task's local rank.
+    if torch.cuda.device_count() > 1:
+        add_device = torch.device("cuda", int(os.environ.get("SLURM_LOCALID", "0")))
+    else:
+        add_device = torch.device("cuda", 0)
+    torch.cuda.set_device(add_device)
 
 if rank == 0:
     os.makedirs(hs_dir, exist_ok=True)
@@ -150,4 +156,4 @@ if rank == 0:
     except OSError:
         pass
 
-print(f"[core rank {rank}] done", flush=True)
+print(f"[core rank {rank}] done, shard on {add_device or 'host'}", flush=True)

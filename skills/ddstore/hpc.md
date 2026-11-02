@@ -30,7 +30,9 @@ srun -N2 -n16 -c7 --gpus-per-task=1 python -u train.py
 # srun -N2 -n8 -c32 --gpus-per-node=4 python -u train.py
 ```
 
-Use `srun`, not `torchrun` or `mpirun`. Set `handshake_dir` to Lustre scratch.
+On Slurm systems use `srun`, not `torchrun` or `mpirun`. Set `handshake_dir` to Lustre scratch.
+
+Complete scripts: [job-vae-single.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-single.sh).
 
 ## Core/extra split (method 2, two srun steps)
 
@@ -41,7 +43,7 @@ srun -N1 -n8 ... bash -c "$WRAP" _ python core.py &
 srun -N3 -n24 ... bash -c "$WRAP" _ python extra.py
 ```
 
-Each step on its own nodes on Frontier. Template: `examples/vae/script/job-vae-core-extra.sh`.
+Each step on its own nodes on Frontier. Template: [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh).
 
 ## Errors
 

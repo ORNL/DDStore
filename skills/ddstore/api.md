@@ -40,7 +40,7 @@ Each rank loads its share of `source`; every rank reads every sample. Collective
 - `encode(sample) -> stored`, `decode(stored, index) -> sample`: for strings, labels, metadata. `decode` runs on the reading rank.
 - `fields=[...]`: keep only these keys/positions (not with `encode`).
 - Attributes and methods: `ds.shapes`, `ds.dtypes`, `ds.store`, `ds.ddstore` (the `PyDDStore`), `ds.read_rows(rows, fields=None, out=None)`, `ds.alloc(n, fields=None)`, `ds.release(bufs)`, `ds.get_profile(name)`.
-- Batches: `__getitems__` reads a batch with one `get_batch()` per field. With method 0 this is collective.
+- Batches: `__getitems__` reads a batch with one `get_batch()` per field (also with `decode`, which then runs per sample). With method 0 this is collective. `ThreadDataLoader` with the default `collate_fn` also reads straight into the batch tensors (direct collation); `decode`, record fields, a custom `collate_fn` or a wrapper dataset turn that off but keep the batched reads, as long as a wrapper forwards `__getitems__`.
 
 ## DistDatasetReader
 
@@ -56,7 +56,7 @@ Reads a method-2 `DistDataset` from a separate job (the "extra" ranks). `n_core`
 ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader_args)
 ```
 
-`DataLoader` with worker threads. Works with all methods and GPU destinations. `num_workers=0` reads in the main thread. Call `loader.close()` with `reuse_buffers=True`.
+`DataLoader` with worker threads; batches are always fetched on a worker thread, never the calling one (`num_workers=0` means one worker thread). Methods 1/2: any number of workers, each with its own reader. Method 0: one worker only (reads are collective). Thread-local state and random transforms in a dataset or wrapper run on the worker threads. Call `loader.close()` with `reuse_buffers=True`.
 
 ## WindowedDataset, row_of
 

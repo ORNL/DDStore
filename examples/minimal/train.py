@@ -5,10 +5,16 @@ that every rank reads the samples the source produces.
   mpirun -n 2 python examples/minimal/train.py                 # MPI build
   srun -n 8 python examples/minimal/train.py --comm torch      # torch.distributed
   DDSTORE_METHOD=1 srun -n 8 python examples/minimal/train.py  # libfabric
+
+DDP's rendezvous uses MASTER_ADDR and MASTER_PORT. If MASTER_ADDR is unset,
+the first host of the Slurm allocation is used (any number of nodes), else
+127.0.0.1 (one node). Set MASTER_PORT if another job step on the same node
+uses 29500.
 """
 
 import argparse
 import os
+import subprocess
 
 import torch  # torch first, then pyddstore, then mpi4py
 import torch.distributed as dist
@@ -52,7 +58,15 @@ if torch.cuda.is_available():
     torch.cuda.set_device(device)
 else:
     device = torch.device("cpu")
-os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+if "MASTER_ADDR" not in os.environ:
+    nodes = os.environ.get("SLURM_JOB_NODELIST")
+    os.environ["MASTER_ADDR"] = (
+        subprocess.check_output(
+            ["scontrol", "show", "hostnames", nodes], text=True
+        ).split()[0]
+        if nodes
+        else "127.0.0.1"
+    )
 os.environ.setdefault("MASTER_PORT", "29500")
 dist.init_process_group(
     "nccl" if device.type == "cuda" else "gloo", rank=rank, world_size=size
@@ -76,6 +90,7 @@ model = torch.nn.parallel.DistributedDataParallel(
 )
 opt = torch.optim.SGD(model.parameters(), lr=0.1)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset, seed=0)
+# one worker thread: required for method 0 (collective reads), enough for 1/2
 loader = ThreadDataLoader(trainset, batch_size=32, sampler=sampler, num_workers=1)
 for epoch in range(args.epochs):
     sampler.set_epoch(epoch)

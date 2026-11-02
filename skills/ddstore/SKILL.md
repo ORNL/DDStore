@@ -21,13 +21,13 @@ Full docs: https://github.com/ORNL/DDStore/tree/main/docs. Complete examples: [e
 
 2. **Find the dataset, its transforms and the loader.** Locate the map-style `Dataset` (`len()` + `[i]`) and the `DataLoader`/sampler. For an `IterableDataset`, ask the user how to index it.
    - Each field must keep the same shape and dtype across samples (bool, uint8, int32, int64, float32, float64, numpy records). For strings, labels or variable metadata, use `encode`/`decode`.
-   - **Split the transforms.** `DistDataset` calls `source[i]` once per sample at construction and stores the result. Deterministic work (file decode, resize, normalize) belongs in the source. Random or epoch-dependent work (crops, flips, augmentation, masking) must move after the read ([patterns.md](patterns.md#4-random-augmentation)); otherwise every epoch sees the same augmented sample, with no error.
+   - **Split the transforms.** `DistDataset` calls `source[i]` once per sample at construction and stores the result. Deterministic work (file decode, fixed-shape resize) belongs in the source. Random or epoch-dependent work (crops, flips, augmentation, masking) must move after the read ([patterns.md](patterns.md#4-random-augmentation)); otherwise every epoch sees the same augmented sample, with no error. Keep the model's inputs identical: same dtype, scale, normalization and shape as the original pipeline. If the original resize doesn't give a fixed shape (e.g. `Resize(256)` keeps the aspect ratio), ask the user which fixed-shape option to use.
 
 3. **Pick the method.**
 
    | Method | Needs | Use when |
    |---|---|---|
-   | 0 | MPI communicator | `ThreadDataLoader` or no workers. Reads are collective: every rank must iterate the same number of batches (`DistributedSampler` does). |
+   | 0 | MPI communicator | Reads are collective: every rank iterates the same number of batches (`DistributedSampler` does), from exactly one thread. |
    | 1 | libfabric | Independent reads; works with forked `DataLoader` workers. GPU destinations need `DDSTORE_FABRIC=cxi`. |
    | 2 | libfabric + shared `handshake_dir` | Same as 1, plus a separate "extra" job can read the data (`DistDatasetReader`). |
 
@@ -41,7 +41,8 @@ Full docs: https://github.com/ORNL/DDStore/tree/main/docs. Complete examples: [e
 5. **Wrap the datasets.** One `DistStore` for all datasets of a run; distinct names; create them in the same order on every rank; `store.free()` at the end. See [patterns.md](patterns.md).
 
 6. **Pick the loader.**
-   - `ThreadDataLoader` (default choice): worker threads, reads straight into GPU memory with `device=`, works with all methods. 1–2 workers are usually enough.
+   - `ThreadDataLoader` (default choice): worker threads, reads straight into GPU memory with `device=`. Methods 1/2: 1–2 workers are usually enough. Method 0: `num_workers=1` exactly (0 also means one thread); that thread calls MPI, so the MPI thread level must be `SERIALIZED` or higher (mpi4py's default is `MULTIPLE`), and the main thread must not call MPI collectives on the same communicator while the loader runs.
+   - `torch.utils.data.DataLoader` with `num_workers=0`: reads on the calling thread; any method.
    - `torch.utils.data.DataLoader` with forked workers: methods 1/2 only; set `DDSTORE_FORK_WORKERS=1` before libfabric starts; host memory only (`device=` ignored); use `persistent_workers=True`.
    - Never `spawn` or `forkserver` start methods (they don't work with MPI on Frontier).
 
@@ -51,7 +52,8 @@ Full docs: https://github.com/ORNL/DDStore/tree/main/docs. Complete examples: [e
 
 ## Rules
 
-- DDStore stores what `source[i]` returns, once. Never store randomly augmented samples.
+- DDStore stores what `source[i]` returns, once. Random transforms in the source are frozen: move them after the read, unless the user wants fixed, precomputed augmentation.
+- Method 0: one loader thread at most.
 - Import order: `torch`, then `pyddstore`, then `mpi4py`.
 - `DistStore(...)`, `DistDataset(...)` and `store.free()` are collective: every rank of the communicator calls them, in the same order.
 - Don't pass `comm`, `method`, `handshake_dir` or `ddstore_width` to a `DistDataset` together with a `DistStore`; they belong to the store.

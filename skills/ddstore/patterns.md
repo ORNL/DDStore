@@ -30,7 +30,7 @@ store = DistStore(MPI.COMM_WORLD, method=1, device=device)
 trainset = DistDataset(train_src, "train", store)
 valset = DistDataset(val_src, "val", store)
 sampler = torch.utils.data.distributed.DistributedSampler(trainset)
-loader = ThreadDataLoader(trainset, batch_size=bs, sampler=sampler, num_workers=1)
+loader = ThreadDataLoader(trainset, batch_size=bs, sampler=sampler, num_workers=1)   # method 0: exactly 1
 for epoch in range(n):
     sampler.set_epoch(epoch)
     for x, y in loader:                        # already on the GPU
@@ -72,27 +72,36 @@ for x, y in loader:
 
 ## 4. Random augmentation
 
-`DistDataset` stores what `source[i]` returns, once. Build the source with the deterministic transforms only, and apply the random ones after the read.
+`DistDataset` stores what `source[i]` returns, once. Build the source with the deterministic transforms only, and apply the random ones after the read. The model must see the same inputs as before: same dtype, scale, normalization and shape.
 
 ```python
-# before: one dataset, transforms in __getitem__
-# train_src = ImageFolder(root, transform=T.Compose([T.Resize(256), T.RandomCrop(224), T.RandomHorizontalFlip(), T.ToTensor()]))
+# original: train_src = ImageFolder(root, transform=T.Compose([
+#     T.Resize(256), T.RandomCrop(224), T.RandomHorizontalFlip(), T.ToTensor(), normalize]))
 
-base = ImageFolder(root, transform=T.Compose([T.Resize((256, 256)), T.PILToTensor()]))   # fixed shape, uint8
-trainset = DistDataset(base, "train", store)
-augment = T.Compose([T.RandomCrop(224), T.RandomHorizontalFlip()])
+stored = T.Compose([T.Resize(256), T.CenterCrop(256), T.PILToTensor()])   # fixed shape, uint8 (4x smaller than float32)
+trainset = DistDataset(ImageFolder(root, transform=stored), "train", store)
+augment = T.Compose([T.RandomCrop(224), T.RandomHorizontalFlip(),
+                     T.ConvertImageDtype(torch.float32), normalize])      # = ToTensor() scaling, then the original normalize
 ```
 
-Then either:
+`DistDataset` needs one shape per field. `Resize(256)` alone keeps the aspect ratio, so its output shape varies. Pick a fixed-shape option with the user:
 
-- **On the batch, in the training loop** (keeps `ThreadDataLoader`'s direct batch reads):
+| Stored | Effect on training |
+|---|---|
+| `Resize(256)` + `CenterCrop(256)` | Aspect ratio kept; random crops see only the center square |
+| `Resize((256, 256))` | Whole image kept; aspect ratio distorted |
+| Images padded to a maximum size, plus their height and width as fields | Exact original pipeline after the read (crop the padding off first); more memory |
+
+Then apply `augment` after the read, either:
+
+- **On the batch, in the training loop** (keeps direct collation):
 
   ```python
   for x, y in loader:
-      x = torch.stack([augment(img) for img in x]).float().div_(255)   # per-sample randomness
+      x = torch.stack([augment(img) for img in x])   # per-sample randomness
   ```
 
-- **Per sample, in a wrapper** (works with any loader; `ThreadDataLoader` then reads sample by sample):
+- **In a wrapper dataset** (works with any loader). Forward `__getitems__` so batches are still read with one `get_batch()` per field; without it, every sample is a separate read:
 
   ```python
   class Augmented(torch.utils.data.Dataset):
@@ -101,10 +110,13 @@ Then either:
       def __getitem__(self, i):
           x, y = self.ds[i]
           return self.fn(x), y
+      def __getitems__(self, indices):
+          return [(self.fn(x), y) for x, y in self.ds.__getitems__(indices)]
+
   loader = ThreadDataLoader(Augmented(trainset, augment), ...)
   ```
 
-Storing `uint8` before normalization also stores 4× less than `float32`. With forked workers, seed per worker (`worker_init_fn`) as usual.
+Random transforms then run on the loader's worker threads (or forked workers; seed those with `worker_init_fn` as usual). Fixed, precomputed augmentation is fine when the user wants it: then leave it in the source.
 
 ## 5. Non-tensor fields
 
@@ -115,7 +127,7 @@ ds = DistDataset(src, "pets", store,
                  decode=lambda d, i: {**d, "label": LABELS[d["label"]]})
 ```
 
-Lookups used in `decode` must exist on every rank. `decode` runs per sample (no direct batch reads).
+Lookups used in `decode` must exist on every rank. Batches are still read with one `get_batch()` per field; `decode` then runs per sample, and `ThreadDataLoader` collates the decoded samples instead of reading straight into batch tensors.
 
 ## 6. Large datasets
 
@@ -161,9 +173,10 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)
 ## Integration checklist
 
 - [ ] Random or epoch-dependent transforms happen after the read, not in the source.
+- [ ] The model's inputs match the original pipeline (dtype, scale, normalization, shape).
 - [ ] Every rank creates the same datasets in the same order.
 - [ ] The sampler is `DistributedSampler` (or equivalent), and `set_epoch` is called.
-- [ ] With method 0: same number of batches on every rank (`drop_last` or equal shards).
+- [ ] With method 0: same number of batches on every rank (`drop_last` or equal shards), one loader thread.
 - [ ] `store.free()` at exit, on every rank.
 - [ ] The loss matches the original code for the first epochs.
 - [ ] Fetch time is measured before and after.

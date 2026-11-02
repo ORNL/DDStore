@@ -113,5 +113,7 @@ jobs:
           PY
       - name: NIC map (fake sysfs trees)
         run: python -m pytest -q -rs test/test_cpu_nic_map.py
-      - name: Skill (links, checker)
-        run: python -m pytest -q -rs test/test_skill.py
+      - name: Skill (links, checker, API without MPI)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pytest -q -rs test/test_skill.py

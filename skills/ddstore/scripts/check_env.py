@@ -103,7 +103,8 @@ def collect():
     info["cxi_devices"] = sorted(os.listdir(cxi)) if os.path.isdir(cxi) else []
     info["srun"] = shutil.which("srun")
     info["notes"].append(
-        "methods_in_build is what was compiled; DDStore's test/test_single.py checks they work"
+        "this is an environment report, not a transport test; the tests that "
+        "need Slurm, CXI or GPUs are listed in DDStore's docs/testing.md"
     )
     return info
 

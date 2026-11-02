@@ -72,31 +72,47 @@ def test_check_env():
         assert key in info
 
 
+# Public pyddstore.torch callables api.md must document, with their full
+# parameter lists. Other names in api.md's code blocks must be listed here
+# as intentional exclusions.
+PUBLIC = {
+    "DistStore",
+    "DistDataset",
+    "DistDatasetReader",
+    "ThreadDataLoader",
+    "WindowedDataset",
+    "row_of",
+}
+NOT_TORCH = {"PyDDStore"}  # pyddstore's low-level API; documented in docs/
+
+
 def _documented_calls(text):
     """name -> parameter names, from the code blocks of api.md."""
     calls = {}
     for block in re.findall(r"```python\n(.*?)```", text, re.S):
         for name, params in re.findall(r"^(\w+)\(([^)]*)\)", block, re.M | re.S):
-            names = [p.split("=")[0].strip() for p in params.split(",") if p.strip()]
-            calls[name] = [n for n in names if not n.startswith("**")]
+            calls[name] = [
+                p.split("=")[0].strip() for p in params.split(",") if p.strip()
+            ]
     return calls
 
 
 def test_api_signatures():
     pt = pytest.importorskip("pyddstore.torch")
     calls = _documented_calls(read(os.path.join(SKILL, "api.md")))
-    checked = 0
-    for name, params in calls.items():
-        obj = getattr(pt, name, None)
-        if obj is None:
-            continue  # PyDDStore methods etc. are not pyddstore.torch callables
-        real = list(inspect.signature(obj).parameters)
-        real = [p for p in real if p not in ("self", "kwargs")]
-        assert (
-            real[: len(params)] == params
-        ), f"{name}: documented {params}, real {real}"
-        checked += 1
-    assert checked >= 6
+    assert PUBLIC <= set(calls), f"undocumented: {PUBLIC - set(calls)}"
+    assert (
+        set(calls) <= PUBLIC | NOT_TORCH
+    ), f"unexpected: {set(calls) - PUBLIC - NOT_TORCH}"
+    assert PUBLIC <= set(pt.__all__), "PUBLIC lists a non-public name"
+    for name in PUBLIC:
+        real = []
+        for p in inspect.signature(getattr(pt, name)).parameters.values():
+            if p.name == "self":
+                continue
+            real.append("**" + p.name if p.kind is p.VAR_KEYWORD else p.name)
+        documented = [d.replace("**DataLoader_args", "**kwargs") for d in calls[name]]
+        assert documented == real, f"{name}: documented {calls[name]}, real {real}"
 
 
 def test_api_attributes():

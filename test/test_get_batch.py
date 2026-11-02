@@ -207,6 +207,43 @@ def test_batch_concurrent_threads(comm, monkeypatch, method):
     assert all_passed(comm, not bad)
 
 
+@pytest.mark.skipif(
+    MPI.Query_thread() != MPI.THREAD_MULTIPLE,
+    reason="needs a provided MPI_THREAD_MULTIPLE",
+)
+def test_method0_batch_thread_with_main_thread_collectives(comm, monkeypatch):
+    """Method 0: one thread reads with get_batch() while the main thread
+    makes collectives on the communicator the store was created with.
+    get_batch()'s private communicator is made by add(), so the reading
+    thread makes no collective on `comm`. Fresh stores, so every round has
+    a first get_batch()."""
+    size = comm.Get_size()
+    ok = True
+    for k in range(20):
+        store = make_store(comm, 0, monkeypatch)
+        errors, bad = [], []
+
+        def reader():
+            rng = np.random.default_rng(1000 * comm.Get_rank() + k)
+            try:
+                for _ in range(5):  # same count on every rank (collective)
+                    idx = rng.integers(0, NROWS * size, size=16)
+                    out = np.zeros((len(idx), NCOLS), dtype=np.float32)
+                    store.get_batch("x", out, idx)
+                    if not np.array_equal(out, expected_rows(idx)):
+                        bad.append(k)
+            except Exception as exc:  # noqa: BLE001 - surface any thread exception
+                errors.append(exc)
+
+        t = threading.Thread(target=reader)
+        t.start()
+        total = sum(comm.allreduce(1) for _ in range(3))
+        t.join()
+        ok &= not errors and not bad and total == 3 * size
+        finish(store)
+    assert all_passed(comm, ok)
+
+
 def _mr_miss(store):
     """recv registrations so far (None unless DDSTORE_PROFILE was set at start)."""
     if os.environ.get("DDSTORE_PROFILE", "0") in ("", "0"):

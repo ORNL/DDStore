@@ -159,6 +159,8 @@ Returns `(total_rows, disp, itemsize)` for a variable that has been `add()`-ed o
 
 Release MPI windows or libfabric endpoints and registrations (including `register_recv()` buffers), and host buffers from `add()`/`init()`; GPU tensors passed to `add()` stay the caller's. Idempotent; skips MPI resources after `MPI_Finalize`. Freed names can be added again.
 
+Doesn't synchronize the ranks. Methods 1/2 release this rank's shard at once, so first make sure no rank still reads from it: a barrier on the store's ranks, and for a `method=2` core group, a signal that the extra job is done (as `examples/vae/vae_core_server.py` does). `DistStore.free()` waits for its ranks itself.
+
 ---
 
 ## `pyddstore.HAVE_MPI`

@@ -52,7 +52,7 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
   - `device`, `add_device`, `chunk_size`: defaults for its datasets.
   - Variables of all its datasets live in one `PyDDStore`; a forked worker or `ThreadDataLoader` thread opens one reader for all of them.
   - Dataset names must differ (`store.names`). With `method=2`, the files a dataset publishes (`{name}.meta.json`, a `.bin` per field; `.` and `/` become `_`) must not be those of another live dataset in the same `handshake_dir`, in this store or another. A `DistDataset` with its own store gets the same check, on every rank.
-  - `store.free()` also frees the readers this process opened on it.
+  - `store.free()` waits for every rank of the store (methods 1/2 release a shard at once), and also frees the readers this process opened on it.
   - `store.free()` frees every dataset. Every rank creates the datasets in the same order.
 
 ```python
@@ -66,7 +66,7 @@ testset  = DistDataset(ConcatDataset([mnist_test]  * r), "test",  store)
 store.free()
 ```
 - **`DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)`**: the same dataset from a separate `method=2` extra job; fields come from the core group's `{name}.meta.json`.
-- **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: `DataLoader` with worker threads instead of processes; safe with MPI and GPU buffers. Fetch, collate and pinning run in the workers; random draws match `DataLoader`'s. `iter(loader)` gives an independent per-epoch iterator; `num_workers * prefetch_factor` batches are prefetched.
+- **`ThreadDataLoader(dataset, reuse_buffers=False, collate_copies=False, **DataLoader args)`**: `DataLoader` with worker threads instead of processes; safe with MPI and GPU buffers. Fetch, collate and pinning run in the workers, never on the calling thread (`num_workers=0` means one worker); with `method=0` use one worker ([Concurrency](concurrency.md)). Random draws match `DataLoader`'s. `iter(loader)` gives an independent per-epoch iterator; `num_workers * prefetch_factor` batches are prefetched.
   - **Parallel reads** (methods 1, 2): each worker thread has its own reader (one endpoint per variable). `DDSTORE_THREAD_READERS=0`: threads share the store.
   - **Direct batch reads**: with the default `collate_fn`, tensor, array and number fields are read straight into the batch tensors (same result as `default_collate`). Records, `decode`, custom `collate_fn` and wrapped datasets use the per-sample path, as does `DDSTORE_FAST_COLLATE=0`.
   - **Workers**: one or two are usually enough with batched reads; more help only when preparing a batch costs about a training step ([Measurements](results.md#loaders-with-batched-reads-mpi-optional-branch)).

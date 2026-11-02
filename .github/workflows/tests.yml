@@ -81,11 +81,13 @@ jobs:
       - if: matrix.mpi == 'openmpi'
         run: ompi_info | grep -E "MCA (osc|pml|btl)"
       - name: 1 rank
-        run: mpirun -n 1 python -m pytest -q -rfs test/test_single.py
+        run: mpirun -n 1 python -m pytest -q -rfs test/test_single.py test/test_skill.py
       - name: 2 ranks
         run: mpirun -n 2 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
       - name: 4 ranks
         run: mpirun -n 4 python -m pytest -q -rf test/test_multirank.py test/test_get_batch.py test/test_torch.py
+      - name: Minimal example, 2 ranks
+        run: mpirun -n 2 python examples/minimal/train.py
 
   nompi:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -111,3 +113,7 @@ jobs:
           PY
       - name: NIC map (fake sysfs trees)
         run: python -m pytest -q -rs test/test_cpu_nic_map.py
+      - name: Skill (links, checker, API without MPI)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pytest -q -rs test/test_skill.py

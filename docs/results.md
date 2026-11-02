@@ -241,3 +241,17 @@ One 2-node debug job covering what Frontier could not:
   Forked workers run with every MR cache monitor except `kdreg2`;
   `FI_CXI_DISABLE_HOST_REGISTER=0` fails after fork (`fi_enable` -262), as on
   Frontier.
+
+## Core/extra layouts on Frontier (method 2, 2 nodes)
+
+`job-vae-core-extra.sh`, thread loader with 1 worker unless noted; epoch-3 test loss.
+
+| Launch | Layout | Ranks (core + extra) | Result |
+|---|---|---|---|
+| Two steps, `job_vni` + wrapper | split-node | 8 + 8 | 151.0458 |
+| Two steps, `job_vni` + wrapper, `--overlap` | colocate | 16 + 16 | extra step fails: `Error configuring interconnect` |
+| `--mpmd` (one `--multi-prog` step) | split-node | 8 + 8 | 151.0442 |
+| `--mpmd` | colocate | 16 + 16 | 183.5597 |
+| `--mpmd`, forked workers (`--loader=torch`, 2) | colocate | 16 + 16 | 183.5597 |
+
+Both programs of an MPMD step get the same `SLINGSHOT_VNIS`, so `single_node_vni` is enough. A heterogeneous step (`srun A : B`) also works on separate nodes, but Slurm doesn't place its components on the same nodes.

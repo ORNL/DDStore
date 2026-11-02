@@ -156,7 +156,7 @@ ds = DistDatasetReader("train", handshake_dir=hs, n_core=n_core_ranks)
 ds.ddstore.free()
 ```
 
-On Frontier this needs `--network=single_node_vni,job_vni` and the `SLINGSHOT_VNIS` wrapper ([hpc.md](hpc.md)). Example: [vae_core_server.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_core_server.py), [vae_extra_train.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_extra_train.py), [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh).
+On Frontier, two srun steps need `--network=single_node_vni,job_vni`, the `SLINGSHOT_VNIS` wrapper and separate nodes; one MPMD step (`srun --multi-prog`) works on shared nodes too ([hpc.md](hpc.md#coreextra-split-method-2)). Example: [vae_core_server.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_core_server.py), [vae_extra_train.py](https://github.com/ORNL/DDStore/blob/main/examples/vae/vae_extra_train.py), [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh).
 
 ## 8. Time windows
 

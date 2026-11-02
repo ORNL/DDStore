@@ -8,7 +8,8 @@
 #SBATCH -q debug
 #SBATCH --network=single_node_vni,job_vni
 #
-# Core/extra split VAE DDP run (two independent srun steps).
+# Core/extra split VAE DDP run: two independent srun steps, or one MPMD step
+# with --mpmd.
 #
 # Slingshot networking (Frontier): every srun step gets its own VNI, and two
 # endpoints can only talk on the same VNI. --network=job_vni adds a job-wide
@@ -17,6 +18,8 @@
 # without it fi_domain() fails with -38 (ENOSYS). libfabric's cxi provider
 # uses only the FIRST VNI listed, so each task below restricts
 # SLINGSHOT_VNIS to the job VNI (last entry) so core and extra share it.
+# With --mpmd both programs run in one step (srun --multi-prog), so they share
+# the step's VNI and none of this is needed.
 #
 # Runs on Frontier and Perlmutter; the rank layout is picked from the machine
 # (see PLATFORM below). The #SBATCH lines above are for Frontier. On
@@ -42,9 +45,15 @@ Options:
   --layout=X     Process distribution: colocate (core and extra both span
                  every allocated node, steps run with --overlap) or
                  split-node (core gets --core-nnodes nodes, extra the rest).
-                 Colocate works on Perlmutter but not on Frontier, where the
-                 second step fails with "Error configuring interconnect";
-                 use split-node there. Default: split-node.
+                 With two steps, colocate works on Perlmutter but not on
+                 Frontier, where the second step fails with "Error
+                 configuring interconnect"; use split-node or --mpmd there.
+                 Default: split-node.
+  --mpmd         Run core and extra in one srun step (--multi-prog, via
+                 mpmd-task.sh) instead of two. Both layouts work on Frontier
+                 and no job VNI is needed. Every task gets the same CPUs and
+                 sees all of its node's GPUs; the extra side picks one by
+                 local rank.
   --core-nnodes=N  Number of nodes for the core step in split-node layout.
                  Ignored in colocate layout. Default: 1.
   --num-workers=N  DataLoader workers for the extra (training) step:
@@ -71,6 +80,7 @@ done
 METHOD=
 FABRIC=
 GPUDIRECT=0
+MPMD=0
 LAYOUT=
 CORE_NNODES_OPT=
 NUM_WORKERS=
@@ -82,6 +92,7 @@ for arg in "$@"; do
         --method=*) METHOD="${arg#--method=}" ;;
         --fabric=*) FABRIC="${arg#--fabric=}" ;;
         --gpudirect) GPUDIRECT=1 ;;
+        --mpmd) MPMD=1 ;;
         --layout=*) LAYOUT="${arg#--layout=}" ;;
         --core-nnodes=*) CORE_NNODES_OPT="${arg#--core-nnodes=}" ;;
         --num-workers=*) NUM_WORKERS="${arg#--num-workers=}" ;;
@@ -144,27 +155,63 @@ case "$PLATFORM" in
         CORE_NR=4
         EXTRA_NR=4
         EXTRA_CPUS_PER_TASK=16
+        GPUS_PER_NODE=4
         EXTRA_GPU_ARGS="--gpus-per-node=4" ;;
     *)
         CORE_NR=8
         EXTRA_NR=8
         EXTRA_CPUS_PER_TASK=6
+        GPUS_PER_NODE=8
         EXTRA_GPU_ARGS="--gpus-per-task=1" ;;
 esac
 CORE_NTASKS=$((CORE_NNODES * CORE_NR))
 EXTRA_NTASKS=$((EXTRA_NNODES * EXTRA_NR))
 
-echo "PLATFORM=$PLATFORM DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYOUT GPUDIRECT=$GPUDIRECT"
+echo "PLATFORM=$PLATFORM DDSTORE_METHOD=$DDSTORE_METHOD DDSTORE_FABRIC=$DDSTORE_FABRIC LAYOUT=$LAYOUT MPMD=$MPMD GPUDIRECT=$GPUDIRECT"
 echo "CORE_NNODES=$CORE_NNODES CORE_NTASKS=$CORE_NTASKS CORE_GPUS_PER_TASK=$CORE_GPUS_PER_TASK CORE_EXTRA_ARGS=\"$CORE_EXTRA_ARGS\" REPLICATE=$REPLICATE IMAGE_SCALE=$IMAGE_SCALE"
 echo "EXTRA_NNODES=$EXTRA_NNODES EXTRA_NTASKS=$EXTRA_NTASKS EXTRA_EXTRA_ARGS=\"$EXTRA_EXTRA_ARGS\" NUM_WORKERS=$NUM_WORKERS"
 
+CORE_CMD="python -u examples/vae/vae_core_server.py ddstore_hs_vae --replicate=$REPLICATE --image-scale=$IMAGE_SCALE $CORE_EXTRA_ARGS"
+EXTRA_CMD="python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS${LOADER:+ --loader=$LOADER} $EXTRA_EXTRA_ARGS"
+
+if [ "$MPMD" == "1" ]; then
+    # One step: tasks 0..CORE_NTASKS-1 run the core, the rest the extra side.
+    # colocate: cyclic puts CORE_NR core tasks (local ranks 0..) and then
+    # EXTRA_NR extra tasks on every node, so the extra local rank starts at
+    # CORE_NR. split-node: block fills the first CORE_NNODES nodes with core
+    # tasks. The core exchanges its records through files, not MPI, since
+    # MPI_COMM_WORLD would span both programs.
+    mapfile -t HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+    if [ "$LAYOUT" == "colocate" ]; then
+        DIST=cyclic
+        EXTRA_LOCAL0=$CORE_NR
+        EXTRA_MASTER=${HOSTS[0]}
+        CPUS_PER_TASK=$((EXTRA_CPUS_PER_TASK / 2))
+    else
+        DIST=block
+        EXTRA_LOCAL0=0
+        EXTRA_MASTER=${HOSTS[$CORE_NNODES]}
+        CPUS_PER_TASK=$EXTRA_CPUS_PER_TASK
+    fi
+    CONF=results/mpmd-${SLURM_JOB_ID}.conf
+    TASK=examples/vae/script/mpmd-task.sh
+    cat > $CONF <<EOF
+0-$((CORE_NTASKS - 1)) env DDSTORE_COMM=file $TASK 0 $CORE_NTASKS 0 ${HOSTS[0]} $CORE_CMD
+$CORE_NTASKS-$((CORE_NTASKS + EXTRA_NTASKS - 1)) env DDSTORE_HANDSHAKE_TIMEOUT_S=60 $TASK $CORE_NTASKS $EXTRA_NTASKS $EXTRA_LOCAL0 $EXTRA_MASTER $EXTRA_CMD
+EOF
+    cat $CONF
+    MASTER_PORT=8891 srun -N$SLURM_NNODES -n$((CORE_NTASKS + EXTRA_NTASKS)) -c$CPUS_PER_TASK --gpus-per-node=$GPUS_PER_NODE \
+        -m $DIST --cpu-bind=verbose,core -l --multi-prog $CONF
+    exit
+fi
+
 MASTER_PORT=8889 srun ${OVERLAP:-} -N$CORE_NNODES -n$CORE_NTASKS -c1 --gpus-per-task=$CORE_GPUS_PER_TASK --cpu-bind=verbose,core -l \
-    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_core_server.py ddstore_hs_vae --replicate=$REPLICATE --image-scale=$IMAGE_SCALE $CORE_EXTRA_ARGS \
+    bash -c "$JOB_VNI_WRAP" _ $CORE_CMD \
     > >(sed 's/^/[core] /') 2> >(sed 's/^/[core] /') &
 sleep 5
 
 MASTER_PORT=8891 DDSTORE_HANDSHAKE_TIMEOUT_S=60 srun ${OVERLAP:-} -N$EXTRA_NNODES -n$EXTRA_NTASKS -c$EXTRA_CPUS_PER_TASK $EXTRA_GPU_ARGS --cpu-bind=verbose,core -l \
-    bash -c "$JOB_VNI_WRAP" _ python -u examples/vae/vae_extra_train.py --handshake-dir ddstore_hs_vae --n-core $CORE_NTASKS --epochs 3 --num-workers=$NUM_WORKERS${LOADER:+ --loader=$LOADER} $EXTRA_EXTRA_ARGS \
+    bash -c "$JOB_VNI_WRAP" _ $EXTRA_CMD \
     > >(sed 's/^/[extr] /') 2> >(sed 's/^/[extr] /')
 sleep 5
 

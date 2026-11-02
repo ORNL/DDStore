@@ -532,6 +532,13 @@ private:
             if (this->method == 0)
             {
 #ifdef DDSTORE_HAVE_MPI
+                /* get_batch()'s private communicator, made here (collective,
+                 * on the caller's thread) and not at the first batched read,
+                 * which may run on a loader thread while the application
+                 * makes its own collectives on this->comm. One per store;
+                 * free() releases it.                                       */
+                if (this->coll_comm == MPI_COMM_NULL)
+                    ddstore_mpi_check(MPI_Comm_dup(this->comm, &this->coll_comm), "MPI_Comm_dup");
                 int rc = MPI_Win_create(base,                              /* pre-allocated buffer */
                                         (MPI_Aint)nrows * disp * itemsize, /* size in bytes */
                                         disp * itemsize,                   /* displacement units */
@@ -625,16 +632,17 @@ private:
      * IPDPSW 2024): every rank all-gathers the batch indices of all ranks,
      * packs the rows it owns for each requester, and one MPI_Alltoallv
      * delivers them; each rank then puts its rows in request order. Uses a
-     * private duplicate of the store's communicator (coll_comm), so it never
-     * matches the caller's own collectives or the windows' fences. The
+     * private duplicate of the store's communicator (coll_comm, made by
+     * add_base()), so it never matches the caller's own collectives or the
+     * windows' fences, and makes no collective on the caller's communicator. The
      * indices are validated after the gather, on the global list, so every
      * rank throws the same error together instead of one rank leaving the
      * others blocked in the exchange.                                       */
     void get_batch_alltoall(const VarInfo_t &varinfo, const long *idx, long n, char *out)
     {
         std::lock_guard<std::mutex> guard(this->coll_mutex);
-        if (this->coll_comm == MPI_COMM_NULL)
-            MPI_Comm_dup(this->comm, &this->coll_comm);
+        if (this->coll_comm == MPI_COMM_NULL) /* made by add_base() */
+            throw std::logic_error("get_batch: no collective communicator (no add()?)");
 
         const int P = this->comm_size;
         const int me = this->rank;

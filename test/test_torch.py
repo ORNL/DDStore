@@ -584,6 +584,24 @@ def test_dist_store_file_names(comm, monkeypatch, tmp_path):
     assert all_ok(comm, True)
 
 
+def test_method0_loader_with_main_thread_collectives(comm):
+    """Method 0, one loader thread: the main thread's collectives on the
+    store's communicator, while the loader reads its first batches, don't
+    mix with the loader's exchange (its private communicator is made by
+    add(), so the loader makes no collective on `comm`). Fresh stores, so
+    every round has a first read."""
+    ok = True
+    for k in range(20):
+        ds = DistDataset(TupleSource(), f"mc{k}", comm, method=0)
+        loader = ThreadDataLoader(ds, batch_size=4, num_workers=1)
+        it = iter(loader)  # the loader thread starts reading now
+        total = sum(comm.allreduce(1) for _ in range(3))
+        got = list(it)
+        ok &= total == 3 * comm.Get_size() and len(got) == len(loader)
+        finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
 @pytest.mark.parametrize("method", [m for m in METHODS if m != 0])
 def test_dist_store_frees_readers(comm, monkeypatch, method):
     """store.free() frees the thread readers too; a loader closed after it

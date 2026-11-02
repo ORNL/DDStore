@@ -34,7 +34,7 @@ On Slurm systems use `srun`, not `torchrun` or `mpirun`. Set `handshake_dir` to 
 
 Complete scripts: [job-vae-single.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-single.sh).
 
-## Core/extra split (method 2, two srun steps)
+## Core/extra split (method 2)
 
 ```bash
 #SBATCH --network=single_node_vni,job_vni
@@ -43,7 +43,7 @@ srun -N1 -n8 ... bash -c "$WRAP" _ python core.py &
 srun -N3 -n24 ... bash -c "$WRAP" _ python extra.py
 ```
 
-Each step on its own nodes on Frontier. Template: [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh).
+Two steps need their own nodes on Frontier. To share nodes, run both programs in one MPMD step (`srun --multi-prog`): one VNI, so neither `job_vni` nor the wrapper is needed. Each program then needs its own rank numbering ([mpmd-task.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/mpmd-task.sh)) and the core uses `DDSTORE_COMM=file`, since `MPI_COMM_WORLD` spans both programs. Template: [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh) (`--mpmd --layout=colocate` shares nodes).
 
 ## Errors
 
@@ -51,6 +51,7 @@ Each step on its own nodes on Frontier. Template: [job-vae-core-extra.sh](https:
 |---|---|
 | `fi_domain()` fails with `-38`, or `no suitable fabric found` | Step has no CXI service: `#SBATCH --network=single_node_vni`. |
 | `VNI_NOT_FOUND` | Reader and store in different srun steps: `job_vni` + the `SLINGSHOT_VNIS` wrapper. |
+| `Error configuring interconnect` at launch (Frontier) | Second srun step on the same nodes; use separate nodes or one MPMD step. |
 | Forked worker error about the MR cache monitor | Set `DDSTORE_FORK_WORKERS=1` before libfabric starts (job script). |
 | Hang in `DistDataset(...)` | Not every rank created it, or datasets created in a different order. With method 0, unequal batch counts. |
 | `variable '...' already exists in this store` / `another DistStore` | Duplicate dataset name, or method-2 file clash in `handshake_dir`. |

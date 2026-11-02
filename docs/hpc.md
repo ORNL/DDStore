@@ -2,13 +2,14 @@
 
 ## Slurm job scripts
 
-[job-vae-single.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-single.sh) runs `vae-ddp.py` as one `srun` step; [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh) runs the core/extra split as two steps. `--help` lists the options. The `#SBATCH` lines target Frontier (8 ranks × 7 cores per node).
+[job-vae-single.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-single.sh) runs `vae-ddp.py` as one `srun` step; [job-vae-core-extra.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/job-vae-core-extra.sh) runs the core/extra split as two steps, or as one MPMD step with `--mpmd`. `--help` lists the options. The `#SBATCH` lines target Frontier (8 ranks × 7 cores per node).
 
 ```bash
 sbatch examples/vae/script/job-vae-single.sh --method=1 --num-workers=1
 sbatch examples/vae/script/job-vae-single.sh --method=1 --gpudirect --image-scale=2
 sbatch examples/vae/script/job-vae-core-extra.sh                       # split-node: 1 core node, the rest extra
 sbatch examples/vae/script/job-vae-core-extra.sh --gpudirect --core-nnodes=2
+sbatch examples/vae/script/job-vae-core-extra.sh --mpmd --layout=colocate  # one step, core and extra on every node
 ```
 
 For your own scripts using methods 1/2, export the CPU→NIC map in the batch step before `srun` so ranks don't each query the topology ([details](backends.md#libfabric-rdma-method1)):
@@ -32,13 +33,23 @@ Each `srun` step gets its own VNI (network isolation ID); endpoints reach each o
 | One `srun` step (normal training) | works | works | works; one-node steps need `single_node_vni` |
 | Core and extra as separate one-node steps (`--layout=split-node`) | works | needs `job_vni` + wrapper | needs both flags + wrapper |
 | Core and extra on the same nodes, or multi-node steps | extra can't reach core | needs `job_vni` + wrapper + `srun --overlap` | second step fails to launch |
+| Core and extra in one MPMD step (`--mpmd`), either layout | | | works; `single_node_vni` only |
 
 `job-vae-core-extra.sh` does both parts for its two steps:
 
 1. `#SBATCH --network=single_node_vni,job_vni`: `job_vni` adds a job-wide VNI to every step (`SLINGSHOT_VNIS=<step>,<job>`); on Frontier `single_node_vni` also gives one-node steps a CXI service.
 2. The wrapper, in each task before Python starts: `export SLINGSHOT_VNIS=${SLINGSHOT_VNIS##*,}`. The cxi provider uses only the first VNI, so without it reads fail with `VNI_NOT_FOUND`.
 
-It defaults to `--layout=split-node`; `--layout=colocate` works on Perlmutter only. Perlmutter columns measured on 2 nodes ([results](results.md#perlmutter-validation-2-nodes--4-a100-cuda-13-cxi)).
+It defaults to `--layout=split-node`; with two steps, `--layout=colocate` works on Perlmutter only.
+
+### One MPMD step
+
+`--mpmd` runs core and extra as one `srun --multi-prog` step. Both programs share the step's VNI, so on Frontier both layouts work without `job_vni` or the wrapper. Inside one step, Slurm numbers the tasks of both programs together and `MPI_COMM_WORLD` spans both, so:
+
+- [mpmd-task.sh](https://github.com/ORNL/DDStore/blob/main/examples/vae/script/mpmd-task.sh) gives each program its own `SLURM_PROCID`, `SLURM_NTASKS` and `SLURM_LOCALID`, and its rank 0's node.
+- The core exchanges its records through files (`DDSTORE_COMM=file`), not MPI. To use MPI instead, every task of both programs would call `MPI_COMM_WORLD.Split` by program.
+- Every task gets the same CPUs and sees all GPUs of its node (`--gpus-per-node`); the extra side picks its GPU by local rank.
+- Placement: `-m cyclic` for `colocate` (core tasks, then extra tasks, on every node), `-m block` for `split-node`. Perlmutter columns measured on 2 nodes ([results](results.md#perlmutter-validation-2-nodes--4-a100-cuda-13-cxi)).
 
 ## Troubleshooting (`cxi`)
 

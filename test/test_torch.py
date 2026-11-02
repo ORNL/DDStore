@@ -586,18 +586,28 @@ def test_dist_store_file_names(comm, monkeypatch, tmp_path):
 
 def test_method0_loader_with_main_thread_collectives(comm):
     """Method 0, one loader thread: the main thread's collectives on the
-    store's communicator, while the loader reads its first batches, don't
-    mix with the loader's exchange (its private communicator is made by
-    add(), so the loader makes no collective on `comm`). Fresh stores, so
-    every round has a first read."""
+    store's own communicator (DistStore splits `comm`; the PyDDStore gets
+    the split one) while the loader reads its first batches. The loader's
+    exchange runs on a private duplicate made by add(), so it makes no
+    collective on that communicator. Fresh stores, so every round has a
+    first read; batches must equal the source's."""
+    from mpi4py import MPI
+
+    if MPI.Query_thread() != MPI.THREAD_MULTIPLE:
+        pytest.skip("needs a provided MPI_THREAD_MULTIPLE")
+    src = TupleSource()
+    ref = list(DataLoader(src, batch_size=4))
     ok = True
     for k in range(20):
-        ds = DistDataset(TupleSource(), f"mc{k}", comm, method=0)
+        ds = DistDataset(src, f"mc{k}", comm, method=0)
+        group = ds.store._group.comm
         loader = ThreadDataLoader(ds, batch_size=4, num_workers=1)
         it = iter(loader)  # the loader thread starts reading now
-        total = sum(comm.allreduce(1) for _ in range(3))
+        total = sum(group.allreduce(1) for _ in range(3))
         got = list(it)
-        ok &= total == 3 * comm.Get_size() and len(got) == len(loader)
+        loader.close()
+        ok &= total == 3 * group.Get_size()
+        ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
         finish(comm, ds)
     assert all_ok(comm, ok)
 

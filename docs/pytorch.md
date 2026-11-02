@@ -52,7 +52,7 @@ pairs = WindowedDataset(frames, window=3, dilation=dt, starts=starts)   # (t, t+
   - `device`, `add_device`, `chunk_size`: defaults for its datasets.
   - Variables of all its datasets live in one `PyDDStore`; a forked worker or `ThreadDataLoader` thread opens one reader for all of them.
   - Dataset names must differ (`store.names`). With `method=2`, the files a dataset publishes (`{name}.meta.json`, a `.bin` per field; `.` and `/` become `_`) must not be those of another live dataset in the same `handshake_dir`, in this store or another. A `DistDataset` with its own store gets the same check, on every rank.
-  - `store.free()` also frees the readers this process opened on it.
+  - `store.free()` waits for every rank of the store (methods 1/2 release a shard at once), and also frees the readers this process opened on it.
   - `store.free()` frees every dataset. Every rank creates the datasets in the same order.
 
 ```python

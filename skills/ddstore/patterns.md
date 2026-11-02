@@ -10,7 +10,8 @@ def local_device():
     # One visible GPU per task (srun --gpus-per-task=1, Frontier): ordinal 0.
     # All of the node's GPUs visible (--gpus-per-node, Perlmutter): the local rank.
     if torch.cuda.device_count() > 1:
-        local = os.environ.get("SLURM_LOCALID") or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")
+        names = ("SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "LOCAL_RANK")
+        local = next((os.environ[n] for n in names if n in os.environ), "0")
         device = torch.device("cuda", int(local))
     else:
         device = torch.device("cuda", 0)

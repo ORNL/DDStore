@@ -935,7 +935,11 @@ class DistStore:
         """Free every dataset of this store (collective), and the readers
         this process opened on it (ThreadDataLoader threads', a forked
         worker's). The readers stay cached, freed, so a loader closed later
-        doesn't open new ones to unregister its buffers."""
+        doesn't open new ones to unregister its buffers.
+
+        Waits for every rank of the store first: methods 1/2 release a
+        rank's shard at once, and another rank may still be reading it."""
+        self._group.allgather(None)
         h = self._handle
         for r in list(h.readers.values()):
             r.free()

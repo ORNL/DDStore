@@ -53,7 +53,9 @@ size = env_int(
     "SLURM_NTASKS", "OMPI_COMM_WORLD_SIZE", "PMI_SIZE", "WORLD_SIZE", default=1
 )
 if torch.cuda.is_available():
-    local = env_int("SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK")
+    local = env_int(
+        "SLURM_LOCALID", "OMPI_COMM_WORLD_LOCAL_RANK", "MPI_LOCALRANKID", "LOCAL_RANK"
+    )
     device = torch.device("cuda", local if torch.cuda.device_count() > 1 else 0)
     torch.cuda.set_device(device)
 else:

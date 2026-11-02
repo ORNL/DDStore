@@ -19,7 +19,7 @@ Ranks, backend and handshake shared by one or more datasets. Collective.
 - `handshake_dir`: shared directory; needed for method 2 and the file communicator. Default `DDSTORE_HANDSHAKE_DIR`, else `./ddstore_hs`.
 - `ddstore_width`: split `comm` into independent stores of this many ranks (each rank reads only its group's data).
 - `device`, `add_device`, `chunk_size`: defaults for its datasets.
-- `store.names`, `store.free()`: frees every dataset of the store and this process's readers. Datasets have no `free()` of their own; use `ds.store.free()`.
+- `store.names`, `store.free()`: waits for every rank of the store, then frees every dataset of the store and this process's readers. Datasets have no `free()` of their own; use `ds.store.free()`.
 
 ## DistDataset
 
@@ -48,7 +48,7 @@ Each rank loads its share of `source`; every rank reads every sample. Collective
 DistDatasetReader(name, handshake_dir=None, n_core=None, device=None, decode=None)
 ```
 
-Reads a method-2 `DistDataset` from a separate job (the "extra" ranks). `n_core`: number of ranks in the core group (`DDSTORE_N_CORE`). Free with `reader.ddstore.free()`.
+Reads a method-2 `DistDataset` from a separate job (the "extra" ranks). `n_core`: number of ranks in the core group (`DDSTORE_N_CORE`). Free with `reader.ddstore.free()`. The core group must not free its store while extra ranks still read: signal the core when the extra job is done.
 
 ## ThreadDataLoader
 
@@ -75,7 +75,7 @@ store = dds.PyDDStore(comm, method=0)  # also: handshake_dir=, rank=, size= with
 store.add(name, ndarray)               # collective; rows are this rank's share
 store.get(name, out, start)            # global row index
 store.get_batch(name, out, indices)
-store.free()
+store.free()                           # no barrier: methods 1/2 need one first
 ```
 
 `pyddstore.HAVE_MPI` is `False` for a `DDSTORE_MPI=0` build.

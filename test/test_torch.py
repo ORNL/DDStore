@@ -9,6 +9,7 @@ present inside a Slurm step (provider: DDSTORE_FABRIC, default cxi).
 
 import glob
 import os
+import time
 
 import numpy as np
 import pytest
@@ -609,6 +610,24 @@ def test_method0_loader_with_main_thread_collectives(comm):
         ok &= total == 3 * group.Get_size()
         ok &= len(got) == len(ref) and all(same(g, r) for g, r in zip(got, ref))
         finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.parametrize("method", [m for m in METHODS if m != 0])
+def test_dist_store_free_waits(comm, monkeypatch, method):
+    """DistStore.free() waits for every rank of the store: the last rank
+    reads every shard late while the others go straight to free(), which
+    for methods 1/2 releases a shard at once."""
+    monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    src = TupleSource()
+    store = DistStore(comm, method=method)
+    ds = DistDataset(src, f"fw{method}", store)
+    ok = True
+    if comm.Get_rank() == comm.Get_size() - 1:
+        time.sleep(2)
+        got = ds.read_rows(list(range(N)))[0]
+        ok = same_values(got, torch.stack([src[i][0] for i in range(N)]))
+    store.free()
     assert all_ok(comm, ok)
 
 

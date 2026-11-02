@@ -98,7 +98,7 @@ See [Without MPI](docs/backends.md#without-mpi-methods-1-and-2).
 | User guide | [Backends](docs/backends.md) (MPI RMA, libfabric, file-based handshake, partitioned stores), [GPUDirect RDMA](docs/gpudirect.md), [PyTorch integration](docs/pytorch.md), [HPC systems](docs/hpc.md) (Slurm, Slingshot, Frontier, Perlmutter), [Performance](docs/performance.md), [Concurrency](docs/concurrency.md) |
 | Reference | [`PyDDStore`](docs/api-pyddstore.md), [`pyddstore.torch`](docs/api-torch.md), [Environment variables](docs/environment.md) |
 | More | [Testing](docs/testing.md), [Measurements](docs/results.md) |
-| AI coding agents | [`skills/ddstore`](skills/ddstore/SKILL.md): a skill for adding DDStore to a training code |
+| AI coding agents | [`skills/ddstore`](skills/ddstore/SKILL.md): a skill for adding DDStore to a training code; [AGENTS.md](AGENTS.md): notes for developing DDStore |
 
 To build the documentation locally:
 

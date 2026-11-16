@@ -249,6 +249,32 @@ def test_thread_loader_iterators(comm):
     assert all_ok(comm, ok)
 
 
+def test_thread_loader_sampler_without_len(comm):
+    """An infinite sampler (no __len__), as torch's DataLoader accepts."""
+
+    class Forever(torch.utils.data.Sampler):
+        def __iter__(self):
+            i = 0
+            while True:
+                yield i % N
+                i += 1
+
+    src = TupleSource()
+    loader = ThreadDataLoader(src, batch_size=4, sampler=Forever(), num_workers=2)
+    it = iter(loader)
+    ok = True
+    for b in range(12):  # past one pass over the data
+        want = torch.utils.data.default_collate(
+            [src[i % N] for i in range(4 * b, 4 * b + 4)]
+        )
+        ok &= same(next(it), want)
+    with pytest.raises(TypeError):
+        len(loader)
+    it.close()
+    loader.close()
+    assert all_ok(comm, ok)
+
+
 def test_thread_loader_keeps_prefetch_full(comm):
     """While the caller holds a batch, num_workers * prefetch_factor more are
     being fetched (as with DataLoader), not one fewer."""

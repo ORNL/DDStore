@@ -21,6 +21,15 @@ cdef inline size_t _host_ptr(arr) except? 0:
         return <size_t> np.PyArray_DATA(<np.ndarray> arr)
     return arr.ctypes.data
 
+
+cdef inline int _row_items(shape) except -1:
+    # Items per row, from the shape and not size // nrows: a rank with no
+    # rows passes the same row width as the others.
+    cdef long n = 1
+    for d in shape[1:]:
+        n *= d
+    return <int> n
+
 from libc.string cimport memcpy
 from libcpp.string cimport string
 from libcpp.typeinfo cimport type_info
@@ -412,13 +421,13 @@ cdef class PyDDStore:
             torch.cuda.synchronize(device=arr.device)
             ptr = arr.data_ptr()
             itemsize = arr.element_size()
-            disp = arr.numel() // nrows
+            disp = _row_items(arr.shape)
             iface = _hmem_iface_for(arr)
         else:
             assert arr.flags.c_contiguous
             ptr = _host_ptr(arr)
             itemsize = arr.itemsize
-            disp = arr.size // nrows
+            disp = _row_items(arr.shape)
             iface = 0
 
         # DDStore::add<T>() only uses T through sizeof(T), so dispatching on

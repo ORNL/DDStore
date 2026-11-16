@@ -580,6 +580,11 @@ void register_send_mr(struct fabric_state *fabric_state)
     if (send_is_hmem && !is_hmem_capable(fabric_state))
         throw std::runtime_error("GPU (HMEM) send buffer requested but fabric is not cxi");
 
+    /* A rank with no rows registers one byte of its (never empty)
+     * allocation, so it has a key and a record like every other rank; no
+     * read is ever addressed to it.                                        */
+    size_t mr_len = fabric_state->send_data_len ? fabric_state->send_data_len : 1;
+
     int mr_rc;
     if (send_is_hmem)
     {
@@ -588,7 +593,7 @@ void register_send_mr(struct fabric_state *fabric_state)
          * in exchange_records()) -- never the local operand of a local
          * fi_read/fi_write on this rank -- so unlike recv_mr in
          * read_from_remote(), no fi_mr_desc()/local descriptor is needed.   */
-        struct iovec iov = {fabric_state->send_data, fabric_state->send_data_len};
+        struct iovec iov = {fabric_state->send_data, mr_len};
         struct fi_mr_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.mr_iov    = &iov;
@@ -603,7 +608,7 @@ void register_send_mr(struct fabric_state *fabric_state)
         mr_rc = fi_mr_reg(
             fabric_state->domain,
             fabric_state->send_data,
-            fabric_state->send_data_len,
+            mr_len,
             FI_WRITE | FI_REMOTE_READ,
             0,
             0,

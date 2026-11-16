@@ -785,8 +785,10 @@ class _StoreDataset(Dataset):
         return values
 
 
-def _rows(values, dtype):
+def _rows(values, dtype, size):
     """Stack per-sample values into contiguous (n, size) rows of `dtype`."""
+    if not values:
+        return np.empty((0, size), dtype)
     return np.ascontiguousarray(
         np.stack([_to_numpy_row(v) for v in values]).astype(dtype, copy=False)
     )
@@ -1078,11 +1080,11 @@ class DistDataset(_StoreDataset):
                 schema = _schema_of(first, f"{name}[{lo}]")
         except (TypeError, ValueError) as exc:
             error = exc
-        schemas = self._raise_on_all(error, schema)
-        if any(s is None for s in schemas):
-            raise ValueError(
-                f"{name}: every rank needs at least one sample (dataset has {self.total_ns})"
-            )
+        # A rank with no samples (fewer samples than ranks) has no schema; it
+        # takes the others' and adds zero rows.
+        schemas = [s for s in self._raise_on_all(error, schema) if s is not None]
+        if not schemas:
+            raise ValueError(f"{name}: the dataset is empty")
         if any(s != schemas[0] for s in schemas):
             raise ValueError(
                 f"{name}: samples differ in structure, shape or dtype across ranks"
@@ -1121,7 +1123,7 @@ class DistDataset(_StoreDataset):
         fields = self.schema["fields"]
         if chunk_size is None:
             # Whole share at once: read, check, then add() each field.
-            samples, error = [first], None
+            samples, error = [first] if hi > lo else [], None
             try:
                 for i in range(lo + 1, hi):
                     samples.append(source[i])
@@ -1131,14 +1133,14 @@ class DistDataset(_StoreDataset):
             self._raise_on_all(error)
             for j, var in enumerate(self._var):
                 values = [_flatten(s)[2][j] for s in samples]
-                if add_device is not None and fields[j]["kind"] == "torch":
+                if add_device is not None and fields[j]["kind"] == "torch" and values:
                     rows = (
                         torch.stack([v.reshape(-1) for v in values])
                         .to(add_device)
                         .contiguous()
                     )
                 else:
-                    rows = _rows(values, fields[j]["dtype"])
+                    rows = _rows(values, fields[j]["dtype"], self._size[j])
                 self.ddstore.add(var, rows)
         else:
             # Chunked: allocate every field (init, collective), then copy the
@@ -1160,7 +1162,9 @@ class DistDataset(_StoreDataset):
                     for j, var in enumerate(self._var):
                         values = [_flatten(sm)[2][j] for sm in chunk]
                         self.ddstore.update(
-                            var, _rows(values, fields[j]["dtype"]), start - lo
+                            var,
+                            _rows(values, fields[j]["dtype"], self._size[j]),
+                            start - lo,
                         )
                     if start == lo:
                         first = None  # held only for the first chunk

@@ -19,6 +19,7 @@ for x, y in loader:
   - `device`: put tensor fields of read samples on a GPU. `add_device`: keep each rank's share there ([GPUDirect](gpudirect.md)).
   - `chunk_size`: load the share that many samples at a time; peak memory ≈ share + one chunk instead of ≈ 3× share (400 MiB share: 461 vs 1202 MiB). Host storage only.
   - `device`, `add_device`, `chunk_size` default to the store's; pass them to override.
+  - A dataset may have fewer samples than ranks: the ranks left without one hold no rows and still read every sample. An empty dataset raises.
   - `encode(sample)` → what to store; `decode(stored, index)` → full sample on every read (runs on the reading rank, so its lookups must exist everywhere). For strings, labels, metadata, shared per-group data. `fields=[...]` keeps only those keys/positions (not with `encode`). `read_rows()` and `WindowedDataset` skip `decode`.
 
 ```python

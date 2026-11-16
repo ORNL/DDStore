@@ -29,7 +29,7 @@ DistDataset(source, name, store=None, ddstore_width=None, device=<store's>,
             chunk_size=<store's>, encode=None, decode=None, fields=None, comm=None)
 ```
 
-Each rank loads its share of `source`; every rank reads every sample. Collective.
+Each rank loads its share of `source`; every rank reads every sample. Collective. Fewer samples than ranks is fine (some ranks hold no rows).
 
 - `source`: map-style dataset. Samples: a value, tuple/list or dict of tensors, arrays or numbers; fixed shape and dtype per field. `source[i]` is called once per sample, here; random transforms in it are frozen.
 - `name`: unique within the store.

@@ -156,6 +156,32 @@ def test_ddstore_width_groups(file_comm, hs):
     assert all(file_comm.allgather(ok))
 
 
+@pytest.mark.parametrize("method", [1, 2])
+def test_fewer_samples_than_ranks(file_comm, hs, method):
+    """Ranks with no rows; with method 2 a reader joins too."""
+    n = max(1, file_comm.size // 2)
+    src = torch.utils.data.Subset(Source(), range(n))
+    ds = DistDataset(src, f"few{method}", handshake_dir=hs, method=method)
+
+    def right(d):
+        idx = list(range(n)) * 2
+        return len(d) == n and all(
+            bool(torch.equal(x, torch.full((2, 3), float(i)))) and int(y) == i
+            for (x, y), i in zip(d.__getitems__(idx), idx)
+        )
+
+    ok = right(ds)
+    if method == 2:
+        reader = DistDatasetReader(
+            f"few{method}", handshake_dir=hs, n_core=file_comm.size
+        )
+        ok &= right(reader)
+        file_comm.allgather(None)
+        reader.ddstore.free()
+    finish(ds)
+    assert all(file_comm.allgather(ok))
+
+
 def test_method2_reader(file_comm, hs):
     core = DistDataset(Source(), "rd", handshake_dir=hs, method=2)
     reader = DistDatasetReader("rd", handshake_dir=hs, n_core=file_comm.size)

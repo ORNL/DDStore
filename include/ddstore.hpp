@@ -194,13 +194,20 @@ public:
             throw std::runtime_error("GPU source buffer is not supported with method=0 (MPI_Win)");
         this->new_name(name);
 
+        /* A rank may hold no rows (fewer rows than ranks). It still takes
+         * part in the setup with a buffer of its own: an empty GPU tensor
+         * has no device memory to register, so it is added as host memory. */
+        if (nrows == 0)
+            hmem_iface = 0;
+
         void *base = NULL;
         int how = BASE_ALIGNED;
         size_t len = 0;
         if (hmem_iface == 0)
         {
             base = alloc_base((size_t)nrows * disp * sizeof(T), how, len);
-            memcpy(base, buffer, (size_t)nrows * disp * sizeof(T));
+            if (nrows > 0)
+                memcpy(base, buffer, (size_t)nrows * disp * sizeof(T));
         }
         else
         {
@@ -219,7 +226,8 @@ public:
         int how = BASE_ALIGNED;
         size_t len = 0;
         void *base = alloc_base((size_t)nrows * disp * itemsize, how, len);
-        memset(base, 0, (size_t)nrows * disp * itemsize);
+        if (nrows > 0)
+            memset(base, 0, (size_t)nrows * disp * itemsize);
         this->add_base(name, base, nrows, disp, itemsize, 0, true, how, len);
     }
 
@@ -463,7 +471,7 @@ private:
         MPI_Finalized(&finalized);
         if (initialized && !finalized)
         {
-            if (MPI_Alloc_mem((MPI_Aint)bytes, MPI_INFO_NULL, &base) != MPI_SUCCESS)
+            if (MPI_Alloc_mem((MPI_Aint)(bytes > 0 ? bytes : 1), MPI_INFO_NULL, &base) != MPI_SUCCESS)
                 throw std::bad_alloc();
             how = BASE_MPI;
             return base;

@@ -46,7 +46,7 @@ Pre-allocate a named variable without providing data yet. Use `update()` to fill
 
 ## `add(name, arr)`
 
-Register a NumPy array as a named variable. Each rank contributes its local shard; the global index space is the concatenation of all shards in rank order. **Collective** — all ranks in `comm` must call with the same `name`.
+Register a NumPy array as a named variable. Each rank contributes its local shard; the global index space is the concatenation of all shards in rank order. **Collective** — all ranks in `comm` must call with the same `name`. A rank may add zero rows (`arr.shape[0] == 0`) with the same row shape as the others.
 
 | Parameter | Type | Description |
 |---|---|---|

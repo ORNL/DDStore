@@ -849,6 +849,88 @@ def test_gpu_reuse_buffers(comm, monkeypatch):
     assert all_ok(comm, ok)
 
 
+def few(comm, cls=TupleSource):
+    """A source with fewer samples than ranks, so some ranks hold no rows."""
+    return torch.utils.data.Subset(cls(), range(max(1, comm.Get_size() // 2)))
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("source_cls", [TupleSource, RecordSource])
+def test_fewer_samples_than_ranks(comm, monkeypatch, method, source_cls, chunk_size):
+    """Ranks with no rows take part in the setup; every rank reads every
+    sample (per-sample and batched reads, and a loader epoch)."""
+    src = few(
+        comm,
+        lambda: RecordSource("dict") if source_cls is RecordSource else source_cls(),
+    )
+    n = len(src)
+    ds = make(comm, monkeypatch, src, method, chunk_size=chunk_size)
+    idx = list(range(n)) * 3
+    ok = len(ds) == n
+    ok &= all(same(ds[i], src[i]) for i in range(n))
+    ok &= all(same(b, src[i]) for b, i in zip(ds.__getitems__(idx), idx))
+    if source_cls is TupleSource:
+        got = list(ThreadDataLoader(ds, batch_size=2, num_workers=1))
+        want = list(DataLoader(src, batch_size=2))
+        ok &= len(got) == len(want) and all(same(g, r) for g, r in zip(got, want))
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
+def test_empty_dataset_raises(comm):
+    with pytest.raises(ValueError, match="empty"):
+        DistDataset(
+            torch.utils.data.Subset(TupleSource(), range(0)), "e", comm, method=0
+        )
+
+
+@pytest.mark.parametrize(
+    "method",
+    METHODS
+    + [pytest.param(2, marks=pytest.mark.skipif(not HAVE_CXI, reason="no CXI device"))],
+)
+def test_dist_store_small_and_large(comm, monkeypatch, tmp_path, method):
+    """One store with a dataset larger and one smaller than the rank count;
+    with method 2 a reader joins the small one."""
+    if method != 0:
+        monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)
+    hs = comm.bcast(str(tmp_path / "hs") if comm.Get_rank() == 0 else None, root=0)
+    big, small = TupleSource(), few(comm, DictSource)
+    store = DistStore(comm, method=method, handshake_dir=hs)
+    a = DistDataset(big, "big", store)
+    b = DistDataset(small, "small", store, chunk_size=2)
+    ok = len(a) == N and len(b) == len(small)
+    for ds, ref in ((a, big), (b, small)):
+        idx = list(range(len(ref)))[::-1]
+        ok &= all(same(g, ref[i]) for g, i in zip(ds.__getitems__(idx), idx))
+    if method == 2 and comm.Get_rank() == 0:  # tmp_path is rank 0's
+        reader = DistDatasetReader("small", handshake_dir=hs, n_core=comm.Get_size())
+        idx = list(range(len(small)))
+        ok &= len(reader) == len(small)
+        ok &= all(same(g, small[i]) for g, i in zip(reader.__getitems__(idx), idx))
+        ok &= all(same(reader[i], small[i]) for i in idx)
+        reader.ddstore.free()
+    store.free()
+    assert all_ok(comm, ok)
+
+
+@pytest.mark.skipif(
+    not (HAVE_CXI and HAVE_GPU and FABRIC == "cxi"),
+    reason="requires the cxi provider and a GPU",
+)
+def test_gpu_fewer_samples_than_ranks(comm, monkeypatch):
+    """GPU source and destination; ranks with no rows have no GPU buffer."""
+    src = few(comm)
+    ds = make(comm, monkeypatch, src, 1, device="cuda", add_device="cuda")
+    idx = list(range(len(src))) * 2
+    batch = ds.__getitems__(idx)
+    ok = batch[0][0].is_cuda
+    ok &= all(same(b, src[i]) for b, i in zip(batch, idx))
+    finish(comm, ds)
+    assert all_ok(comm, ok)
+
+
 @pytest.mark.skipif(not HAVE_CXI, reason="no CXI device")
 def test_method2_reader(comm, monkeypatch, tmp_path):
     monkeypatch.setenv("DDSTORE_FABRIC", FABRIC)

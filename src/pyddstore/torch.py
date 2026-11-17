@@ -1404,7 +1404,6 @@ class ThreadDataLoader(DataLoader):
         self._pool = self._pool_sets or None
 
         logger.debug("num_workers: %s", self.num_workers)
-        logger.debug("len: %s", len(self._index_sampler))
 
     @staticmethod
     def worker_init(counter):
